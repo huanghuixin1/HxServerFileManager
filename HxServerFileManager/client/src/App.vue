@@ -71,17 +71,61 @@ function startResize(e) {
   document.body.style.userSelect = 'none'
 }
 
+// ---- 本地化持久化：打开中的 SSH 会话 + 各自路径，刷新/下次打开自动恢复 ----
+const WS_KEY = 'hx_workspace_v1'
+let persistTimer = null
+
 async function loadSaved() {
   try {
     const res = await api.listConnections()
     savedList.value = res.connections || []
   } catch (_) { /* 忽略：下拉里会显示空 */ }
 }
-onMounted(loadSaved)
+onMounted(() => {
+  loadSaved()
+  restoreWorkspace() // 恢复上次打开的 SSH 会话与路径
+})
+
+// 把当前活跃会话（profileId + 路径）写入 localStorage（防抖）
+function persistWorkspace() {
+  if (persistTimer) clearTimeout(persistTimer)
+  persistTimer = setTimeout(() => {
+    try {
+      const sessions = connections.value.map((c) => ({
+        profileId: c.profileId || null,
+        name: c.name || '',
+        host: c.host,
+        port: c.port,
+        username: c.username,
+        cwd: cwdMap[c.connectionId] || '/',
+      }))
+      localStorage.setItem(WS_KEY, JSON.stringify({ sessions, ts: Date.now() }))
+    } catch (_) { /* 忽略存储异常 */ }
+  }, 400)
+}
+
+// 启动时恢复上次打开的会话与路径（自动重连 + 回到上次目录）
+function restoreWorkspace() {
+  let saved = null
+  try {
+    saved = JSON.parse(localStorage.getItem(WS_KEY) || 'null')
+  } catch (_) { /* 忽略 */ }
+  if (!saved || !Array.isArray(saved.sessions) || saved.sessions.length === 0) return
+  for (const s of saved.sessions) {
+    if (!s.profileId) continue
+    ;(async () => {
+      try {
+        const res = await api.reconnect(s.profileId)
+        handleConnected({ ...res, port: s.port, authType: 'password' }, s.cwd)
+      } catch (_) { /* 服务器不可达/连接被删：静默跳过，用户可手动连 */ }
+    })()
+  }
+}
 
 function toConn(payload) {
   return {
     connectionId: payload.connectionId,
+    profileId: payload.profileId || null,
     host: payload.host,
     username: payload.username,
     port: payload.port,
@@ -91,7 +135,8 @@ function toConn(payload) {
   }
 }
 
-function handleConnected(payload) {
+// restoreCwd：可选，恢复上次打开的路径（为空则用家目录）
+function handleConnected(payload, restoreCwd) {
   const conn = toConn(payload)
   // 同一 connectionId 去重（如重连同一台）
   const idx = connections.value.findIndex((c) => c.connectionId === conn.connectionId)
@@ -100,8 +145,9 @@ function handleConnected(payload) {
   activeId.value = conn.connectionId
   connectVisible.value = false
   editor.value = { open: false, connId: null, path: null }
-  cwdMap[conn.connectionId] = conn.homeDirectory || '/'
+  cwdMap[conn.connectionId] = restoreCwd || conn.homeDirectory || '/'
   loadSaved() // 刷新排序/别名
+  persistWorkspace()
 }
 
 async function disconnectConn(connId) {
@@ -115,6 +161,7 @@ async function disconnectConn(connId) {
     const rest = connections.value
     activeId.value = rest.length ? rest[rest.length - 1].connectionId : null
   }
+  persistWorkspace()
 }
 
 // 文件列表导航 -> 同步会话 cwd（后端 exec 链路），并让交互终端执行 cd（双向联动）。
@@ -128,6 +175,7 @@ async function onNavigate(connId, path) {
   } catch (_) { /* 目录可能不存在，忽略 */ }
   // 交互终端里直接 cd（组件内部判断是否交互模式）
   termRefs[connId]?.injectCd?.(path)
+  persistWorkspace()
 }
 
 // 交互终端 cd（OSC 7 推送）-> 更新共享 cwd，文件列表跟随；并同步后端 exec 链路目录
@@ -135,6 +183,7 @@ function onCwdChanged(connId, path) {
   if (!path || !syncCwd.value) return
   cwdMap[connId] = path
   api.setCwd(connId, path).catch(() => {})
+  persistWorkspace()
 }
 
 async function disconnectActive() {

@@ -29,6 +29,7 @@ async function doReconnect(item) {
     const res = await api.reconnect(item.id)
     emit('reconnect', {
       connectionId: res.connectionId,
+      profileId: res.profileId, // 本地化保存会话时引用后端 profile
       host: res.host,
       username: res.username,
       port: item.port,

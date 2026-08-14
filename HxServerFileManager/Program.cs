@@ -73,12 +73,13 @@ app.MapPost("/api/connect", (ConnectRequest req, ConnectionManager mgr, Connecti
         return Results.BadRequest(new { error = err });
     }
 
-    // 连接成功后持久化（相同 host:port:username 会更新而非新增）
-    store.Upsert(ToProfile(req, port));
+    // 连接成功后持久化（相同 host:port:username 会更新而非新增）；返回最终 profile 供前端本地化引用
+    var prof = store.Upsert(ToProfile(req, port));
     log.Log("info", $"{req.Username}@{req.Host}:{port}", "连接", "建立 SSH/SFTP 会话", "成功");
     return Results.Ok(new
     {
         connectionId = id,
+        profileId = prof.Id,
         host = req.Host,
         username = req.Username,
         name = req.Name,
@@ -134,6 +135,7 @@ app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr,
     return Results.Ok(new
     {
         connectionId = id,
+        profileId = prof.Id,
         host = prof.Host,
         username = prof.Username,
         name = prof.Name,
@@ -836,23 +838,27 @@ public sealed class ConnectionsStore
         lock (_gate) return _profiles.FirstOrDefault(p => p.Id == id);
     }
 
-    // 以 host|port|username 去重；已存在则保留原 Id/CreatedAt 并更新凭据与时间
-    public void Upsert(ConnectionProfile p)
+    // 以 host|port|username 去重；已存在则保留原 Id/CreatedAt 并更新凭据与时间。返回最终保存的 profile
+    public ConnectionProfile Upsert(ConnectionProfile p)
     {
         lock (_gate)
         {
             var key = $"{p.Host}|{p.Port}|{p.Username}";
             var existing = _profiles.FirstOrDefault(x => $"{x.Host}|{x.Port}|{x.Username}" == key);
+            ConnectionProfile saved;
             if (existing is null)
             {
                 _profiles.Add(p);
+                saved = p;
             }
             else
             {
                 _profiles.Remove(existing);
-                _profiles.Add(p with { Id = existing.Id, CreatedAt = existing.CreatedAt });
+                saved = p with { Id = existing.Id, CreatedAt = existing.CreatedAt };
+                _profiles.Add(saved);
             }
             Save();
+            return saved;
         }
     }
 

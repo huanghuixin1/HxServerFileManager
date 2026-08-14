@@ -80,12 +80,14 @@ function goUp() {
   goPath(parentDir(cwd.value))
 }
 
-// 终端 cd 后 App 推来新目录，文件列表跟随（syncCwd 关闭时 externalPath 为 null，自动忽略）
+// 终端 cd 后 App 推来新目录，文件列表跟随（syncCwd 关闭时 externalPath 为 null，自动忽略）。
+// immediate：刷新恢复路径时挂载即可能已带 externalPath，否则首次不触发
 watch(
   () => props.externalPath,
   (p) => {
     if (p && p !== cwd.value) load(p)
-  }
+  },
+  { immediate: true }
 )
 
 function download(item) {

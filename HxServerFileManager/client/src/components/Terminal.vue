@@ -58,6 +58,10 @@ function restoreFocus() {
 const termHost = ref(null)
 let xterm = null
 let es = null
+let initialCdDone = false // 首次打开时按 cwd prop 恢复目录（刷新/重开回到上次路径）
+let oscIgnored = false // 注入恢复路径完成前忽略 OSC 7（防止 shell 初始目录覆盖恢复路径）
+// 挂载时快照初始目录：恢复路径不能被后续 OSC 7 推送覆盖（props.cwd 会随 cwdMap 变化）
+const initialCwd = props.cwd
 
 // OSC 7 解析：bash PROMPT_COMMAND 每次提示符输出 \x1b]7;file://host/path\x07，
 // 从中提取当前目录；chunk 可能被 SSH/TCP 分片，需要跨 chunk 缓冲
@@ -115,6 +119,18 @@ async function openInteractive() {
     const rows = hostEl ? Math.min(60, Math.max(10, Math.floor(hostEl.clientHeight / 18))) : 30
     await api.terminalOpen(props.connId, cols, rows)
 
+    // 首次打开时，若 App 给了初始目录（如本地化恢复的路径）且不是根目录，注入一次 cd
+    if (!initialCdDone && initialCwd && initialCwd !== '/') {
+      initialCdDone = true
+      oscIgnored = true // cd 生效前的 OSC 7（shell 初始目录）不推给 App，避免覆盖恢复路径
+      setTimeout(() => {
+        api.terminalInput(props.connId, `cd ${initialCwd}\r`).catch(() => {})
+        setTimeout(() => { oscIgnored = false }, 500) // cd 生效后恢复推送
+      }, 400) // 等 shell 提示符就绪
+    } else if (!initialCdDone) {
+      initialCdDone = true
+    }
+
     if (!xterm) {
       xterm = new XTerm({
         cursorBlink: true,
@@ -139,7 +155,7 @@ async function openInteractive() {
           if (msg.type === 'out' && xterm) {
             const { cleaned, paths } = extractOsc7(msg.data)
             // 终端 cd 后推送新目录（文件列表跟随）；OSC 序列本身不渲染
-            if (paths.length) emit('update:cwd', paths[paths.length - 1])
+            if (paths.length && !oscIgnored) emit('update:cwd', paths[paths.length - 1])
             if (cleaned) xterm.write(cleaned)
           }
         } catch (_) { /* ignore */ }
