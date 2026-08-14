@@ -101,6 +101,28 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ connectionId: connId, path }),
     }),
+
+  // 交互终端（SSH shell + pty）
+  terminalOpen: (connId, cols, rows) =>
+    request('/api/terminal/open', {
+      method: 'POST',
+      body: JSON.stringify({ connectionId: connId, cols, rows }),
+    }),
+
+  terminalInput: (connId, data) =>
+    request('/api/terminal/input', {
+      method: 'POST',
+      body: JSON.stringify({ connectionId: connId, data }),
+    }),
+
+  terminalClose: (connId) =>
+    request('/api/terminal/close', {
+      method: 'POST',
+      body: JSON.stringify({ connectionId: connId }),
+    }),
+
+  terminalStreamUrl: (connId) =>
+    `/api/terminal/stream?connId=${encodeURIComponent(connId)}`,
 }
 
 // SSE 实时日志流

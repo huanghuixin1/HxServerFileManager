@@ -30,3 +30,4 @@ obj
 .workbuddy/
 .vscode
 HxServerFileManager/wwwroot/*
+HxServerFileManager/Data/*

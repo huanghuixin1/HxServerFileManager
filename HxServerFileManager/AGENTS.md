@@ -16,7 +16,8 @@
 - `Program.cs`：全部后端逻辑（最小 API + 单文件类型定义）。**JSON body 绑定一律读 `ConnectionId`**（camelCase `connectionId`），前端 `api.js` 必须发 `connectionId` 字段，发 `connId` 会静默绑定为 null（历史教训，见已知问题）
 - `client/src/App.vue`：多连接标签页架构。`connections[]` 存所有活跃会话，`activeId` 当前标签；标签可关闭（确认后断开）；工作区用 `v-show` 按连接渲染，保证每会话的终端历史/文件浏览器状态独立
 - `client/src/api.js`：所有 /api 封装。POST 类接口统一发 `{ connectionId, ... }`；文件接口参数名与后端 record 一一对应（如 rename 用 `path`+`name`，不是 `dir`/`oldName`）
-- `client/src/components/`：ConnectPanel（连接表单，可内联也可在对话框里复用）、SavedConnections、FileManager（el-table + 自绘面包屑）、Terminal、LogPanel（SSE）、EditorModal
+- `client/src/components/`：ConnectPanel（连接表单，可内联也可在对话框里复用）、SavedConnections、FileManager（el-table + 自绘面包屑）、Terminal（双模式：快捷命令 exec + 交互终端 xterm）、LogPanel（SSE）、EditorModal
+- 终端双模式：**快捷命令（exec）** 一次一命令带 cwd 持久化；**交互终端（interactive）** 用 SSH.NET `ShellStream`（pty，xterm-256color）+ 前端 `@xterm/xterm`，可跑 nano/vim/read 脚本等需要 TTY/stdin 的程序。输出走 SSE（`/api/terminal/stream`，先回放 ShellTail 再实时推送），输入走 `POST /api/terminal/input`，每会话惰性创建/关闭（`SshSession.EnsureShell/DisposeShell`），ShellOutput 为有界 Channel（DropWrite）防无消费者时积压，ShellTail 供新 SSE 消费者回放。切回 exec 模式会 DisposeShell（nano 等随之终止）
 - 会话工作目录联动：`SshSession.Cwd` 为会话级 cwd（连接时初始化为 SFTP 工作目录）。`/api/command` 把命令包装为 `cd <cwd> && <cmd>; rc=$?; pwd; exit $rc`，解析末尾 pwd 行更新 cwd 并返回；`/api/cwd` 供文件列表导航时同步会话 cwd。前端 App.vue 持 `cwdMap`（每连接共享），FileManager「跟随终端路径」checkbox（默认开）控制文件列表是否随终端 cd 跳转，双向联动
 - `client/vite.config.js`：dev proxy 指向 `http://localhost:5101`
 
@@ -24,6 +25,7 @@
 - 曾批量出现“字段名不匹配”：前端发 `connId`，后端绑 `ConnectionId`，导致 disconnect/reconnect/mkdir/rename/delete/command/save 全部静默失败或 404。已全部统一为 `connectionId`。**新增后端接口时务必核对 body 字段名**
 - 后端最小 API 返回体一律 camelCase（`FileEntry` 序列化为 `name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 曾误读 PascalCase 导致列表空白，已改 camelCase。**前端读响应字段时一律用小写开头**
 - 后端会话空闲 30 分钟自动回收（ConnectionManager.CleanupLoop）；前端标签不会自动消失，此时操作会报“连接不存在或已断开”，需手动断开重连
+- SSE 端点（`/api/logs/stream`、`/api/terminal/stream`）在客户端断开后**不要返回 `Results.Ok()`**——响应已开始会抛 "StatusCode cannot be set because the response has already started"，用 `Results.Empty`（不触碰状态码）
 - Docker 端到端（连 test-linux）尚未跑：开发环境无 docker
 - `connections.json` 明文存密码/私钥，仅限本地/内网
 
@@ -35,3 +37,4 @@
 - 2026-08-14：文件列表空白 bug —— 后端最小 API 序列化 FileEntry 为 camelCase，前端曾读 PascalCase，已统一改 camelCase
 - 2026-08-14：终端 cwd 持久化 + 文件列表联动 —— SSH.NET 每次 CreateCommand 开新通道导致 cd 不保留，改为会话级 Cwd + 命令包装（pwd 兜底解析）；新增 `/api/cwd`；FileManager 加「跟随终端路径」checkbox（默认开）双向联动；自绘面包屑去掉 el-breadcrumb 的间隙/双斜杠问题；顺带修复连接后初始目录未用家目录（ConnectPanel 缺发 homeDirectory）
 - 2026-08-14：终端回车丢焦点 —— el-input 在 busy 时被 `:disabled` 禁用，焦点被浏览器夺走；改为执行期间不禁用输入框 + `restoreFocus()`（ref.focus）兜底，真实测试机实测连续命令焦点保持
+- 2026-08-14：交互终端 —— 后端 `ShellStream` + pty（`/api/terminal/open|stream|input|close`）+ 前端 xterm.js（`@xterm/xterm` 6.0.0，Terminal.vue 双模式 radio）。实测连真实测试机：ls、read 交互输入回显、nano 全屏打开并输入文字均正常；修掉 SSE 关闭时 `Results.Ok()` 重复设状态码异常；Ctrl 组合键无法用合成事件自动化测试（工具限制），真实键盘可用

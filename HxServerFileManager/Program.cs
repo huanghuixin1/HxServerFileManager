@@ -5,6 +5,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
 using Renci.SshNet;
+using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 using System.Collections.Concurrent;
 using System.Text;
@@ -361,6 +362,91 @@ app.MapPost("/api/command", (CommandRequest req, ConnectionManager mgr, Operatio
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
 
+// ----------------------------------------------------------------------------
+// 交互终端（带 pty 的 SSH shell）：可运行 nano/vim/top 及需要读输入的脚本。
+// 输出经 SSE 流式推送，输入通过 POST 写回 stdin。
+// ----------------------------------------------------------------------------
+
+// 打开交互终端（每会话一个 shell，惰性创建；pty 尺寸创建后不可变）
+app.MapPost("/api/terminal/open", (TerminalOpenRequest req, ConnectionManager mgr, OperationLogger log) =>
+{
+    try
+    {
+        var s = mgr.Get(req.ConnectionId);
+        var cols = req.Cols is int c and > 0 and < 500 ? (uint)c : 100;
+        var rows = req.Rows is int r and > 0 and < 200 ? (uint)r : 30;
+        s.EnsureShell(cols, rows);
+        log.Log("info", req.ConnectionId, "打开交互终端", $"{cols}x{rows}");
+        return Results.Ok(new { ok = true });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
+// 交互终端输出流（SSE：先回放最近输出，再实时推送）
+app.MapGet("/api/terminal/stream", async (string connId, HttpContext ctx, ConnectionManager mgr) =>
+{
+    var s = mgr.Get(connId);
+    ShellStream? shell;
+    Channel<byte[]>? ch;
+    lock (s.ShellLock) { shell = s.Shell; ch = s.ShellOutput; }
+    if (shell is null || ch is null)
+        return Results.BadRequest(new { error = "终端未打开，请先 POST /api/terminal/open" });
+
+    ctx.Response.Headers.Append("Content-Type", "text/event-stream");
+    ctx.Response.Headers.Append("Cache-Control", "no-cache");
+    ctx.Response.Headers.Append("Connection", "keep-alive");
+    ctx.Response.Headers.Append("X-Accel-Buffering", "no");
+
+    string tail;
+    lock (s.ShellTail) tail = s.ShellTail.ToString();
+    if (tail.Length > 0)
+        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "out", data = tail })}\n\n", ctx.RequestAborted);
+    await ctx.Response.Body.FlushAsync();
+
+    try
+    {
+        await foreach (var chunk in ch.Reader.ReadAllAsync(ctx.RequestAborted))
+        {
+            var data = Encoding.UTF8.GetString(chunk);
+            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "out", data })}\n\n", ctx.RequestAborted);
+            await ctx.Response.Body.FlushAsync();
+        }
+    }
+    catch (OperationCanceledException) { /* 客户端断开 */ }
+    // 响应已开始，不能返回 Results.Ok()（会因重复设置状态码抛异常）；Empty 不触碰状态码
+    return Results.Empty;
+});
+
+// 向交互终端写输入（按键/粘贴/控制键都走这里）
+app.MapPost("/api/terminal/input", (TerminalInputRequest req, ConnectionManager mgr) =>
+{
+    try
+    {
+        var s = mgr.Get(req.ConnectionId);
+        lock (s.ShellLock)
+        {
+            if (s.Shell is null || !s.ShellAlive)
+                return Results.BadRequest(new { error = "终端未打开" });
+            s.Shell.Write(req.Data ?? "");
+            s.Shell.Flush();
+        }
+        return Results.Ok(new { ok = true });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
+// 关闭交互终端
+app.MapPost("/api/terminal/close", (IdRequest req, ConnectionManager mgr) =>
+{
+    try
+    {
+        var s = mgr.Get(req.ConnectionId);
+        s.DisposeShell();
+        return Results.Ok(new { ok = true });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
 // 同步会话工作目录（文件列表导航时调用，让终端下一条命令从该目录开始）
 app.MapPost("/api/cwd", (CwdRequest req, ConnectionManager mgr, OperationLogger log) =>
 {
@@ -531,6 +617,8 @@ public record RenameRequest(string ConnectionId, string Path, string Name, strin
 public record CommandRequest(string ConnectionId, string Command);
 public record FileContentRequest(string ConnectionId, string Path, string Content);
 public record CwdRequest(string ConnectionId, string Path);
+public record TerminalOpenRequest(string ConnectionId, int? Cols, int? Rows);
+public record TerminalInputRequest(string ConnectionId, string Data);
 
 public record FileEntry(string Name, string FullPath, bool IsDirectory, long Size, DateTime LastWriteTimeUtc, bool IsText);
 
@@ -549,6 +637,13 @@ public sealed class SshSession : IDisposable
     /// <summary>当前工作目录：命令包装 + 文件列表联动共用的会话级状态。</summary>
     public string Cwd { get; set; }
 
+    // ---- 交互终端（ShellStream + pty）----
+    public object ShellLock { get; } = new();
+    public ShellStream? Shell { get; set; }
+    public bool ShellAlive { get; set; }
+    public Channel<byte[]>? ShellOutput { get; set; }
+    public StringBuilder ShellTail { get; } = new(); // 新 SSE 消费者回放
+
     public SshSession(SshClient ssh, SftpClient sftp, string cwd)
     {
         Ssh = ssh;
@@ -556,10 +651,59 @@ public sealed class SshSession : IDisposable
         Cwd = cwd;
     }
 
+    /// <summary>惰性创建交互式 shell（带 pty，可跑 nano/vim/top 等需要 TTY 的程序）。</summary>
+    public ShellStream EnsureShell(uint cols, uint rows)
+    {
+        lock (ShellLock)
+        {
+            if (ShellAlive && Shell != null) return Shell;
+            var stream = Ssh.CreateShellStream("xterm-256color", cols, rows, cols * 8, rows * 16, 8192);
+            Shell = stream;
+            ShellAlive = true;
+            // 有界+丢写：没有 SSE 消费者时（如长时间没人看）不会无限积压
+            ShellOutput = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(4000)
+            {
+                SingleReader = true,
+                FullMode = BoundedChannelFullMode.DropWrite
+            });
+            stream.DataReceived += OnShellData;
+            return stream;
+        }
+    }
+
+    private void OnShellData(object? sender, ShellDataEventArgs e)
+    {
+        if (e.Data is not { Length: > 0 } data) return;
+        lock (ShellTail)
+        {
+            ShellTail.Append(Encoding.UTF8.GetString(data));
+            if (ShellTail.Length > 65536) ShellTail.Remove(0, ShellTail.Length - 65536);
+        }
+        ShellOutput?.Writer.TryWrite(data);
+    }
+
+    public void DisposeShell()
+    {
+        lock (ShellLock)
+        {
+            if (Shell != null)
+            {
+                try { Shell.DataReceived -= OnShellData; } catch { }
+                try { Shell.Close(); } catch { }
+                try { Shell.Dispose(); } catch { }
+            }
+            Shell = null;
+            ShellAlive = false;
+            ShellOutput = null;
+            lock (ShellTail) ShellTail.Clear();
+        }
+    }
+
     public void Touch() => LastUsedUtc = DateTime.UtcNow;
 
     public void Dispose()
     {
+        DisposeShell();
         try { if (Sftp.IsConnected) Sftp.Disconnect(); } catch { }
         try { if (Ssh.IsConnected) Ssh.Disconnect(); } catch { }
         Sftp.Dispose();

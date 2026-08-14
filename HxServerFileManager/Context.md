@@ -13,6 +13,7 @@
 - ✅ 后端已加 `MapFallbackToFile("index.html")`。
 - ✅ `npm run build` 已覆盖 `wwwroot`（index.html + assets/，旧 app.js/style.css 已被清空）。
 - ✅ **多服务器并发连接**：`App.vue` 会话标签栏（自定义 pill tab，可关闭+确认）、新建连接对话框、每标签独立 FileManager/Terminal/编辑器（`v-show` 保留各自终端历史/目录状态）。后端本就支持多会话，无需改动。
+- ✅ **交互终端**：`Terminal.vue` 双模式（快捷命令 exec / 交互终端 interactive）。交互终端 = 后端 SSH.NET `ShellStream`（pty xterm-256color）+ 前端 `@xterm/xterm` 6.0.0。输出 SSE（`/api/terminal/stream`，先回放最近输出再实时推送，ShellOutput 有界 Channel 防积压），输入 `POST /api/terminal/input`，关闭 `POST /api/terminal/close`（DisposeShell）。可跑 nano/vim/read 脚本等需要 TTY 的程序。
 
 ## 文件列表空白 bug 已修（字段大小写）
 - 后端 `/api/files` 的 `FileEntry` 经最小 API 序列化为 camelCase（`name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 原来读 PascalCase，导致名称/大小/修改时间全空白。已统一改读 camelCase。
@@ -30,6 +31,12 @@
 - 编辑对话框：`PUT /api/connections/{id}`，可改别名/主机/端口/用户名/凭据；**留空字段保持不变**（凭据不随列表返回，编辑时留空即不改）。
 - 别名：连接表单与编辑表单均可设置 `name`；连接/重连响应新增 `name`；标签和已保存列表显示别名（列表里别名≠主机时附带主机 tag）。
 - 已用 mock 实测：连接中下拉开第二个连接、编辑改别名、下拉/管理面板同步刷新。
+
+## 交互终端实测（真实测试机 192.168.31.254:2222）
+- `ls -la` 输出、`read -p` 等待输入并回显、nano 全屏打开并输入文字（标题显示 Modified）均正常；切回快捷命令模式 shell 正确关闭。
+- 修复：SSE 客户端断开后 `Results.Ok()` 重复设状态码抛异常 → 改 `Results.Empty`，日志已无异常。
+- 注意：Ctrl 组合键（Ctrl+X 等）无法用合成事件自动化测试，真实键盘可用（xterm 标准处理）。
+- 部署提醒：交互终端依赖 `@xterm/xterm`，`npm run build` 会打进产物；bin 里运行需重新 `dotnet build` 同步 wwwroot。
 
 ## 字段名 bug 已全部修复（connId → connectionId）
 - 断开：`api.disconnect` 改发 JSON `{ connectionId }`，后端 `IdRequest` 可正确绑定。
