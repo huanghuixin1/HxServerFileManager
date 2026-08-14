@@ -18,6 +18,15 @@
 ## 文件列表空白 bug 已修（字段大小写）
 - 后端 `/api/files` 的 `FileEntry` 经最小 API 序列化为 camelCase（`name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 原来读 PascalCase，导致名称/大小/修改时间全空白。已统一改读 camelCase。
 
+## 终端默认交互模式 + 路径双向同步
+- 终端模式 radio 默认选中「交互终端」（Terminal.vue `mode` 默认值 + onMounted 自动打开）；快捷命令保留为二线工具。
+- 后端 `EnsureShell` 创建 shell 后注入：`export PROMPT_COMMAND='printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'` + 自定义 `PS1='\u@\h:\w$ '`。bash 每次提示符前输出 OSC 7 序列（含当前目录），前端 Terminal.vue 在 SSE 流里用正则提取（跨 chunk 缓冲，剥掉序列再渲染）。
+- 正向：终端 `cd /etc` → OSC 7 推送 → 文件列表面包屑自动变 `/etc`。
+- 反向：文件列表导航（点目录/面包屑/上级）→ App 调 `termRefs[connId].injectCd(path)` → 向交互终端写 `cd <path>\r`，终端提示符同步变化。
+- checkbox 已改名「同步路径」：**开 = 双向同步（终端 cd ⇄ 文件列表导航互相跟随）；关 = 两边完全独立**（终端 cd 不动文件列表，文件列表导航也不注入终端 cd、不更新会话 cwd）。实测：关闭时点文件列表目录终端提示符不变，打开后点「上级」终端收到 `cd /config`。
+- 注意：OSC 7 依赖 bash（非 bash 默认 shell 时仅失去路径同步）；全屏程序（nano）运行时反向注入的 `cd` 会被程序接收（预期行为）。
+- 真实测试机实测通过：`cd /etc` → 面包屑 `/etc`；点「上级」→ 终端 `/`；checkbox 关闭 → 文件列表不跟随。
+
 ## 终端路径持久化 + 文件列表联动
 - 根因：SSH.NET 每次 `CreateCommand` 都是新 exec 通道，`cd` 不保留，所以终端总回默认目录。
 - 方案：`SshSession.Cwd` 会话级 cwd（连接时初始化为 SFTP 工作目录）；`/api/command` 命令包装为 `cd <cwd> && <cmd>; rc=$?; pwd; exit $rc`，解析末尾 pwd 行更新并返回 cwd；新增 `/api/cwd` 供文件列表导航同步会话目录。

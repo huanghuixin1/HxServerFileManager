@@ -667,6 +667,17 @@ public sealed class SshSession : IDisposable
                 FullMode = BoundedChannelFullMode.DropWrite
             });
             stream.DataReceived += OnShellData;
+            // 注入 bash 提示符钩子：每次打印提示符前输出 OSC 7 序列携带当前目录
+            // （\033]7;file://host/path\007，VSCode/tmux 的标准做法），前端解析后同步文件列表
+            try
+            {
+                var init =
+                    "export PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"'\n" +
+                    "export PS1='\\u@\\h:\\w$ '\n";
+                stream.Write(init);
+                stream.Flush();
+            }
+            catch { /* 非 bash 或写入失败：仅失去路径同步，不影响终端使用 */ }
             return stream;
         }
     }

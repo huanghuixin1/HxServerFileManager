@@ -17,5 +17,11 @@
   <ItemGroup>
     <None Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <ItemGroup>
+    <None Remove="Data\connections.json" />
+  </ItemGroup>
+  <ItemGroup>
+    <Folder Include="Data\" />
+  </ItemGroup>
 
 </Project>

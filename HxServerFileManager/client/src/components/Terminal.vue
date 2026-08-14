@@ -13,7 +13,8 @@ const props = defineProps({
 })
 const emit = defineEmits(['update:cwd'])
 
-const mode = ref('exec')
+// 默认交互终端（真终端）；快捷命令保留为二线工具
+const mode = ref('interactive')
 const command = ref('')
 const lines = ref([])
 const busy = ref(false)
@@ -57,8 +58,56 @@ const termHost = ref(null)
 let xterm = null
 let es = null
 
+// OSC 7 解析：bash PROMPT_COMMAND 每次提示符输出 \x1b]7;file://host/path\x07，
+// 从中提取当前目录；chunk 可能被 SSH/TCP 分片，需要跨 chunk 缓冲
+let oscBuf = ''
+function extractOsc7(chunk) {
+  oscBuf += chunk
+  let cleaned = ''
+  let paths = []
+  const re = /\x1b\]7;([^\x07\x1b]*(?:\x07|\x1b\\))/g
+  let m
+  let last = 0
+  while ((m = re.exec(oscBuf))) {
+    cleaned += oscBuf.slice(last, m.index)
+    let payload = m[1]
+    payload = payload.endsWith('\x1b\\') ? payload.slice(0, -2) : payload.slice(0, -1)
+    let p = payload.replace(/^file:\/\/[^/]*/, '')
+    if (p) {
+      try { p = decodeURIComponent(p) } catch (_) { /* 保留原样 */ }
+      paths.push(p)
+    }
+    last = m.index + m[0].length
+  }
+  cleaned += oscBuf.slice(last)
+  // 尾部若还有未闭合的 OSC 7（跨 chunk），保留等待下一条
+  const open = cleaned.lastIndexOf('\x1b]7;')
+  if (open !== -1) {
+    oscBuf = cleaned.slice(open)
+    cleaned = cleaned.slice(0, open)
+  } else {
+    oscBuf = ''
+  }
+  return { cleaned, paths }
+}
+
+// 等容器有实际尺寸（挂载瞬间布局可能未完成，拿 0 会导致 pty 行数列数取下限）
+function waitForSize(timeout = 2500) {
+  return new Promise((resolve) => {
+    const start = Date.now()
+    const check = () => {
+      const el = termHost.value
+      if (el && el.clientHeight > 60 && el.clientWidth > 120) return resolve()
+      if (Date.now() - start > timeout) return resolve()
+      setTimeout(check, 80)
+    }
+    check()
+  })
+}
+
 async function openInteractive() {
   try {
+    await waitForSize()
     // pty 尺寸按容器估一个，与 xterm 显示保持一致（创建后不可变）
     const hostEl = termHost.value
     const cols = hostEl ? Math.min(200, Math.max(40, Math.floor(hostEl.clientWidth / 9))) : 100
@@ -86,7 +135,12 @@ async function openInteractive() {
       es.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
-          if (msg.type === 'out' && xterm) xterm.write(msg.data)
+          if (msg.type === 'out' && xterm) {
+            const { cleaned, paths } = extractOsc7(msg.data)
+            // 终端 cd 后推送新目录（文件列表跟随）；OSC 序列本身不渲染
+            if (paths.length) emit('update:cwd', paths[paths.length - 1])
+            if (cleaned) xterm.write(cleaned)
+          }
         } catch (_) { /* ignore */ }
       }
       es.onerror = () => { /* EventSource 自动重连 */ }
@@ -102,9 +156,22 @@ function closeInteractive() {
   if (xterm) { try { xterm.dispose() } catch (_) {} xterm = null }
 }
 
+// 文件列表导航 -> 在交互终端里执行 cd（仅交互模式生效；全屏程序运行时会被吞进程序里，属预期）
+function injectCd(path) {
+  if (mode.value !== 'interactive') return
+  api.terminalInput(props.connId, `cd ${path}\r`).catch(() => {})
+}
+
+defineExpose({ injectCd })
+
 watch(mode, (m) => {
   if (m === 'interactive') nextTick(openInteractive)
   else closeInteractive()
+})
+
+onMounted(() => {
+  // 默认交互终端：挂载后立即打开
+  if (mode.value === 'interactive') nextTick(openInteractive)
 })
 
 onUnmounted(() => {
@@ -256,6 +323,15 @@ onUnmounted(() => {
   overflow: hidden;
 }
 .xterm-wrap :deep(.xterm) {
+  height: 100%;
+}
+.xterm-wrap :deep(.xterm-viewport) {
+  height: 100% !important; /* 滚动区撑满容器，避免只显示 pty 行数高度的上半截 */
+}
+.xterm-wrap :deep(.xterm-scrollable-element) {
+  height: 100%; /* 内容承载元素约束为容器高，滚动才生效（xterm.css 未给它高度） */
+}
+.xterm-wrap :deep(.xterm-screen) {
   height: 100%;
 }
 </style>

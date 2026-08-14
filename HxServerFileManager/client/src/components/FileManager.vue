@@ -222,10 +222,9 @@ function fmtDate(s) {
       <div class="tools">
         <el-checkbox
           :model-value="syncCwd"
-          @update:model-value="emit('update:sync-cwd', $event)"
-          class="sync-cb"
-          >跟随终端路径</el-checkbox
-        >
+          @update:model-value="emit('update:sync-cwd', $event)"            class="sync-cb"
+            >同步路径</el-checkbox
+          >
         <el-button size="small" @click="goUp">
           <el-icon style="margin-right: 4px"><Top /></el-icon>上级
         </el-button>

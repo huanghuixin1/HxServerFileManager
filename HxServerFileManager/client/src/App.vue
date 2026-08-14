@@ -30,6 +30,8 @@ const activeConn = computed(
 // 文件列表是否跟随终端路径（默认开）；每连接的会话工作目录，终端与文件列表共享
 const syncCwd = ref(true)
 const cwdMap = reactive({})
+// 各连接 Terminal 组件实例（导航时向交互终端注入 cd）
+const termRefs = reactive({})
 
 async function loadSaved() {
   try {
@@ -77,18 +79,24 @@ async function disconnectConn(connId) {
   }
 }
 
-// 文件列表导航 -> 同步会话 cwd（终端提示符与下一条命令跟随）
+// 文件列表导航 -> 同步会话 cwd（后端 exec 链路），并让交互终端执行 cd（双向联动）。
+// 「同步路径」关闭时两边完全独立：文件列表只管自己，不动终端任何状态。
 async function onNavigate(connId, path) {
   if (!path) return
+  if (!syncCwd.value) return
   cwdMap[connId] = path
   try {
     await api.setCwd(connId, path)
   } catch (_) { /* 目录可能不存在，忽略 */ }
+  // 交互终端里直接 cd（组件内部判断是否交互模式）
+  termRefs[connId]?.injectCd?.(path)
 }
 
-// 终端 cd -> 更新共享 cwd，syncCwd 开启时文件列表跟随
+// 交互终端 cd（OSC 7 推送）-> 更新共享 cwd，文件列表跟随；并同步后端 exec 链路目录
 function onCwdChanged(connId, path) {
-  if (path) cwdMap[connId] = path
+  if (!path || !syncCwd.value) return
+  cwdMap[connId] = path
+  api.setCwd(connId, path).catch(() => {})
 }
 
 async function disconnectActive() {
@@ -261,6 +269,7 @@ function closeEditor() {
             @update:sync-cwd="(v) => (syncCwd = v)"
           />
           <Terminal
+            :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
             :conn-id="c.connectionId"
             :cwd="cwdMap[c.connectionId]"
             @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
@@ -448,6 +457,7 @@ function closeEditor() {
 .workspace {
   display: grid;
   grid-template-columns: 1.4fr 1fr;
+  grid-template-rows: minmax(0, 1fr); /* 显式行高：子项 height:100% 才有确定参照，否则回退成内容高度导致卡片矮半截 */
   gap: 18px;
   height: 100%;
   min-height: 0;
@@ -456,6 +466,10 @@ function closeEditor() {
   .connect-area,
   .workspace {
     grid-template-columns: 1fr;
+  }
+  .workspace {
+    /* 单列上下排：两卡片各占一半高度（否则第二行 auto 会塌成内容高） */
+    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
   }
 }
 </style>
