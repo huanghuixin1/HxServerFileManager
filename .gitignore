@@ -31,3 +31,4 @@ obj
 .vscode
 HxServerFileManager/wwwroot/*
 HxServerFileManager/Data/*
+HxServerFileManager/configs/env.json

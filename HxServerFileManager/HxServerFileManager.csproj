@@ -11,17 +11,44 @@
     <PackageReference Include="SSH.NET" Version="2026.0.0" />
     <!-- 保持控制台(Exe)，通过框架引用启用 Kestrel / ASP.NET Core 能力 -->
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <!-- 登录鉴权库：HxSimpleWebAuth（凭据 + token + 失败锁定 + 本机回环绑定） -->
+    <Reference Include="HxSimpleWebAuth">
+      <HintPath>libs\HxSimpleWebAuth.dll</HintPath>
+    </Reference>
   </ItemGroup>
 
-  <!-- 将前端 wwwroot 一并发布到输出目录 -->
+  <!-- 鉴权库随编译输出 -->
   <ItemGroup>
-    <None Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="libs\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
   <ItemGroup>
     <None Remove="Data\connections.json" />
   </ItemGroup>
+
+  <!--
+    编译后把 wwwroot 整体镜像到输出目录。
+    先清空目标目录再拷贝：Vite 每次构建产出的资源文件名带内容哈希，
+    单纯增量复制会让旧的 index-xxxx.js / .css 无限堆积。
+  -->
+  <Target Name="CopyWwwrootToOutput" AfterTargets="Build">
+    <ItemGroup>
+      <WwwrootSource Include="$(MSBuildProjectDirectory)\wwwroot\**\*" />
+      <WwwrootStale Include="$(OutDir)wwwroot\**\*" />
+    </ItemGroup>
+    <Delete Files="@(WwwrootStale)" ContinueOnError="true" />
+    <Copy SourceFiles="@(WwwrootSource)"
+          DestinationFiles="@(WwwrootSource->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Message Importance="high"
+             Text="wwwroot -&gt; $(OutDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
+  </Target>
   <ItemGroup>
     <Folder Include="Data\" />
+    <Folder Include="wwwroot\" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="configs\env.json.example">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

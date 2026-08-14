@@ -4,6 +4,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
+using HxSimpleWebAuth;
 using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
@@ -44,6 +45,79 @@ var dataDir = Path.Combine(builder.Environment.ContentRootPath, "Data");
 builder.Services.AddSingleton(new ConnectionsStore(dataDir));
 
 var app = builder.Build();
+
+// ----------------------------------------------------------------------------
+// 登录鉴权（HxSimpleWebAuth）：密码来源优先级：
+//   1) 环境变量 HXSFM_WEB_PASSWORD（可覆盖，方便 CI/Docker 注入）；
+//   2) configs/env.json 的 authPwd 字段（模板见 configs/env.json.example，存密码用）。
+// - 配置了密码：所有 /api（除 /api/session 与 /api/auth/*）必须带有效 Bearer token；
+// - 未配置密码：仅允许本机回环来源访问（fail-closed，避免内网裸奔）；
+// - SSE/下载等无法携带请求头的场景，前端把 token 放在 ?token= 查询参数，
+//   中间件在此处统一转成 Authorization 头再交给库校验。
+// ----------------------------------------------------------------------------
+var adminPassword = Environment.GetEnvironmentVariable("HXSFM_WEB_PASSWORD");
+if (string.IsNullOrEmpty(adminPassword))
+    adminPassword = LoadConfigPassword(builder.Environment.ContentRootPath);
+adminPassword ??= "";
+var authRequired = !string.IsNullOrEmpty(adminPassword);
+var auth = new WebAdminAuth(adminPassword, logDirectory: builder.Environment.ContentRootPath);
+
+app.Use(async (context, next) =>
+{
+    var path = context.Request.Path;
+    if (!path.StartsWithSegments("/api")
+        || path.StartsWithSegments("/api/session")
+        || auth.IsAuthPath(path.ToString()))
+    {
+        await next();
+        return;
+    }
+
+    if (!authRequired)
+    {
+        if (IsLoopbackAddress(context.Connection.RemoteIpAddress))
+        {
+            await next();
+            return;
+        }
+
+        await WriteAuthResponseAsync(context, ApiResponse.Error(403, "未配置访问密码（HXSFM_WEB_PASSWORD 或 configs/env.json），仅允许本机访问。"));
+        return;
+    }
+
+    if (auth.Authorize(await CreateAuthRequestAsync(context)))
+    {
+        await next();
+        return;
+    }
+
+    await WriteAuthResponseAsync(context, ApiResponse.Error(401, "Unauthorized."));
+});
+
+// 会话探测：前端据此决定显示登录页还是主界面
+app.MapGet("/api/session", (HttpContext context) => Results.Ok(new
+{
+    required = authRequired,
+    authenticated = !authRequired || auth.Authorize(CreateAuthRequest(context)),
+}));
+
+// 登录 / 登出（凭据校验、token 签发/吊销、失败锁定都由 HxSimpleWebAuth 处理）
+app.MapPost("/api/auth/login", async (HttpContext context) =>
+{
+    var response = auth.Handle(await CreateAuthRequestAsync(context), context.Request.Path.ToString());
+    await WriteAuthResponseAsync(context, response);
+});
+
+app.MapPost("/api/auth/logout", async (HttpContext context) =>
+{
+    var response = auth.Handle(await CreateAuthRequestAsync(context), context.Request.Path.ToString());
+    await WriteAuthResponseAsync(context, response);
+});
+
+if (authRequired)
+    Console.WriteLine("[HxServerFileManager] 已启用登录鉴权（密码来源：HXSFM_WEB_PASSWORD 环境变量 或 configs/env.json）");
+else
+    Console.WriteLine("[HxServerFileManager] 未配置访问密码（HXSFM_WEB_PASSWORD / configs/env.json）：仅本机回环可访问");
 
 // ---- 静态前端（wwwroot）----
 var wwwroot = Path.Combine(builder.Environment.ContentRootPath, "wwwroot");
@@ -509,8 +583,91 @@ static string CombinePath(string dir, string name)
     return dir + "/" + name.TrimStart('/');
 }
 
-// 单引号转义，用于安全地把路径拼进 sh 命令
+// 单引号转义，用于安全地把路径拼进 sh 命令`
 static string Shq(string s) => "'" + s.Replace("'", "'\\''") + "'";
+
+// ----------------------------------------------------------------------------
+// 鉴权辅助（HxSimpleWebAuth）
+// ----------------------------------------------------------------------------
+
+/// <summary>
+/// 读取 configs/env.json 中的 authPwd（模板见 configs/env.json.example）。
+/// 文件不存在或解析失败返回 null（此时回退到环境变量/未配置）。
+/// </summary>
+static string? LoadConfigPassword(string contentRoot)
+{
+    var configPath = Path.Combine(contentRoot, "configs", "env.json");
+    if (!File.Exists(configPath)) return null;
+    try
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+        if (doc.RootElement.TryGetProperty("authPwd", out var p) && p.ValueKind == JsonValueKind.String)
+        {
+            var v = p.GetString();
+            if (!string.IsNullOrEmpty(v)) return v;
+        }
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"[HxServerFileManager] 读取 configs/env.json 失败：{ex.Message}");
+    }
+    return null;
+}
+
+static bool IsLoopbackAddress(System.Net.IPAddress? address)
+{
+    if (address is null) return false;
+    if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+    return System.Net.IPAddress.IsLoopback(address);
+}
+
+/// <summary>
+/// 把 HttpContext 转成 HxSimpleWebAuth 需要的 HttpRequestData。
+/// EventSource/<a download> 等场景带不了请求头，token 走 ?token= 查询参数，
+/// 这里统一补成 Authorization: Bearer 头再交给库校验。
+/// </summary>
+static HttpRequestData CreateAuthRequest(HttpContext context, string body = "", string? method = null)
+{
+    var headers = context.Request.Headers.ToDictionary(
+        pair => pair.Key,
+        pair => pair.Value.ToString(),
+        StringComparer.OrdinalIgnoreCase);
+
+    if (!headers.ContainsKey("Authorization")
+        && context.Request.Query.TryGetValue("token", out var qtoken)
+        && !string.IsNullOrWhiteSpace(qtoken.ToString()))
+    {
+        headers["Authorization"] = "Bearer " + qtoken.ToString();
+    }
+
+    var target = $"{context.Request.PathBase}{context.Request.Path}{context.Request.QueryString}";
+    var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+    return new HttpRequestData(
+        (method ?? context.Request.Method).ToUpperInvariant(),
+        target,
+        headers,
+        body,
+        remoteIp);
+}
+
+static async Task<HttpRequestData> CreateAuthRequestAsync(HttpContext context)
+{
+    context.Request.EnableBuffering();
+    using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
+    var body = await reader.ReadToEndAsync(context.RequestAborted);
+    context.Request.Body.Position = 0;
+    return CreateAuthRequest(context, body);
+}
+
+static async Task WriteAuthResponseAsync(HttpContext context, ApiResponse response)
+{
+    context.Response.StatusCode = response.StatusCode;
+    if (response.AllowHeader is not null)
+        context.Response.Headers.Allow = response.AllowHeader;
+    context.Response.ContentType = "application/json; charset=utf-8";
+    context.Response.ContentLength = response.Body.Length;
+    await context.Response.Body.WriteAsync(response.Body, context.RequestAborted);
+}
 
 // 真正执行连接（纯逻辑，不含持久化/日志，便于 connect 与 reconnect 复用）
 static (bool ok, string? connectionId, string? home, string? error) ConnectInternal(ConnectRequest req, ConnectionManager mgr)

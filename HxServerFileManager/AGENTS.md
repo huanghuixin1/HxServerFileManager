@@ -22,6 +22,13 @@
 - **交互终端路径同步（OSC 7）**：后端 `EnsureShell` 注入 `PROMPT_COMMAND`（printf OSC 7 序列 `\033]7;file://$HOSTNAME$PWD\007`）+ 自定义 PS1。bash 每次打印提示符前输出 OSC 7 携带当前目录；前端 Terminal.vue 在 SSE 数据里正则提取（跨 chunk 缓冲，`extractOsc7`），剥掉序列再 `xterm.write`，解析出的 path 通过 `update:cwd` 推给 App 同步文件列表。反向：App.vue 的 `onNavigate`（文件列表导航）调用 `termRefs[connId].injectCd(path)` 向交互终端写 `cd <path>\r`（Terminal 内判断是否交互模式；全屏程序运行时会被吞进程序，属预期）。**「同步路径」关闭时 `onNavigate`/`onCwdChanged` 直接 return，两端互不干扰**。OSC 7 依赖 bash（非 bash 时仅失去路径同步）
 - `client/vite.config.js`：dev proxy 指向 `http://localhost:5101`
 
+## 登录鉴权（HxSimpleWebAuth）
+- 鉴权库：`libs/HxSimpleWebAuth.dll`（从 BackDatabase 项目拷来，net8 程序集 net10 可引用；csproj `<Reference HintPath=libs\...>` + `<None Include=libs\**\* CopyToOutputDirectory>`，构建会拷到 bin）。API：`new WebAdminAuth(password, logDirectory, envVarName)`；`Authorize(HttpRequestData)` 校验 Bearer token；`Handle(HttpRequestData, path)` 处理登录/登出（登录 POST body 用 `{"key": "<密码>"}`，返回 `{token, expiresAt}`，错误时 `{error, locked, remainingAttempts}`）；`IsAuthPath(path)` 判定 `/api/auth/login|logout`；`HttpRequestData(Method, Target, Headers, Body, RemoteIp)`；`ApiResponse(StatusCode, Body, AllowHeader)` + `Json/Error` 静态方法。**token 只认 Authorization: Bearer 头，不认查询参数**
+- 密码配置：**优先级 ① 环境变量 `HXSFM_WEB_PASSWORD`（可覆盖）→ ② `configs/env.json` 的 `authPwd` 字段（模板 `configs/env.json.example`，`LoadConfigPassword()` 读取）**。`configs/env.json` 已加入根 .gitignore（存密码不入库），`env.json.example` 可提交。**配置了密码**：所有 /api（除 /api/session 与 /api/auth/*）必须带有效 token；**未配置**：仅本机回环可访问（fail-closed，防止内网裸奔；手机/局域网访问必须设密码）
+- 中间件位于 `app.Use(...)`（静态文件之前），`CreateAuthRequest(Async)` 把 HttpContext 转 HttpRequestData；**EventSource/<a download> 带不了请求头**，前端把 token 放 `?token=` 查询参数，中间件检测到无 Authorization 头时自动补 `Authorization: Bearer <token>` 再校验（实测 SSE/download 均通过）
+- 端点：`GET /api/session`（返回 `{required, authenticated}`，前端据此显示登录页）、`POST /api/auth/login`、`POST /api/auth/logout`（吊销 token，之后原 token 变 401）
+- 前端（api.js）：token 存 sessionStorage + 勾选记住时存 localStorage（`hxsfm_auth_token`）；`request()` 统一带 Bearer 头，401（非登录接口）触发 `setUnauthorizedHandler` → App 清状态回登录页；`api.login` 单独处理 401 拿 locked/remainingAttempts 展示；下载 URL 与 SSE URL 追加 `?token=`。App.vue：`checkSession` 探测后决定渲染 LoginView 还是主界面，**认证通过后才 loadSaved + restoreWorkspace**；退出登录会吊销 token + 逐个断开 SSH 会话 + 清 localStorage；登录成功（onAuthed）后同样恢复会话/路径
+
 ## 已知问题
 - 曾批量出现“字段名不匹配”：前端发 `connId`，后端绑 `ConnectionId`，导致 disconnect/reconnect/mkdir/rename/delete/command/save 全部静默失败或 404。已全部统一为 `connectionId`。**新增后端接口时务必核对 body 字段名**
 - 后端最小 API 返回体一律 camelCase（`FileEntry` 序列化为 `name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 曾误读 PascalCase 导致列表空白，已改 camelCase。**前端读响应字段时一律用小写开头**

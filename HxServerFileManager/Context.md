@@ -41,6 +41,13 @@
 - 别名：连接表单与编辑表单均可设置 `name`；连接/重连响应新增 `name`；标签和已保存列表显示别名（列表里别名≠主机时附带主机 tag）。
 - 已用 mock 实测：连接中下拉开第二个连接、编辑改别名、下拉/管理面板同步刷新。
 
+## 登录鉴权（HxSimpleWebAuth）
+- 后端引用 `libs/HxSimpleWebAuth.dll`（net8，net10 可引用）：`WebAdminAuth` 负责凭据/token/失败锁定/IP 绑定校验。密码来源优先级：**① 环境变量 `HXSFM_WEB_PASSWORD`（可覆盖）→ ② `configs/env.json` 的 `authPwd` 字段**（`LoadConfigPassword()` 读取，文件不存在/解析失败返回 null）——设置后所有 /api（除 /api/session、/api/auth/*）必须带 Bearer token；未设置则仅本机回环可访问。`configs/env.json` 已 gitignore（存密码不入库），模板 `configs/env.json.example` 可提交。
+- 端点：`GET /api/session`（required/authenticated 探测）、`POST /api/auth/login`（body `{"key":密码}` → `{token}`）、`POST /api/auth/logout`（吊销 token）。
+- SSE（/api/logs/stream、/api/terminal/stream）与 `<a download>` 带不了请求头：前端把 token 放 `?token=` 查询参数，后端中间件统一转成 Authorization 头再校验。
+- 前端：登录页 LoginView.vue（密码+记住我+剩余次数提示）；api.js 统一带 Bearer 头、401 触发回登录页；token 存 sessionStorage/localStorage（hxsfm_auth_token）；认证通过后才恢复会话/路径；退出登录吊销 token + 断开所有 SSH 会话。
+- 实测（curl + 浏览器）：无 token 401、错密码提示剩余次数、正确登录拿 token、SSE/download 带 ?token= 通过、登出后 token 失效、刷新记住登录、退出回登录页全部通过。
+
 ## 文件列表：操作下拉 + 行多选
 - 「上传/新建目录/删除」收进「操作」下拉（el-dropdown：新建目录/上传/删除，删除为**批量删除**——未选中时禁用、显示「删除（N）」数量，确认后逐个删除并刷新），工具栏只剩 同步路径/上级/刷新/操作。
 - 行选择改为 Windows/Mac 风格：隐藏 selection 列 checkbox（CSS display:none，列宽 1px）；`@row-click` 自处理——普通单击单选、Ctrl/Cmd 加减选、Shift 范围选（lastSelected 到当前行），`row-key=fullPath`，`.row-selected` 高亮。双击目录/文件仍打开/编辑。
@@ -67,10 +74,13 @@
 `docker compose up -d --build` → 容器 22 映射本机 2222，`testuser/testpass`。
 
 ## 安全提醒
-`connections.json` 明文存密码/私钥，仅限本地/内网。
+- `connections.json` 明文存密码/私钥，仅限本地/内网。
+- 访问控制：设密码（`HXSFM_WEB_PASSWORD` 或 `configs/env.json` 的 `authPwd`）后所有接口需登录；未设置时仅本机回环可访问。局域网/公网使用必须设置强密码。
 
 ## 运行
 ```bash
-dotnet run                      # 后端 http://localhost:5101
+# 带登录鉴权（密码写进 configs/env.json 的 authPwd，模板见 configs/env.json.example）
+PORT=5101 ./bin/Debug/net10.0/HxServerFileManager.exe
+# 或用环境变量覆盖：HXSFM_WEB_PASSWORD=你的密码 PORT=5101 ...
 cd client && npm run build      # 前端产物 -> ../wwwroot
 ```

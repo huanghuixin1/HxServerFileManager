@@ -1,13 +1,19 @@
 <script setup>
 import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from './api.js'
+import { api, getToken, setToken, clearToken, setUnauthorizedHandler } from './api.js'
 import ConnectPanel from './components/ConnectPanel.vue'
 import SavedConnections from './components/SavedConnections.vue'
 import FileManager from './components/FileManager.vue'
 import Terminal from './components/Terminal.vue'
 import LogPanel from './components/LogPanel.vue'
 import EditorModal from './components/EditorModal.vue'
+import LoginView from './components/LoginView.vue'
+
+// ---- 登录鉴权状态：探测 /api/session，未认证时显示登录页 ----
+const authLoading = ref(true)
+const authRequired = ref(false)
+const authed = ref(false)
 
 // 多连接：connections 保存所有活跃会话，activeId 标记当前查看的标签
 const connections = ref([])
@@ -81,9 +87,64 @@ async function loadSaved() {
     savedList.value = res.connections || []
   } catch (_) { /* 忽略：下拉里会显示空 */ }
 }
-onMounted(() => {
+
+// 会话探测：决定显示登录页还是主界面；认证通过后才恢复会话/路径
+async function checkSession() {
+  try {
+    const res = await api.session()
+    authRequired.value = !!res.required
+    authed.value = !!res.authenticated
+  } catch (_) {
+    // 后端不可达：先按未认证处理，主界面操作时会再报错
+    authRequired.value = true
+    authed.value = false
+  } finally {
+    authLoading.value = false
+  }
+  if (authed.value) {
+    loadSaved()
+    restoreWorkspace() // 恢复上次打开的 SSH 会话与路径
+  }
+}
+
+// 登录成功：保存 token 后进入主界面并恢复会话
+function onAuthed(res) {
+  setToken(res.token, res.remember)
+  authed.value = true
   loadSaved()
-  restoreWorkspace() // 恢复上次打开的 SSH 会话与路径
+  restoreWorkspace()
+}
+
+// 任意请求 401（token 失效/被吊销）：清 token 退回登录页，并清理界面会话状态
+function onUnauthorized() {
+  authed.value = false
+  connections.value = []
+  activeId.value = null
+  termRefs && Object.keys(termRefs).forEach((k) => delete termRefs[k])
+  Object.keys(cwdMap).forEach((k) => delete cwdMap[k])
+  // 界面已回登录页，后端会话由空闲回收兜底
+}
+setUnauthorizedHandler(onUnauthorized)
+
+// 退出登录：吊销 token + 断开所有 SSH 会话 + 回到登录页
+async function logout() {
+  try {
+    await api.logout()
+  } catch (_) { /* 忽略：token 可能已失效 */ }
+  clearToken()
+  // 逐个断开活跃连接，避免退出后仍挂着 SSH 会话
+  for (const c of [...connections.value]) {
+    try { await api.disconnect(c.connectionId) } catch (_) { /* ignore */ }
+  }
+  connections.value = []
+  activeId.value = null
+  Object.keys(termRefs).forEach((k) => delete termRefs[k])
+  Object.keys(cwdMap).forEach((k) => delete cwdMap[k])
+  authed.value = false
+}
+
+onMounted(() => {
+  checkSession()
 })
 
 // 把当前活跃会话（profileId + 路径）写入 localStorage（防抖）
@@ -249,7 +310,11 @@ function closeEditor() {
 </script>
 
 <template>
-  <div class="app">
+  <div v-if="authLoading" class="auth-loading">
+    <el-icon class="is-loading" :size="26"><Loading /></el-icon>
+  </div>
+  <LoginView v-else-if="authRequired && !authed" @authed="onAuthed" />
+  <div v-else class="app">
     <header class="topbar">
       <div class="brand">
         <el-icon :size="18"><Monitor /></el-icon>
@@ -301,6 +366,9 @@ function closeEditor() {
         </el-button>
         <el-button v-if="activeConn" type="danger" plain @click="disconnectActive">
           断开当前
+        </el-button>
+        <el-button v-if="authRequired" text type="warning" @click="logout">
+          <el-icon style="margin-right: 4px"><SwitchButton /></el-icon>退出登录
         </el-button>
       </div>
     </header>
@@ -423,6 +491,13 @@ function closeEditor() {
 </template>
 
 <style>
+.auth-loading {
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #2d6cdf;
+}
 .app {
   display: flex;
   flex-direction: column;
