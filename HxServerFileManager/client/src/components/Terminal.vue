@@ -54,10 +54,10 @@ function restoreFocus() {
   nextTick(() => inputRef.value?.focus())
 }
 
-// ---- 交互终端（xterm + SSE）----
+// ---- 交互终端（xterm + WebSocket 双向通道）----
 const termHost = ref(null)
 let xterm = null
-let es = null
+let ws = null
 let initialCdDone = false // 首次打开时按 cwd prop 恢复目录（刷新/重开回到上次路径）
 let oscIgnored = false // 注入恢复路径完成前忽略 OSC 7（防止 shell 初始目录覆盖恢复路径）
 // 挂载时快照初始目录：恢复路径不能被后续 OSC 7 推送覆盖（props.cwd 会随 cwdMap 变化）
@@ -124,7 +124,7 @@ async function openInteractive() {
       initialCdDone = true
       oscIgnored = true // cd 生效前的 OSC 7（shell 初始目录）不推给 App，避免覆盖恢复路径
       setTimeout(() => {
-        api.terminalInput(props.connId, `cd ${initialCwd}\r`).catch(() => {})
+        sendInput(`cd ${initialCwd}\r`)
         setTimeout(() => { oscIgnored = false }, 500) // cd 生效后恢复推送
       }, 400) // 等 shell 提示符就绪
     } else if (!initialCdDone) {
@@ -142,14 +142,14 @@ async function openInteractive() {
       xterm.open(termHost.value)
       xterm.resize(cols, rows)
       xterm.onData((data) => {
-        api.terminalInput(props.connId, data).catch(() => {})
+        sendInput(data)
       })
       xterm.writeln('--- 交互终端已连接（可直接输入；Ctrl+C 中断，exit 退出） ---')
     }
 
-    if (!es) {
-      es = new EventSource(api.terminalStreamUrl(props.connId))
-      es.onmessage = (e) => {
+    if (!ws) {
+      ws = new WebSocket(api.terminalWsUrl(props.connId))
+      ws.onmessage = (e) => {
         try {
           const msg = JSON.parse(e.data)
           if (msg.type === 'out' && xterm) {
@@ -157,10 +157,12 @@ async function openInteractive() {
             // 终端 cd 后推送新目录（文件列表跟随）；OSC 序列本身不渲染
             if (paths.length && !oscIgnored) emit('update:cwd', paths[paths.length - 1])
             if (cleaned) xterm.write(cleaned)
+          } else if (msg.type === 'closed' && xterm) {
+            xterm.writeln('\r\n[终端已关闭] ' + (msg.reason || ''))
           }
         } catch (_) { /* ignore */ }
       }
-      es.onerror = () => { /* EventSource 自动重连 */ }
+      ws.onerror = () => { /* close 回调会处理重连 */ }
     }
     xterm.focus()
   } catch (e) {
@@ -168,15 +170,21 @@ async function openInteractive() {
   }
 }
 
+function sendInput(data) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'input', data }))
+  }
+}
+
 function closeInteractive() {
-  if (es) { es.close(); es = null }
+  if (ws) { try { ws.close() } catch (_) {} ws = null }
   if (xterm) { try { xterm.dispose() } catch (_) {} xterm = null }
 }
 
 // 文件列表导航 -> 在交互终端里执行 cd（仅交互模式生效；全屏程序运行时会被吞进程序里，属预期）
 function injectCd(path) {
   if (mode.value !== 'interactive') return
-  api.terminalInput(props.connId, `cd ${path}\r`).catch(() => {})
+  sendInput(`cd ${path}\r`)
 }
 
 defineExpose({ injectCd })

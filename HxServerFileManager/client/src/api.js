@@ -176,21 +176,17 @@ export const api = {
       body: JSON.stringify({ connectionId: connId, cols, rows }),
     }),
 
-  terminalInput: (connId, data) =>
-    request('/api/terminal/input', {
-      method: 'POST',
-      body: JSON.stringify({ connectionId: connId, data }),
-    }),
-
   terminalClose: (connId) =>
     request('/api/terminal/close', {
       method: 'POST',
       body: JSON.stringify({ connectionId: connId }),
     }),
 
-  // SSE 不能带请求头，token 放查询参数
-  terminalStreamUrl: (connId) =>
-    `/api/terminal/stream?connId=${encodeURIComponent(connId)}&token=${encodeURIComponent(getToken())}`,
+  // WebSocket 双向通道（输入+输出共一条连接，token 走 ?token= 查询参数）
+  terminalWsUrl: (connId) => {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    return `${proto}//${location.host}/api/terminal/ws?connId=${encodeURIComponent(connId)}&token=${encodeURIComponent(getToken())}`
+  },
 }
 
 // SSE 实时日志流（EventSource 不能带请求头，token 走查询参数）

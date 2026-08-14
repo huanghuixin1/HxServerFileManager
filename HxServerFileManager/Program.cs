@@ -9,6 +9,7 @@ using Renci.SshNet;
 using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 using System.Collections.Concurrent;
+using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -493,7 +494,109 @@ app.MapGet("/api/terminal/stream", async (string connId, HttpContext ctx, Connec
     return Results.Empty;
 });
 
+// ----------------------------------------------------------------------------
+// 交互终端 WebSocket：双向通道，输入输出共一条连接，替代「SSE 输出 + POST 输入」。
+// 鉴权由上方中间件统一处理（?token= 查询参数 → Authorization 头）。
+// 消息格式（JSON 文本帧）：
+//   入站 { "type": "input", "data": "..." }   写入 shell stdin
+//   入站 { "type": "resize", "cols": 80, "rows": 24 }
+//   出站 { "type": "out", "data": "..." }     shell stdout（含 OSC 7）
+//   出站 { "type": "closed", "reason": "..." } shell 已关闭
+// ----------------------------------------------------------------------------
+app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, ConnectionManager mgr) =>
+{
+    if (!ctx.WebSockets.IsWebSocketRequest)
+        return Results.BadRequest(new { error = "需要 WebSocket 请求" });
+
+    SshSession s;
+    try { s = mgr.Get(connId); }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+    using var ws = await ctx.WebSockets.AcceptWebSocketAsync();
+
+    ShellStream? shell;
+    Channel<byte[]>? ch;
+    lock (s.ShellLock) { shell = s.Shell; ch = s.ShellOutput; }
+    if (shell is null || ch is null || !s.ShellAlive)
+    {
+        await SendWsJsonAsync(ws, new { type = "closed", reason = "终端未打开，请先 POST /api/terminal/open" }, ctx.RequestAborted);
+        return Results.Empty;
+    }
+
+    // 输出转发任务：shell 输出 channel → WebSocket
+    var pump = Task.Run(async () =>
+    {
+        try
+        {
+            // 先回放 tail，再实时推送（与 SSE 行为一致）
+            string tail;
+            lock (s.ShellTail) tail = s.ShellTail.ToString();
+            if (tail.Length > 0)
+                await SendWsJsonAsync(ws, new { type = "out", data = tail }, ctx.RequestAborted);
+
+            await foreach (var chunk in ch.Reader.ReadAllAsync(ctx.RequestAborted))
+            {
+                var data = Encoding.UTF8.GetString(chunk);
+                await SendWsJsonAsync(ws, new { type = "out", data }, ctx.RequestAborted);
+            }
+        }
+        catch (OperationCanceledException) { /* 客户端断开 */ }
+        catch (Exception) { /* channel 关闭等 */ }
+    }, ctx.RequestAborted);
+
+    // 主循环：读取入站 WebSocket 帧 → shell stdin
+    try
+    {
+        var buf = new byte[8192];
+        while (true)
+        {
+            var result = await ws.ReceiveAsync(buf, ctx.RequestAborted);
+            if (result.MessageType == WebSocketMessageType.Close)
+                break;
+            if (result.MessageType != WebSocketMessageType.Text)
+                continue;
+            var text = Encoding.UTF8.GetString(buf, 0, result.Count);
+
+            try
+            {
+                using var doc = JsonDocument.Parse(text);
+                if (doc.RootElement.TryGetProperty("type", out var typeEl))
+                {
+                    var t = typeEl.GetString();
+                    lock (s.ShellLock)
+                    {
+                        if (s.Shell is null || !s.ShellAlive)
+                            break;
+
+                        if (t == "input" && doc.RootElement.TryGetProperty("data", out var dataEl))
+                        {
+                            s.Shell.Write(dataEl.GetString() ?? "");
+                            s.Shell.Flush();
+                        }
+                        else if (t == "resize"
+                                 && doc.RootElement.TryGetProperty("cols", out var colsEl)
+                                 && doc.RootElement.TryGetProperty("rows", out var rowsEl))
+                        {
+                            // ShellStream 不支持动态 resize，忽略（与现有行为一致）
+                        }
+                    }
+                }
+            }
+            catch (JsonException) { /* 非法 JSON，忽略 */ }
+        }
+    }
+    catch (OperationCanceledException) { }
+    catch (WebSocketException) { }
+
+    // 等输出转发结束（取消 token 已触发，pump 会快速退出）
+    try { await pump; } catch { }
+    try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
+
+    return Results.Empty;
+});
+
 // 向交互终端写输入（按键/粘贴/控制键都走这里）
+// 保留供向后兼容；前端已改用 WebSocket 双向通道。
 app.MapPost("/api/terminal/input", (TerminalInputRequest req, ConnectionManager mgr) =>
 {
     try
@@ -667,6 +770,13 @@ static async Task WriteAuthResponseAsync(HttpContext context, ApiResponse respon
     context.Response.ContentType = "application/json; charset=utf-8";
     context.Response.ContentLength = response.Body.Length;
     await context.Response.Body.WriteAsync(response.Body, context.RequestAborted);
+}
+
+static async Task SendWsJsonAsync(WebSocket ws, object payload, CancellationToken ct)
+{
+    var json = JsonSerializer.Serialize(payload);
+    var bytes = Encoding.UTF8.GetBytes(json);
+    await ws.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
 }
 
 // 真正执行连接（纯逻辑，不含持久化/日志，便于 connect 与 reconnect 复用）
