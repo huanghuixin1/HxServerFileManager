@@ -13,7 +13,7 @@ import EditorModal from './components/EditorModal.vue'
 const connections = ref([])
 const activeId = ref(null)
 const connectVisible = ref(false)
-const logEnabled = ref(true)
+const logEnabled = ref(false) // 实时操作日志默认隐藏，顶部按钮可随时开关
 const editor = ref({ open: false, connId: null, path: null })
 
 // 已保存连接（来自后端 connections.json）：下拉快速打开 + 管理/编辑
@@ -27,11 +27,49 @@ const activeConn = computed(
   () => connections.value.find((c) => c.connectionId === activeId.value) || null
 )
 
+// 窄屏（单列布局）时分隔条是横向的，拖拽调高度
+const isNarrow = ref(window.matchMedia('(max-width: 1000px)').matches)
+window.matchMedia('(max-width: 1000px)').addEventListener('change', (e) => {
+  isNarrow.value = e.matches
+})
+
 // 文件列表是否跟随终端路径（默认开）；每连接的会话工作目录，终端与文件列表共享
 const syncCwd = ref(true)
 const cwdMap = reactive({})
 // 各连接 Terminal 组件实例（导航时向交互终端注入 cd）
 const termRefs = reactive({})
+
+// 工作区布局：终端在左（默认更宽）可拖拽调宽；窄屏单列时终端在上，可拖拽调高度；支持终端最大化
+const termMax = ref(false)
+const termWidth = ref(58)  // 双列时终端宽度百分比
+const termHeight = ref(50) // 单列时终端高度百分比
+function startResize(e) {
+  if (termMax.value) return
+  e.preventDefault() // 防止拖动时选中文本/触发默认行为
+  const el = e.currentTarget.parentElement
+  const rect = el.getBoundingClientRect()
+  // 根据实际布局方向决定拖宽度还是高度（响应式切换时以渲染为准）
+  const isCol = getComputedStyle(el).flexDirection === 'column'
+  const startPos = isCol ? e.clientY : e.clientX
+  const startPct = isCol ? termHeight.value : termWidth.value
+  const move = (ev) => {
+    const delta = (isCol ? ev.clientY : ev.clientX) - startPos
+    const pct = startPct + (delta / (isCol ? rect.height : rect.width)) * 100
+    const v = Math.min(75, Math.max(30, pct))
+    if (isCol) termHeight.value = v
+    else termWidth.value = v
+  }
+  const up = () => {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+  document.body.style.cursor = isCol ? 'row-resize' : 'col-resize'
+  document.body.style.userSelect = 'none'
+}
 
 async function loadSaved() {
   try {
@@ -258,7 +296,25 @@ function closeEditor() {
           v-show="activeId === c.connectionId"
           :key="c.connectionId"
           class="workspace"
+          :class="{ 'term-max': termMax }"
+          :style="{ '--term-w': termWidth + '%', '--term-h': termHeight + '%' }"
         >
+          <!-- 终端在左（默认更宽），文件列表在右（可窄） -->
+          <Terminal
+            :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
+            :conn-id="c.connectionId"
+            :cwd="cwdMap[c.connectionId]"
+            :maximized="termMax"
+            @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
+            @toggle-max="termMax = !termMax"
+          />
+          <div
+            v-if="!termMax"
+            class="ws-divider"
+            :class="{ narrow: isNarrow }"
+            :title="isNarrow ? '按住上下拖拽调整高度' : '按住左右拖拽调整宽度'"
+            @pointerdown="startResize"
+          ></div>
           <FileManager
             :conn-id="c.connectionId"
             :initial-dir="c.homeDirectory"
@@ -267,12 +323,6 @@ function closeEditor() {
             @open-file="(p) => openEditor(c.connectionId, p)"
             @navigate="(p) => onNavigate(c.connectionId, p)"
             @update:sync-cwd="(v) => (syncCwd = v)"
-          />
-          <Terminal
-            :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
-            :conn-id="c.connectionId"
-            :cwd="cwdMap[c.connectionId]"
-            @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
           />
         </div>
       </section>
@@ -455,21 +505,74 @@ function closeEditor() {
   min-height: 0;
 }
 .workspace {
-  display: grid;
-  grid-template-columns: 1.4fr 1fr;
-  grid-template-rows: minmax(0, 1fr); /* 显式行高：子项 height:100% 才有确定参照，否则回退成内容高度导致卡片矮半截 */
-  gap: 18px;
+  display: flex;
   height: 100%;
   min-height: 0;
 }
+.workspace > .term {
+  /* 终端在左，默认 58%，拖拽调宽（flex-basis 由 --term-w 控制） */
+  flex: 0 0 var(--term-w, 58%);
+  min-width: 0;
+}
+.workspace > .fm {
+  flex: 1 1 0;
+  min-width: 0;
+}
+.ws-divider {
+  flex-shrink: 0;
+  width: 20px; /* 拖拽热区加宽，更容易抓住 */
+  cursor: col-resize;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  transition: background 0.15s;
+}
+.ws-divider:hover {
+  background: rgba(45, 108, 223, 0.08); /* hover 整条高亮，提示可拖 */
+}
+.ws-divider::after {
+  content: '';
+  width: 4px;
+  height: 64px;
+  border-radius: 3px;
+  background: #d8e0ea;
+  transition: background 0.15s;
+}
+.ws-divider:hover::after {
+  background: #2d6cdf;
+}
+/* 终端最大化：占满整个工作区，隐藏文件列表与分隔条 */
+.workspace.term-max > .term {
+  flex: 1 0 100%;
+}
+.workspace.term-max > .fm,
+.workspace.term-max > .ws-divider {
+  display: none;
+}
 @media (max-width: 1000px) {
-  .connect-area,
-  .workspace {
+  .connect-area {
     grid-template-columns: 1fr;
   }
   .workspace {
-    /* 单列上下排：两卡片各占一半高度（否则第二行 auto 会塌成内容高） */
-    grid-template-rows: minmax(0, 1fr) minmax(0, 1fr);
+    /* 单列上下排：终端在上，文件列表在下，各占一半 */
+    flex-direction: column;
+  }
+  .workspace > .term {
+    flex: 0 0 var(--term-h, 50%); /* 单列：终端在上，可拖拽调高度 */
+  }
+  .ws-divider {
+    width: 100%;
+    height: 20px; /* 横条也加宽 */
+    cursor: row-resize;
+    flex-shrink: 0;
+  }
+  .ws-divider::after {
+    height: 4px;
+    width: 64px;
+  }
+  .workspace.term-max > .term {
+    flex: 1 0 100%;
   }
 }
 </style>

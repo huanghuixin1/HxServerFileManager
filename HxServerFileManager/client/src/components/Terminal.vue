@@ -10,8 +10,9 @@ import { api } from '../api.js'
 const props = defineProps({
   connId: String,
   cwd: { type: String, default: '/' },
+  maximized: { type: Boolean, default: false },
 })
-const emit = defineEmits(['update:cwd'])
+const emit = defineEmits(['update:cwd', 'toggle-max'])
 
 // 默认交互终端（真终端）；快捷命令保留为二线工具
 const mode = ref('interactive')
@@ -196,6 +197,16 @@ onUnmounted(() => {
         :disabled="lines.length === 0"
         @click="lines = []"
       >清空</el-button>
+      <el-button
+        size="small"
+        text
+        :title="maximized ? '还原' : '最大化'"
+        @click="emit('toggle-max')"
+      >
+        <el-icon :size="16">
+          <FullScreen v-if="!maximized" /><Aim v-else />
+        </el-icon>
+      </el-button>
     </div>
 
     <!-- 快捷命令模式 -->

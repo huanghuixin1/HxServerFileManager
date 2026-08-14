@@ -199,7 +199,10 @@ function fmtSize(n) {
 function fmtDate(s) {
   if (!s) return ''
   const d = new Date(s)
-  return isNaN(d) ? s : d.toLocaleString()
+  if (isNaN(d)) return s
+  const p = (n) => String(n).padStart(2, '0')
+  // 精确到分钟，去掉秒
+  return `${d.getFullYear()}/${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 </script>
 
