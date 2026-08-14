@@ -69,6 +69,81 @@ function menuDelete() {
 onMounted(() => document.addEventListener('click', closeMenu))
 onUnmounted(() => document.removeEventListener('click', closeMenu))
 
+// ---- 行单选/多选（Shift 范围选，Ctrl/Cmd 加减选，类似 Windows/Mac 文件管理器）----
+const tableRef = ref(null)
+const selectedSet = ref(new Set()) // 选中项的 fullPath
+let lastSelected = null
+
+function onSelectionChange(rows) {
+  selectedSet.value = new Set(rows.map((r) => r.fullPath))
+}
+function rowClassName({ row }) {
+  return selectedSet.value.has(row.fullPath) ? 'row-selected' : ''
+}
+function onRowClick(row, _col, event) {
+  const table = tableRef.value
+  if (!table) return
+  if (event.shiftKey && lastSelected) {
+    // Shift：上次选中到当前行的范围全部选中
+    const start = items.value.indexOf(lastSelected)
+    const end = items.value.indexOf(row)
+    if (start >= 0 && end >= 0) {
+      const range = items.value.slice(Math.min(start, end), Math.max(start, end) + 1)
+      for (const r of range) table.toggleRowSelection(r, true)
+    }
+    lastSelected = row
+  } else if (event.ctrlKey || event.metaKey) {
+    // Ctrl/Cmd：切换当前行选中（不重置其他）
+    table.toggleRowSelection(row, !selectedSet.value.has(row.fullPath))
+    lastSelected = row
+  } else {
+    // 普通单击：单选
+    table.clearSelection()
+    table.toggleRowSelection(row, true)
+    lastSelected = row
+  }
+}
+
+// 「操作」下拉：新建目录 / 上传 / 批量删除
+function onToolCommand(cmd) {
+  if (cmd === 'mkdir') newDirVisible.value = true
+  else if (cmd === 'upload') triggerUpload()
+  else if (cmd === 'delete') batchDelete()
+}
+
+// 当前选中项（来自当前目录列表）
+const selectedItems = computed(() => items.value.filter((i) => selectedSet.value.has(i.fullPath)))
+
+async function batchDelete() {
+  const sel = selectedItems.value
+  if (!sel.length) {
+    ElMessage.warning('请先选中要删除的文件')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      `确定删除选中的 ${sel.length} 项（${sel.some((i) => i.isDirectory) ? '含目录' : '文件'}）？此操作不可撤销。`,
+      '批量删除',
+      { type: 'warning', confirmButtonText: '删除', cancelButtonText: '取消' }
+    )
+  } catch (_) {
+    return // 用户取消
+  }
+  error.value = ''
+  try {
+    for (const item of sel) {
+      await api.remove(props.connId, parentDir(item.fullPath), item.name)
+    }
+    ElMessage.success(`已删除 ${sel.length} 项`)
+    tableRef.value?.clearSelection()
+    lastSelected = null
+    selectedSet.value = new Set()
+    await load()
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
 function combinePath(dir, name) {
   dir = (dir || '/').replace(/\/+$/, '')
   return (dir || '/') + '/' + String(name).replace(/^\/+/, '')
@@ -278,12 +353,25 @@ function fmtDate(s) {
         <el-button size="small" @click="load()">
           <el-icon style="margin-right: 4px"><Refresh /></el-icon>刷新
         </el-button>
-        <el-button size="small" type="primary" plain @click="newDirVisible = true">
-          <el-icon style="margin-right: 4px"><FolderAdd /></el-icon>新建目录
-        </el-button>
-        <el-button size="small" :loading="uploading" @click="triggerUpload">
-          <el-icon style="margin-right: 4px"><Upload /></el-icon>{{ uploading ? '上传中…' : '上传' }}
-        </el-button>
+        <el-dropdown trigger="click" @command="onToolCommand">
+          <el-button size="small" type="primary" plain>
+            <el-icon style="margin-right: 4px"><Menu /></el-icon>操作
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item command="mkdir">
+                <el-icon style="margin-right: 6px"><FolderAdd /></el-icon>新建目录
+              </el-dropdown-item>
+              <el-dropdown-item command="upload" :disabled="uploading">
+                <el-icon style="margin-right: 6px"><Upload /></el-icon>{{ uploading ? '上传中…' : '上传' }}
+              </el-dropdown-item>
+              <el-dropdown-item command="delete" :disabled="selectedItems.length === 0" divided>
+                <el-icon style="margin-right: 6px"><Delete /></el-icon>删除{{ selectedItems.length ? `（${selectedItems.length}）` : '' }}
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <input ref="fileInput" type="file" multiple hidden @change="onFileSelected" />
       </div>
     </div>
@@ -298,21 +386,22 @@ function fmtDate(s) {
     />
 
     <el-table
+      ref="tableRef"
       :data="items"
       class="fm-table"
       v-loading="loading"
       row-key="fullPath"
       empty-text="空目录"
-      @row-dblclick="(row) => (row.isDirectory ? openDir(row) : row.isText && emit('open-file', row.fullPath))"
+      :row-class-name="rowClassName"
+      @row-click="onRowClick"
+      @row-dblclick="(row) => (row.isDirectory ? openDir(row) : emit('open-file', row.fullPath))"
       @row-contextmenu="onRowContextMenu"
+      @selection-change="onSelectionChange"
     >
+      <el-table-column type="selection" width="1" class-name="sel-col" />
       <el-table-column label="名称" min-width="240">
         <template #default="{ row }">
-          <span
-            class="fname"
-            :class="{ dir: row.isDirectory, text: row.isText }"
-            @click="row.isDirectory ? openDir(row) : (row.isText && emit('open-file', row.fullPath))"
-          >
+          <span class="fname" :class="{ dir: row.isDirectory, text: row.isText }">
             <el-icon class="fico"><Folder v-if="row.isDirectory" /><Document v-else-if="row.isText" /><Files v-else /></el-icon>
             {{ row.name }}
           </span>
@@ -392,6 +481,9 @@ function fmtDate(s) {
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  /* 屏蔽浏览器原生文本选中（行选择/拖拽时不出高亮） */
+  user-select: none;
+  -webkit-user-select: none;
 }
 .fm-toolbar {
   display: flex;
@@ -473,6 +565,18 @@ function fmtDate(s) {
 }
 .fname.text .fico {
   color: #7a8794;
+}
+
+/* 单选/多选：隐藏 selection 列 checkbox，行点击驱动选择 */
+.fm-table :deep(.el-table__header .el-checkbox),
+.fm-table :deep(.el-table__cell .el-checkbox) {
+  display: none;
+}
+.fm-table :deep(.el-table__row.row-selected > td.el-table__cell) {
+  background: #e3efff !important;
+}
+.fm-table :deep(.el-table__row.row-selected .fname) {
+  color: #2d6cdf;
 }
 
 /* 行右键菜单 */
