@@ -95,6 +95,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ connectionId: connId, command }),
     }),
+
+  setCwd: (connId, path) =>
+    request('/api/cwd', {
+      method: 'POST',
+      body: JSON.stringify({ connectionId: connId, path }),
+    }),
 }
 
 // SSE 实时日志流

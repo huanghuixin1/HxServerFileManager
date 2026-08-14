@@ -6,8 +6,10 @@ import { api } from '../api.js'
 const props = defineProps({
   connId: String,
   initialDir: { type: String, default: '/' },
+  syncCwd: { type: Boolean, default: true },
+  externalPath: { type: String, default: null }, // 终端推送的目录（syncCwd 开启时跟随）
 })
-const emit = defineEmits(['open-file'])
+const emit = defineEmits(['open-file', 'navigate', 'update:sync-cwd'])
 
 const cwd = ref(props.initialDir || '/')
 const items = ref([])
@@ -66,12 +68,25 @@ async function load(dir) {
 onMounted(() => load())
 watch(() => props.connId, () => load(props.initialDir))
 
+// 用户主动导航：跳目录并通知 App 同步会话 cwd（终端提示符/下一条命令跟随）
+function goPath(p) {
+  load(p)
+  emit('navigate', p)
+}
 function openDir(item) {
-  if (item.isDirectory) load(item.fullPath)
+  if (item.isDirectory) goPath(item.fullPath)
 }
 function goUp() {
-  load(parentDir(cwd.value))
+  goPath(parentDir(cwd.value))
 }
+
+// 终端 cd 后 App 推来新目录，文件列表跟随（syncCwd 关闭时 externalPath 为 null，自动忽略）
+watch(
+  () => props.externalPath,
+  (p) => {
+    if (p && p !== cwd.value) load(p)
+  }
+)
 
 function download(item) {
   const a = document.createElement('a')
@@ -191,22 +206,26 @@ function fmtDate(s) {
 <template>
   <div class="card fm">
     <div class="fm-toolbar">
-      <el-breadcrumb separator="/" class="crumbs">
-        <el-breadcrumb-item>
-          <a class="crumb-link" @click="load('/')">/</a>
-        </el-breadcrumb-item>
-        <el-breadcrumb-item v-for="(b, i) in breadcrumbs" :key="b.path">
+      <div class="crumbs">
+        <span class="crumb-link root" @click="goPath('/')">/</span>
+        <template v-for="(b, i) in breadcrumbs" :key="b.path">
+          <span v-if="i > 0" class="sep">/</span>
           <span
-            v-if="i < breadcrumbs.length - 1"
             class="crumb-link"
-            @click="load(b.path)"
+            :class="{ last: i === breadcrumbs.length - 1 }"
+            @click="goPath(b.path)"
             >{{ b.name }}</span
           >
-          <span v-else class="crumb-current">{{ b.name }}</span>
-        </el-breadcrumb-item>
-      </el-breadcrumb>
+        </template>
+      </div>
 
       <div class="tools">
+        <el-checkbox
+          :model-value="syncCwd"
+          @update:model-value="emit('update:sync-cwd', $event)"
+          class="sync-cb"
+          >跟随终端路径</el-checkbox
+        >
         <el-button size="small" @click="goUp">
           <el-icon style="margin-right: 4px"><Top /></el-icon>上级
         </el-button>
@@ -325,17 +344,35 @@ function fmtDate(s) {
   flex: 1;
   min-width: 0;
   font-size: 13px;
+  display: flex;
+  align-items: center;
+  white-space: nowrap;
+  overflow: hidden;
 }
 .crumb-link {
   color: #2d6cdf;
   cursor: pointer;
+  padding: 2px 3px;
+  border-radius: 4px;
 }
 .crumb-link:hover {
-  text-decoration: underline;
+  background: var(--accent-soft);
 }
-.crumb-current {
+.crumb-link.last {
   color: #1f2d3d;
   font-weight: 600;
+  cursor: default;
+}
+.crumb-link.last:hover {
+  background: transparent;
+}
+.sep {
+  color: #b6c0cc;
+  flex-shrink: 0;
+}
+.sync-cb {
+  margin-right: 4px;
+  white-space: nowrap;
 }
 .tools {
   display: flex;

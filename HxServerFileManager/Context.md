@@ -17,6 +17,13 @@
 ## 文件列表空白 bug 已修（字段大小写）
 - 后端 `/api/files` 的 `FileEntry` 经最小 API 序列化为 camelCase（`name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 原来读 PascalCase，导致名称/大小/修改时间全空白。已统一改读 camelCase。
 
+## 终端路径持久化 + 文件列表联动
+- 根因：SSH.NET 每次 `CreateCommand` 都是新 exec 通道，`cd` 不保留，所以终端总回默认目录。
+- 方案：`SshSession.Cwd` 会话级 cwd（连接时初始化为 SFTP 工作目录）；`/api/command` 命令包装为 `cd <cwd> && <cmd>; rc=$?; pwd; exit $rc`，解析末尾 pwd 行更新并返回 cwd；新增 `/api/cwd` 供文件列表导航同步会话目录。
+- 前端：App.vue `cwdMap` 每连接共享；FileManager 工具栏「跟随终端路径」checkbox（默认开）控制文件列表随终端 cd 跳转；双向联动（点文件列表目录也会更新终端提示符和会话 cwd）。
+- 面包屑：弃用 el-breadcrumb（分隔符自带 margin 造成 `/` 右侧间隙），改自绘 span，无间隙无双斜杠。
+- 顺带修复：连接后初始目录没用家目录（ConnectPanel 未把 `homeDirectory` 传给 App）。
+
 ## 已保存连接增强
 - 顶栏「已保存连接」下拉：连接中也能一键打开任意已保存连接（新开标签），含「管理已保存的连接…」入口。
 - 管理对话框：重连/编辑/删除。

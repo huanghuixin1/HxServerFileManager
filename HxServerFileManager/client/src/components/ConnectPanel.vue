@@ -70,6 +70,7 @@ async function submit() {
         port: req.port,
         authType: authType.value,
         name: res.name || alias.value,
+        homeDirectory: res.homeDirectory || '/',
       })
     }
   } catch (e) {

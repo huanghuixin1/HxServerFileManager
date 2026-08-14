@@ -324,21 +324,52 @@ app.MapPut("/api/file-content", (FileContentRequest req, ConnectionManager mgr, 
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
 
-// 执行命令（阻塞至命令结束）
+// 执行命令（阻塞至命令结束）。
+// SSH.NET 每次 CreateCommand 都会开新的 exec 通道，cd 等目录状态默认不保留；
+// 这里在会话里记录 cwd，命令包装为 cd <cwd> && <cmd>; rc=$?; pwd; exit $rc，
+// 这样目录会跨命令保留，并返回最新 cwd 供前端（终端提示符 / 文件列表联动）使用。
 app.MapPost("/api/command", (CommandRequest req, ConnectionManager mgr, OperationLogger log) =>
 {
     try
     {
         var s = mgr.Get(req.ConnectionId);
-        using var cmd = s.Ssh.CreateCommand(req.Command ?? "");
+        var cwd = string.IsNullOrWhiteSpace(s.Cwd) ? "/" : s.Cwd;
+        var wrapped = $"cd {Shq(cwd)} && {req.Command ?? ""}; rc=$?; pwd; exit $rc";
+        using var cmd = s.Ssh.CreateCommand(wrapped);
         cmd.Execute();
-        log.Log("info", req.ConnectionId, "执行命令", req.Command ?? "", $"exit={cmd.ExitStatus}");
+
+        var output = (cmd.Result ?? "").TrimEnd('\r', '\n');
+        var newCwd = cwd;
+        var lines = output.Split('\n');
+        var last = lines[^1].Trim();
+        if (last.StartsWith('/'))
+        {
+            newCwd = last;
+            output = string.Join('\n', lines.Take(lines.Length - 1));
+        }
+        s.Cwd = newCwd;
+
+        log.Log("info", req.ConnectionId, "执行命令", req.Command ?? "", $"exit={cmd.ExitStatus} cwd={newCwd}");
         return Results.Ok(new
         {
-            output = cmd.Result ?? "",
+            output,
             error = cmd.Error ?? "",
-            exitStatus = cmd.ExitStatus
+            exitStatus = cmd.ExitStatus,
+            cwd = newCwd
         });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
+// 同步会话工作目录（文件列表导航时调用，让终端下一条命令从该目录开始）
+app.MapPost("/api/cwd", (CwdRequest req, ConnectionManager mgr, OperationLogger log) =>
+{
+    try
+    {
+        var s = mgr.Get(req.ConnectionId);
+        if (!string.IsNullOrWhiteSpace(req.Path)) s.Cwd = req.Path.Trim();
+        log.Log("info", req.ConnectionId, "切换目录", s.Cwd);
+        return Results.Ok(new { path = s.Cwd });
     }
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
@@ -390,6 +421,9 @@ static string CombinePath(string dir, string name)
     return dir + "/" + name.TrimStart('/');
 }
 
+// 单引号转义，用于安全地把路径拼进 sh 命令
+static string Shq(string s) => "'" + s.Replace("'", "'\\''") + "'";
+
 // 真正执行连接（纯逻辑，不含持久化/日志，便于 connect 与 reconnect 复用）
 static (bool ok, string? connectionId, string? home, string? error) ConnectInternal(ConnectRequest req, ConnectionManager mgr)
 {
@@ -424,11 +458,10 @@ static (bool ok, string? connectionId, string? home, string? error) ConnectInter
         ssh.Connect();
         sftp.Connect();
 
-        var id = mgr.Add(new SshSession(ssh, sftp));
-
         string home = "/";
         try { home = sftp.WorkingDirectory; } catch { /* ignore */ }
 
+        var id = mgr.Add(new SshSession(ssh, sftp, home));
         return (true, id, home, null);
     }
     catch (Exception ex)
@@ -497,6 +530,7 @@ public record PathRequest(string ConnectionId, string Path, string Name);
 public record RenameRequest(string ConnectionId, string Path, string Name, string NewPath);
 public record CommandRequest(string ConnectionId, string Command);
 public record FileContentRequest(string ConnectionId, string Path, string Content);
+public record CwdRequest(string ConnectionId, string Path);
 
 public record FileEntry(string Name, string FullPath, bool IsDirectory, long Size, DateTime LastWriteTimeUtc, bool IsText);
 
@@ -512,10 +546,14 @@ public sealed class SshSession : IDisposable
     public SftpClient Sftp { get; }
     public DateTime LastUsedUtc { get; private set; } = DateTime.UtcNow;
 
-    public SshSession(SshClient ssh, SftpClient sftp)
+    /// <summary>当前工作目录：命令包装 + 文件列表联动共用的会话级状态。</summary>
+    public string Cwd { get; set; }
+
+    public SshSession(SshClient ssh, SftpClient sftp, string cwd)
     {
         Ssh = ssh;
         Sftp = sftp;
+        Cwd = cwd;
     }
 
     public void Touch() => LastUsedUtc = DateTime.UtcNow;

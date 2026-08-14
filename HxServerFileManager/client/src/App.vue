@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from './api.js'
 import ConnectPanel from './components/ConnectPanel.vue'
@@ -26,6 +26,10 @@ const editVisible = ref(false)
 const activeConn = computed(
   () => connections.value.find((c) => c.connectionId === activeId.value) || null
 )
+
+// 文件列表是否跟随终端路径（默认开）；每连接的会话工作目录，终端与文件列表共享
+const syncCwd = ref(true)
+const cwdMap = reactive({})
 
 async function loadSaved() {
   try {
@@ -56,6 +60,7 @@ function handleConnected(payload) {
   activeId.value = conn.connectionId
   connectVisible.value = false
   editor.value = { open: false, connId: null, path: null }
+  cwdMap[conn.connectionId] = conn.homeDirectory || '/'
   loadSaved() // 刷新排序/别名
 }
 
@@ -65,10 +70,25 @@ async function disconnectConn(connId) {
   } catch (_) { /* 忽略：会话可能已被后端回收 */ }
   const idx = connections.value.findIndex((c) => c.connectionId === connId)
   if (idx >= 0) connections.value.splice(idx, 1)
+  delete cwdMap[connId]
   if (activeId.value === connId) {
     const rest = connections.value
     activeId.value = rest.length ? rest[rest.length - 1].connectionId : null
   }
+}
+
+// 文件列表导航 -> 同步会话 cwd（终端提示符与下一条命令跟随）
+async function onNavigate(connId, path) {
+  if (!path) return
+  cwdMap[connId] = path
+  try {
+    await api.setCwd(connId, path)
+  } catch (_) { /* 目录可能不存在，忽略 */ }
+}
+
+// 终端 cd -> 更新共享 cwd，syncCwd 开启时文件列表跟随
+function onCwdChanged(connId, path) {
+  if (path) cwdMap[connId] = path
 }
 
 async function disconnectActive() {
@@ -234,9 +254,17 @@ function closeEditor() {
           <FileManager
             :conn-id="c.connectionId"
             :initial-dir="c.homeDirectory"
+            :sync-cwd="syncCwd"
+            :external-path="syncCwd ? cwdMap[c.connectionId] : null"
             @open-file="(p) => openEditor(c.connectionId, p)"
+            @navigate="(p) => onNavigate(c.connectionId, p)"
+            @update:sync-cwd="(v) => (syncCwd = v)"
           />
-          <Terminal :conn-id="c.connectionId" />
+          <Terminal
+            :conn-id="c.connectionId"
+            :cwd="cwdMap[c.connectionId]"
+            @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
+          />
         </div>
       </section>
     </main>
