@@ -9,6 +9,13 @@
 
   <ItemGroup>
     <PackageReference Include="SSH.NET" Version="2026.0.0" />
+    <!-- 保持控制台(Exe)，通过框架引用启用 Kestrel / ASP.NET Core 能力 -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- 将前端 wwwroot 一并发布到输出目录 -->
+  <ItemGroup>
+    <None Include="wwwroot\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

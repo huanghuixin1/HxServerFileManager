@@ -26,3 +26,7 @@ replay_pid*
 .history
 bin
 obj
+.freebuff/
+.workbuddy/
+.vscode
+HxServerFileManager/wwwroot/*

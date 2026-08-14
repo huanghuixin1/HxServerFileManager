@@ -1,0 +1,22 @@
+# 用法（在本目录执行）：
+#   docker compose up -d --build      # 构建并后台启动
+#   docker compose ps                 # 查看状态
+#   docker compose down               # 停止并删除容器
+#   docker compose down -v            # 连同数据卷一起删除
+#
+# 启动后：
+#   - 宿主机端口 2222 映射到容器内 SSH 22
+#   - 在你的 Web 界面填：主机=localhost，端口=2222，
+#     用户名=testuser，密码=testpass（或 root / rootpass）
+#
+# 想换端口/密码，改下面 ports 和 Dockerfile 里的 chpasswd 即可。
+services:
+  test-linux:
+    build: .
+    container_name: hx-test-linux
+    ports:
+      - "2222:22"
+    volumes:
+      # 把测试文件持久化到宿主机的 ./testdata，容器删了数据还在
+      - ./testdata:/home/testuser/data
+    restart: unless-stopped
