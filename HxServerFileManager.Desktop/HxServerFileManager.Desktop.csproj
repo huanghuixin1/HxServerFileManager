@@ -11,8 +11,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Photino.NET：跨平台轻量 WebView（Windows=WebView2 / macOS=WKWebView / Linux=WebKitGTK） -->
-    <PackageReference Include="Photino.NET" Version="3.0.14" />
+    <!-- Photino.NET：跨平台轻量 WebView（Windows=WebView2 / macOS=WKWebView / Linux=WebKitGTK）。
+         不要用 3.0.14 —— 该版本在 Windows 上建出的窗口失效（实测只剩标题栏大小），4.0.16 正常。 -->
+    <PackageReference Include="Photino.NET" Version="4.0.16" />
   </ItemGroup>
 
   <ItemGroup>
