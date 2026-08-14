@@ -37,4 +37,16 @@
              Text="wwwroot -&gt; $(OutDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
   </Target>
 
+  <!--
+    主项目是 Exe（top-level statement 要求），ProjectReference 会把它的 exe 也复制过来。
+    桌面壳只需要 DLL，删掉多余的 HxServerFileManager.exe，避免给用户两个 exe 造成困惑。
+  -->
+  <Target Name="RemoveRedundantExe" AfterTargets="Build">
+    <ItemGroup>
+      <RedundantExe Include="$(OutDir)HxServerFileManager.exe" />
+      <RedundantPdb Include="$(OutDir)HxServerFileManager.pdb" />
+    </ItemGroup>
+    <Delete Files="@(RedundantExe);@(RedundantPdb)" ContinueOnError="true" />
+  </Target>
+
 </Project>
