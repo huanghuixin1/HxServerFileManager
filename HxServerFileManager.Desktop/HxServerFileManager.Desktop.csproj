@@ -20,4 +20,20 @@
     <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj" />
   </ItemGroup>
 
+  <!--
+    主项目的 CopyWwwrootToOutput Target 不会在引用方构建时执行，
+    这里从主项目源目录把 wwwroot 镜像到桌面壳输出目录（先清后拷，同主项目逻辑）。
+  -->
+  <Target Name="CopyWwwrootToDesktopOutput" AfterTargets="Build">
+    <ItemGroup>
+      <WwwrootSource Include="$(MSBuildThisFileDirectory)..\HxServerFileManager\wwwroot\**\*" />
+      <WwwrootStale Include="$(OutDir)wwwroot\**\*" />
+    </ItemGroup>
+    <Delete Files="@(WwwrootStale)" ContinueOnError="true" />
+    <Copy SourceFiles="@(WwwrootSource)"
+          DestinationFiles="@(WwwrootSource->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Message Importance="high"
+             Text="wwwroot -&gt; $(OutDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
+  </Target>
+
 </Project>
