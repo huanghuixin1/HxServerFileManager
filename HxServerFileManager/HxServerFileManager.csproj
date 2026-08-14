@@ -5,6 +5,8 @@
     <TargetFramework>net10.0</TargetFramework>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <!-- 被 Desktop 项目引用时，不要继承 RID 导致 self-contained 冲突（NETSDK1151） -->
+    <SelfContained>false</SelfContained>
   </PropertyGroup>
 
   <ItemGroup>
