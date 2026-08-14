@@ -29,3 +29,5 @@
 - 2026-08-14：前端整体切到 Element Plus（main.js 注册 EP+图标；组件全用 el-*）
 - 2026-08-14：修复 5 处字段名 bug（connId→connectionId）、断开/重连、dev proxy 端口
 - 2026-08-14：支持多服务器并发连接 —— App.vue 会话标签栏（自定义 pill tab，可关闭+确认）、新建连接对话框、每标签独立 FileManager/Terminal/EditorModal（v-show 保留状态）；后端本就支持多会话（ConcurrentDictionary），无需改动
+- 2026-08-14：已保存连接增强 —— 顶栏「已保存连接」下拉（连接中也可一键再开一个，走 /api/connections/reconnect）；管理对话框；编辑对话框（`PUT /api/connections/{id}`，留空字段保持不变，凭据不返回）；连接表单/编辑表单支持别名（name 字段），标签与列表显示别名
+- 2026-08-14：文件列表空白 bug —— 后端最小 API 序列化 FileEntry 为 camelCase，前端曾读 PascalCase，已统一改 camelCase

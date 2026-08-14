@@ -33,6 +33,12 @@ export const api = {
   reconnect: (id) =>
     request('/api/connections/reconnect', { method: 'POST', body: JSON.stringify({ connectionId: id }) }),
 
+  updateConnection: (id, req) =>
+    request(`/api/connections/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(req),
+    }),
+
   deleteConnection: (id) =>
     request(`/api/connections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 

@@ -17,6 +17,13 @@
 ## 文件列表空白 bug 已修（字段大小写）
 - 后端 `/api/files` 的 `FileEntry` 经最小 API 序列化为 camelCase（`name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 原来读 PascalCase，导致名称/大小/修改时间全空白。已统一改读 camelCase。
 
+## 已保存连接增强
+- 顶栏「已保存连接」下拉：连接中也能一键打开任意已保存连接（新开标签），含「管理已保存的连接…」入口。
+- 管理对话框：重连/编辑/删除。
+- 编辑对话框：`PUT /api/connections/{id}`，可改别名/主机/端口/用户名/凭据；**留空字段保持不变**（凭据不随列表返回，编辑时留空即不改）。
+- 别名：连接表单与编辑表单均可设置 `name`；连接/重连响应新增 `name`；标签和已保存列表显示别名（列表里别名≠主机时附带主机 tag）。
+- 已用 mock 实测：连接中下拉开第二个连接、编辑改别名、下拉/管理面板同步刷新。
+
 ## 字段名 bug 已全部修复（connId → connectionId）
 - 断开：`api.disconnect` 改发 JSON `{ connectionId }`，后端 `IdRequest` 可正确绑定。
 - 重连：`api.reconnect` 改发 JSON `{ connectionId }`，不再 404。

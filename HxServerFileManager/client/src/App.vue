@@ -1,6 +1,6 @@
 <script setup>
-import { ref, computed } from 'vue'
-import { ElMessageBox } from 'element-plus'
+import { ref, computed, onMounted } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from './api.js'
 import ConnectPanel from './components/ConnectPanel.vue'
 import SavedConnections from './components/SavedConnections.vue'
@@ -16,9 +16,24 @@ const connectVisible = ref(false)
 const logEnabled = ref(true)
 const editor = ref({ open: false, connId: null, path: null })
 
+// 已保存连接（来自后端 connections.json）：下拉快速打开 + 管理/编辑
+const savedList = ref([])
+const savedReload = ref(0)
+const manageVisible = ref(false)
+const editing = ref(null)
+const editVisible = ref(false)
+
 const activeConn = computed(
   () => connections.value.find((c) => c.connectionId === activeId.value) || null
 )
+
+async function loadSaved() {
+  try {
+    const res = await api.listConnections()
+    savedList.value = res.connections || []
+  } catch (_) { /* 忽略：下拉里会显示空 */ }
+}
+onMounted(loadSaved)
 
 function toConn(payload) {
   return {
@@ -27,6 +42,7 @@ function toConn(payload) {
     username: payload.username,
     port: payload.port,
     authType: payload.authType,
+    name: payload.name || '',
     homeDirectory: payload.homeDirectory || '/',
   }
 }
@@ -40,6 +56,7 @@ function handleConnected(payload) {
   activeId.value = conn.connectionId
   connectVisible.value = false
   editor.value = { open: false, connId: null, path: null }
+  loadSaved() // 刷新排序/别名
 }
 
 async function disconnectConn(connId) {
@@ -64,7 +81,7 @@ async function onTabRemove(name) {
   if (!conn) return
   try {
     await ElMessageBox.confirm(
-      `断开连接 “${conn.username}@${conn.host}:${conn.port}” ？`,
+      `断开连接 “${conn.name || `${conn.username}@${conn.host}:${conn.port}`}” ？`,
       '断开确认',
       { type: 'warning', confirmButtonText: '断开', cancelButtonText: '取消' }
     )
@@ -72,6 +89,40 @@ async function onTabRemove(name) {
     return // 用户取消
   }
   await disconnectConn(name)
+}
+
+// 用已保存的连接快速打开（无需重新输入）
+async function openSaved(p) {
+  try {
+    const res = await api.reconnect(p.id)
+    handleConnected({ ...res, port: p.port, authType: p.authType })
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+function onSavedCommand(cmd) {
+  if (cmd === 'manage') {
+    manageVisible.value = true
+    return
+  }
+  if (cmd.startsWith('open:')) {
+    const p = savedList.value.find((x) => x.id === cmd.slice(5))
+    if (p) openSaved(p)
+  }
+}
+
+function openEdit(profile) {
+  editing.value = profile
+  editVisible.value = true
+}
+
+function onUpdated() {
+  editVisible.value = false
+  editing.value = null
+  savedReload.value++ // 刷新管理面板/空态面板
+  loadSaved()         // 刷新下拉
+  ElMessage.success('已保存修改')
 }
 
 function openEditor(connId, path) {
@@ -103,6 +154,33 @@ function closeEditor() {
         <el-button text @click="logEnabled = !logEnabled">
           {{ logEnabled ? '隐藏日志' : '显示日志' }}
         </el-button>
+
+        <!-- 已保存连接：连接中也可一键再开一个 -->
+        <el-dropdown trigger="click" @command="onSavedCommand">
+          <el-button plain>
+            <el-icon style="margin-right: 4px"><Connection /></el-icon>已保存连接
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item v-if="!savedList.length" disabled>
+                暂无已保存的连接
+              </el-dropdown-item>
+              <el-dropdown-item
+                v-for="c in savedList"
+                :key="c.id"
+                :command="'open:' + c.id"
+              >
+                <span class="dd-name">{{ c.name }}</span>
+                <span class="dd-sub">{{ c.username }}@{{ c.host }}:{{ c.port }}</span>
+              </el-dropdown-item>
+              <el-dropdown-item v-if="savedList.length" divided command="manage">
+                <el-icon><Setting /></el-icon> 管理已保存的连接…
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
+
         <el-button type="primary" plain @click="connectVisible = true">
           <el-icon style="margin-right: 4px"><Plus /></el-icon>新建连接
         </el-button>
@@ -112,7 +190,7 @@ function closeEditor() {
       </div>
     </header>
 
-    <!-- 多连接标签栏：每个活跃会话一个标签，可关闭 -->
+    <!-- 多连接标签栏：每个活跃会话一个标签，可关闭；有别名时显示别名 -->
     <div v-if="connections.length > 0" class="tabsbar">
       <div
         v-for="c in connections"
@@ -124,7 +202,9 @@ function closeEditor() {
         @click="activeId = c.connectionId"
       >
         <span class="t-dot" :class="{ on: activeId === c.connectionId }"></span>
-        <span class="t-label">{{ c.username }}@{{ c.host }}:{{ c.port }}</span>
+        <span class="t-label" :title="`${c.username}@${c.host}:${c.port}`">
+          {{ c.name || `${c.username}@${c.host}:${c.port}` }}
+        </span>
         <el-icon
           class="t-close"
           title="断开该连接"
@@ -137,7 +217,11 @@ function closeEditor() {
       <!-- 无任何连接：内联连接表单 + 已保存连接 -->
       <section v-if="connections.length === 0" class="connect-area">
         <ConnectPanel @connected="handleConnected" />
-        <SavedConnections @reconnect="handleConnected" />
+        <SavedConnections
+          :reload-token="savedReload"
+          @reconnect="handleConnected"
+          @edit="openEdit"
+        />
       </section>
       <!-- 有连接：按标签渲染工作区（v-show 保留每会话的终端历史/目录状态） -->
       <section v-else class="sessions">
@@ -167,6 +251,30 @@ function closeEditor() {
       :close-on-click-modal="false"
     >
       <ConnectPanel @connected="handleConnected" />
+    </el-dialog>
+
+    <!-- 管理已保存的连接（连接中也可进入） -->
+    <el-dialog
+      v-model="manageVisible"
+      title="管理已保存的连接"
+      width="min(560px, 94vw)"
+      :close-on-click-modal="false"
+    >
+      <SavedConnections
+        :reload-token="savedReload"
+        @reconnect="handleConnected"
+        @edit="openEdit"
+      />
+    </el-dialog>
+
+    <!-- 编辑已保存的连接（可改别名/主机/凭据） -->
+    <el-dialog
+      v-model="editVisible"
+      title="编辑已保存的连接"
+      width="min(480px, 92vw)"
+      :close-on-click-modal="false"
+    >
+      <ConnectPanel mode="edit" :initial="editing" @updated="onUpdated" />
     </el-dialog>
 
     <EditorModal
@@ -224,6 +332,15 @@ function closeEditor() {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
+  align-items: center;
+}
+.dd-name {
+  font-weight: 600;
+  margin-right: 8px;
+}
+.dd-sub {
+  color: #8a97a5;
+  font-size: 12px;
 }
 .tabsbar {
   background: #fff;

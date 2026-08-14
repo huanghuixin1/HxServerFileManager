@@ -1,8 +1,11 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, watch } from 'vue'
 import { api } from '../api.js'
 
-const emit = defineEmits(['reconnect'])
+const props = defineProps({
+  reloadToken: { type: Number, default: 0 },
+})
+const emit = defineEmits(['reconnect', 'edit'])
 
 const items = ref([])
 const error = ref('')
@@ -17,6 +20,7 @@ async function load() {
   }
 }
 onMounted(load)
+watch(() => props.reloadToken, load)
 
 async function doReconnect(item) {
   error.value = ''
@@ -29,6 +33,7 @@ async function doReconnect(item) {
       username: res.username,
       port: item.port,
       authType: item.authType,
+      name: res.name || item.name,
     })
     await load() // 刷新最近连接排序
   } catch (e) {
@@ -71,9 +76,18 @@ async function doDelete(item) {
     <ul v-else class="list">
       <li v-for="it in items" :key="it.id" class="item">
         <div class="meta">
-          <div class="name">{{ it.name }}</div>
+          <div class="name">
+            {{ it.name }}
+            <el-tag
+              v-if="it.name !== it.host"
+              size="small"
+              type="info"
+              effect="plain"
+              class="host-tag"
+            >{{ it.host }}</el-tag>
+          </div>
           <div class="sub">
-            {{ it.username }} · {{ it.host }}:{{ it.port }}
+            {{ it.username }}@{{ it.host }}:{{ it.port }}
             <el-tag
               size="small"
               :type="it.authType === 'key' ? 'warning' : 'info'"
@@ -93,6 +107,7 @@ async function doDelete(item) {
           >
             {{ busyId === it.id ? '重连中…' : '重连' }}
           </el-button>
+          <el-button size="small" @click="emit('edit', it)">编辑</el-button>
           <el-button type="danger" size="small" plain @click="doDelete(it)">
             删除
           </el-button>
@@ -144,6 +159,12 @@ async function doDelete(item) {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.host-tag {
+  flex-shrink: 0;
 }
 .sub {
   font-size: 12px;
@@ -153,5 +174,7 @@ async function doDelete(item) {
   display: flex;
   gap: 6px;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 </style>

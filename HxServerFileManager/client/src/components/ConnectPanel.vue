@@ -1,9 +1,15 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, watch } from 'vue'
 import { api } from '../api.js'
 
-const emit = defineEmits(['connected'])
+// mode='connect'：连接并保存；mode='edit'：更新已保存的连接（initial 传入该连接）
+const props = defineProps({
+  initial: { type: Object, default: null },
+  mode: { type: String, default: 'connect' },
+})
+const emit = defineEmits(['connected', 'updated'])
 
+const alias = ref('')
 const host = ref('')
 const port = ref(22)
 const username = ref('')
@@ -14,6 +20,35 @@ const passphrase = ref('')
 const error = ref('')
 const busy = ref(false)
 
+// 编辑模式：用已保存的连接预填表单（密码/私钥不返回，留空表示不修改）
+watch(
+  () => props.initial,
+  (v) => {
+    if (!v) return
+    alias.value = v.name || ''
+    host.value = v.host || ''
+    port.value = v.port || 22
+    username.value = v.username || ''
+    authType.value = v.authType === 'key' ? 'key' : 'password'
+    password.value = ''
+    keyText.value = ''
+    passphrase.value = ''
+  },
+  { immediate: true }
+)
+
+function buildReq() {
+  return {
+    name: alias.value.trim() || undefined,
+    host: host.value.trim(),
+    port: Number(port.value) || 22,
+    username: username.value.trim(),
+    password: authType.value === 'password' ? password.value : '',
+    privateKey: authType.value === 'key' ? keyText.value : '',
+    passphrase: authType.value === 'key' ? passphrase.value : '',
+  }
+}
+
 async function submit() {
   error.value = ''
   if (!host.value || !username.value) {
@@ -22,22 +57,21 @@ async function submit() {
   }
   busy.value = true
   try {
-    const req = {
-      host: host.value,
-      port: Number(port.value) || 22,
-      username: username.value,
-      password: authType.value === 'password' ? password.value : '',
-      privateKey: authType.value === 'key' ? keyText.value : '',
-      passphrase: authType.value === 'key' ? passphrase.value : '',
+    if (props.mode === 'edit' && props.initial) {
+      const res = await api.updateConnection(props.initial.id, buildReq())
+      emit('updated', { id: res.id, name: res.name || alias.value })
+    } else {
+      const req = buildReq()
+      const res = await api.connect(req)
+      emit('connected', {
+        connectionId: res.connectionId,
+        host: res.host,
+        username: res.username,
+        port: req.port,
+        authType: authType.value,
+        name: res.name || alias.value,
+      })
     }
-    const res = await api.connect(req)
-    emit('connected', {
-      connectionId: res.connectionId,
-      host: res.host,
-      username: res.username,
-      port: req.port,
-      authType: authType.value,
-    })
   } catch (e) {
     error.value = e.message
   } finally {
@@ -48,8 +82,16 @@ async function submit() {
 
 <template>
   <div class="card connect">
-    <h3 class="title">连接 Linux 服务器</h3>
+    <h3 class="title">{{ mode === 'edit' ? '编辑已保存的连接' : '连接 Linux 服务器' }}</h3>
     <el-form label-position="top" @submit.prevent="submit">
+      <el-form-item label="别名 (可选)">
+        <el-input
+          v-model.trim="alias"
+          placeholder="给这台服务器起个名字，例如 测试机"
+          clearable
+        />
+      </el-form-item>
+
       <el-form-item label="主机 Host" required>
         <el-input
           v-model.trim="host"
@@ -89,7 +131,7 @@ async function submit() {
           <el-input
             v-model="password"
             type="password"
-            placeholder="••••••"
+            :placeholder="mode === 'edit' ? '留空表示不修改原密码' : '••••••'"
             show-password
           />
         </el-form-item>
@@ -100,12 +142,17 @@ async function submit() {
             v-model="keyText"
             type="textarea"
             :rows="4"
-            placeholder="-----BEGIN OPENSSH PRIVATE KEY-----"
+            :placeholder="mode === 'edit' ? '留空表示不修改原私钥' : '-----BEGIN OPENSSH PRIVATE KEY-----'"
             class="key-textarea"
           />
         </el-form-item>
         <el-form-item label="私钥口令 (可选)">
-          <el-input v-model="passphrase" type="password" show-password />
+          <el-input
+            v-model="passphrase"
+            type="password"
+            :placeholder="mode === 'edit' ? '留空表示不修改' : ''"
+            show-password
+          />
         </el-form-item>
       </template>
 
@@ -123,7 +170,7 @@ async function submit() {
         :loading="busy"
         style="width: 100%"
       >
-        {{ busy ? '连接中…' : '连接' }}
+        {{ busy ? (mode === 'edit' ? '保存中…' : '连接中…') : (mode === 'edit' ? '保存修改' : '连接') }}
       </el-button>
     </el-form>
   </div>

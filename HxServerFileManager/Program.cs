@@ -80,6 +80,7 @@ app.MapPost("/api/connect", (ConnectRequest req, ConnectionManager mgr, Connecti
         connectionId = id,
         host = req.Host,
         username = req.Username,
+        name = req.Name,
         homeDirectory = home,
         message = "连接成功"
     });
@@ -134,9 +135,33 @@ app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr,
         connectionId = id,
         host = prof.Host,
         username = prof.Username,
+        name = prof.Name,
         homeDirectory = home,
         message = "连接成功"
     });
+});
+
+// 编辑已保存的连接（留空的字段保持不变；别名可任意设置）
+app.MapPut("/api/connections/{id}", (string id, ConnectRequest req, ConnectionsStore store) =>
+{
+    var prof = store.Get(id);
+    if (prof is null) return Results.NotFound(new { error = "未找到保存的连接" });
+
+    var updated = prof with
+    {
+        Name = string.IsNullOrWhiteSpace(req.Name) ? prof.Name : req.Name.Trim(),
+        Host = string.IsNullOrWhiteSpace(req.Host) ? prof.Host : req.Host.Trim(),
+        Port = req.Port is int pp && pp > 0 ? pp : prof.Port,
+        Username = string.IsNullOrWhiteSpace(req.Username) ? prof.Username : req.Username.Trim(),
+        Password = string.IsNullOrEmpty(req.Password) ? prof.Password : req.Password,
+        PrivateKey = string.IsNullOrEmpty(req.PrivateKey) ? prof.PrivateKey : req.PrivateKey,
+        Passphrase = string.IsNullOrEmpty(req.Passphrase) ? prof.Passphrase : req.Passphrase,
+        AuthType = string.IsNullOrWhiteSpace(req.PrivateKey)
+            ? (string.IsNullOrWhiteSpace(req.Password) ? prof.AuthType : "password")
+            : "key",
+    };
+    store.Upsert(updated);
+    return Results.Ok(new { message = "已更新", id = updated.Id, name = updated.Name });
 });
 
 // 删除已保存的连接
