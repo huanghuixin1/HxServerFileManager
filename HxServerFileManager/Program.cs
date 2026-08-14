@@ -28,24 +28,41 @@ using System.Threading.Channels;
 //       请勿在公网环境直接暴露本服务。
 // ----------------------------------------------------------------------------
 
-var builder = WebApplication.CreateBuilder(args);
+// ----------------------------------------------------------------------------
+// Web 服务入口：桌面壳（HxServerFileManager.Desktop）与独立运行共用此构建逻辑。
+//   独立运行：dotnet run —— 走 top-level 的 WebHost.Build(args).Run()
+//   桌面壳：  Photino 窗口 —— WebHost.Build(args) 后台 RunAsync()，前台弹 WebView
+// ----------------------------------------------------------------------------
 
-// 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 5101）
-var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 5101;
-builder.WebHost.UseKestrel(kestrel =>
+var app = WebHost.Build(args);
+app.Run();
+
+/// <summary>
+/// 构建并配置 WebApplication（中间件 + 路由 + 服务注册），但不启动。
+/// 独立运行与桌面壳共用此方法。
+/// </summary>
+public static partial class WebHost
 {
-    kestrel.ListenAnyIP(listenPort);
-    // 允许较大文件上传（默认 200MB）
-    kestrel.Limits.MaxRequestBodySize = 200 * 1024 * 1024;
-});
+    public static WebApplication Build(string[] args)
+    {
+        var builder = WebApplication.CreateBuilder(args);
 
-// 单例：会话表 / 操作日志 / 连接存储
-builder.Services.AddSingleton<ConnectionManager>();
-builder.Services.AddSingleton<OperationLogger>();
-var dataDir = Path.Combine(builder.Environment.ContentRootPath, "Data");
-builder.Services.AddSingleton(new ConnectionsStore(dataDir));
+        // 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 5101）
+        var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 5101;
+        builder.WebHost.UseKestrel(kestrel =>
+        {
+            kestrel.ListenAnyIP(listenPort);
+            // 允许较大文件上传（默认 200MB）
+            kestrel.Limits.MaxRequestBodySize = 200 * 1024 * 1024;
+        });
 
-var app = builder.Build();
+        // 单例：会话表 / 操作日志 / 连接存储
+        builder.Services.AddSingleton<ConnectionManager>();
+        builder.Services.AddSingleton<OperationLogger>();
+        var dataDir = Path.Combine(builder.Environment.ContentRootPath, "Data");
+        builder.Services.AddSingleton(new ConnectionsStore(dataDir));
+
+        var app = builder.Build();
 
 // 启用 WebSocket 支持（交互终端 /api/terminal/ws 依赖）
 app.UseWebSockets();
@@ -676,175 +693,180 @@ app.Lifetime.ApplicationStopping.Register(() => cts.Cancel());
 _ = Task.Run(() => mgr.CleanupLoop(cts.Token));
 
 Console.WriteLine($"[HxServerFileManager] Kestrel 已启动，监听 http://0.0.0.0:{listenPort}");
-app.Run();
-
-// ----------------------------------------------------------------------------
-// 辅助函数 / 类型
-// ----------------------------------------------------------------------------
-
-static string CombinePath(string dir, string name)
-{
-    dir = (dir ?? "/").TrimEnd('/');
-    if (dir == "") dir = "";
-    return dir + "/" + name.TrimStart('/');
+        return app;
+    }
 }
 
-// 单引号转义，用于安全地把路径拼进 sh 命令`
-static string Shq(string s) => "'" + s.Replace("'", "'\\''") + "'";
-
 // ----------------------------------------------------------------------------
-// 鉴权辅助（HxSimpleWebAuth）
+// 辅助函数：WebHost.Build 内的路由 lambda 调用，放在 partial class WebHost 中
 // ----------------------------------------------------------------------------
 
-/// <summary>
-/// 读取 configs/env.json 中的 authPwd（模板见 configs/env.json.example）。
-/// 文件不存在或解析失败返回 null（此时回退到环境变量/未配置）。
-/// </summary>
-static string? LoadConfigPassword(string contentRoot)
+public static partial class WebHost
 {
-    var configPath = Path.Combine(contentRoot, "configs", "env.json");
-    if (!File.Exists(configPath)) return null;
-    try
+    internal static string CombinePath(string dir, string name)
     {
-        using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
-        if (doc.RootElement.TryGetProperty("authPwd", out var p) && p.ValueKind == JsonValueKind.String)
+        dir = (dir ?? "/").TrimEnd('/');
+        if (dir == "") dir = "";
+        return dir + "/" + name.TrimStart('/');
+    }
+
+    // 单引号转义，用于安全地把路径拼进 sh 命令
+    internal static string Shq(string s) => "'" + s.Replace("'", "'\\''") + "'";
+
+    // ----------------------------------------------------------------------------
+    // 鉴权辅助（HxSimpleWebAuth）
+    // ----------------------------------------------------------------------------
+
+    /// <summary>
+    /// 读取 configs/env.json 中的 authPwd（模板见 configs/env.json.example）。
+    /// 文件不存在或解析失败返回 null（此时回退到环境变量/未配置）。
+    /// </summary>
+    internal static string? LoadConfigPassword(string contentRoot)
+    {
+        var configPath = Path.Combine(contentRoot, "configs", "env.json");
+        if (!File.Exists(configPath)) return null;
+        try
         {
-            var v = p.GetString();
-            if (!string.IsNullOrEmpty(v)) return v;
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"[HxServerFileManager] 读取 configs/env.json 失败：{ex.Message}");
-    }
-    return null;
-}
-
-static bool IsLoopbackAddress(System.Net.IPAddress? address)
-{
-    if (address is null) return false;
-    if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
-    return System.Net.IPAddress.IsLoopback(address);
-}
-
-/// <summary>
-/// 把 HttpContext 转成 HxSimpleWebAuth 需要的 HttpRequestData。
-/// EventSource/<a download> 等场景带不了请求头，token 走 ?token= 查询参数，
-/// 这里统一补成 Authorization: Bearer 头再交给库校验。
-/// </summary>
-static HttpRequestData CreateAuthRequest(HttpContext context, string body = "", string? method = null)
-{
-    var headers = context.Request.Headers.ToDictionary(
-        pair => pair.Key,
-        pair => pair.Value.ToString(),
-        StringComparer.OrdinalIgnoreCase);
-
-    if (!headers.ContainsKey("Authorization")
-        && context.Request.Query.TryGetValue("token", out var qtoken)
-        && !string.IsNullOrWhiteSpace(qtoken.ToString()))
-    {
-        headers["Authorization"] = "Bearer " + qtoken.ToString();
-    }
-
-    var target = $"{context.Request.PathBase}{context.Request.Path}{context.Request.QueryString}";
-    var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
-    return new HttpRequestData(
-        (method ?? context.Request.Method).ToUpperInvariant(),
-        target,
-        headers,
-        body,
-        remoteIp);
-}
-
-static async Task<HttpRequestData> CreateAuthRequestAsync(HttpContext context)
-{
-    context.Request.EnableBuffering();
-    using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
-    var body = await reader.ReadToEndAsync(context.RequestAborted);
-    context.Request.Body.Position = 0;
-    return CreateAuthRequest(context, body);
-}
-
-static async Task WriteAuthResponseAsync(HttpContext context, ApiResponse response)
-{
-    context.Response.StatusCode = response.StatusCode;
-    if (response.AllowHeader is not null)
-        context.Response.Headers.Allow = response.AllowHeader;
-    context.Response.ContentType = "application/json; charset=utf-8";
-    context.Response.ContentLength = response.Body.Length;
-    await context.Response.Body.WriteAsync(response.Body, context.RequestAborted);
-}
-
-static async Task SendWsJsonAsync(WebSocket ws, object payload, CancellationToken ct)
-{
-    var json = JsonSerializer.Serialize(payload);
-    var bytes = Encoding.UTF8.GetBytes(json);
-    await ws.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
-}
-
-// 真正执行连接（纯逻辑，不含持久化/日志，便于 connect 与 reconnect 复用）
-static (bool ok, string? connectionId, string? home, string? error) ConnectInternal(ConnectRequest req, ConnectionManager mgr)
-{
-    try
-    {
-        var port = req.Port is int p && p > 0 ? p : 22;
-        var authMethods = new List<AuthenticationMethod>();
-
-        if (!string.IsNullOrWhiteSpace(req.PrivateKey))
-        {
-            try
+            using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+            if (doc.RootElement.TryGetProperty("authPwd", out var p) && p.ValueKind == JsonValueKind.String)
             {
-                using var ms = new MemoryStream(Encoding.UTF8.GetBytes(req.PrivateKey));
-                var keyFile = new PrivateKeyFile(ms, req.Passphrase);
-                authMethods.Add(new PrivateKeyAuthenticationMethod(req.Username, keyFile));
-            }
-            catch (Exception ex)
-            {
-                return (false, null, null, "私钥解析失败: " + ex.Message);
+                var v = p.GetString();
+                if (!string.IsNullOrEmpty(v)) return v;
             }
         }
-
-        if (!string.IsNullOrWhiteSpace(req.Password))
-            authMethods.Add(new PasswordAuthenticationMethod(req.Username, req.Password));
-
-        if (authMethods.Count == 0)
-            return (false, null, null, "必须提供密码或私钥");
-
-        var connInfo = new Renci.SshNet.ConnectionInfo(req.Host, port, req.Username, authMethods.ToArray());
-        var ssh = new SshClient(connInfo);
-        var sftp = new SftpClient(connInfo);
-        ssh.Connect();
-        sftp.Connect();
-
-        string home = "/";
-        try { home = sftp.WorkingDirectory; } catch { /* ignore */ }
-
-        var id = mgr.Add(new SshSession(ssh, sftp, home));
-        return (true, id, home, null);
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[HxServerFileManager] 读取 configs/env.json 失败：{ex.Message}");
+        }
+        return null;
     }
-    catch (Exception ex)
+
+    internal static bool IsLoopbackAddress(System.Net.IPAddress? address)
     {
-        return (false, null, null, "连接失败: " + ex.Message);
+        if (address is null) return false;
+        if (address.IsIPv4MappedToIPv6) address = address.MapToIPv4();
+        return System.Net.IPAddress.IsLoopback(address);
     }
-}
 
-static ConnectionProfile ToProfile(ConnectRequest req, int port) => new(
-    Id: Guid.NewGuid().ToString("N"),
-    Name: req.Name ?? req.Host,
-    Host: req.Host,
-    Port: port,
-    Username: req.Username,
-    AuthType: string.IsNullOrWhiteSpace(req.PrivateKey) ? "password" : "key",
-    Password: req.Password,
-    PrivateKey: req.PrivateKey,
-    Passphrase: req.Passphrase,
-    CreatedAt: DateTime.Now,
-    LastConnectedAt: DateTime.Now);
+    /// <summary>
+    /// 把 HttpContext 转成 HxSimpleWebAuth 需要的 HttpRequestData。
+    /// EventSource/<a download> 等场景带不了请求头，token 走 ?token= 查询参数，
+    /// 这里统一补成 Authorization: Bearer 头再交给库校验。
+    /// </summary>
+    internal static HttpRequestData CreateAuthRequest(HttpContext context, string body = "", string? method = null)
+    {
+        var headers = context.Request.Headers.ToDictionary(
+            pair => pair.Key,
+            pair => pair.Value.ToString(),
+            StringComparer.OrdinalIgnoreCase);
 
-static async Task WriteLogEvent(HttpContext ctx, LogEntry e)
-{
-    var json = JsonSerializer.Serialize(e);
-    await ctx.Response.WriteAsync($"data: {json}\n\n", ctx.RequestAborted);
+        if (!headers.ContainsKey("Authorization")
+            && context.Request.Query.TryGetValue("token", out var qtoken)
+            && !string.IsNullOrWhiteSpace(qtoken.ToString()))
+        {
+            headers["Authorization"] = "Bearer " + qtoken.ToString();
+        }
+
+        var target = $"{context.Request.PathBase}{context.Request.Path}{context.Request.QueryString}";
+        var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        return new HttpRequestData(
+            (method ?? context.Request.Method).ToUpperInvariant(),
+            target,
+            headers,
+            body,
+            remoteIp);
+    }
+
+    internal static async Task<HttpRequestData> CreateAuthRequestAsync(HttpContext context)
+    {
+        context.Request.EnableBuffering();
+        using var reader = new StreamReader(context.Request.Body, leaveOpen: true);
+        var body = await reader.ReadToEndAsync(context.RequestAborted);
+        context.Request.Body.Position = 0;
+        return CreateAuthRequest(context, body);
+    }
+
+    internal static async Task WriteAuthResponseAsync(HttpContext context, ApiResponse response)
+    {
+        context.Response.StatusCode = response.StatusCode;
+        if (response.AllowHeader is not null)
+            context.Response.Headers.Allow = response.AllowHeader;
+        context.Response.ContentType = "application/json; charset=utf-8";
+        context.Response.ContentLength = response.Body.Length;
+        await context.Response.Body.WriteAsync(response.Body, context.RequestAborted);
+    }
+
+    internal static async Task SendWsJsonAsync(WebSocket ws, object payload, CancellationToken ct)
+    {
+        var json = JsonSerializer.Serialize(payload);
+        var bytes = Encoding.UTF8.GetBytes(json);
+        await ws.SendAsync(bytes, WebSocketMessageType.Text, endOfMessage: true, ct);
+    }
+
+    // 真正执行连接（纯逻辑，不含持久化/日志，便于 connect 与 reconnect 复用）
+    internal static (bool ok, string? connectionId, string? home, string? error) ConnectInternal(ConnectRequest req, ConnectionManager mgr)
+    {
+        try
+        {
+            var port = req.Port is int p && p > 0 ? p : 22;
+            var authMethods = new List<AuthenticationMethod>();
+
+            if (!string.IsNullOrWhiteSpace(req.PrivateKey))
+            {
+                try
+                {
+                    using var ms = new MemoryStream(Encoding.UTF8.GetBytes(req.PrivateKey));
+                    var keyFile = new PrivateKeyFile(ms, req.Passphrase);
+                    authMethods.Add(new PrivateKeyAuthenticationMethod(req.Username, keyFile));
+                }
+                catch (Exception ex)
+                {
+                    return (false, null, null, "私钥解析失败: " + ex.Message);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(req.Password))
+                authMethods.Add(new PasswordAuthenticationMethod(req.Username, req.Password));
+
+            if (authMethods.Count == 0)
+                return (false, null, null, "必须提供密码或私钥");
+
+            var connInfo = new Renci.SshNet.ConnectionInfo(req.Host, port, req.Username, authMethods.ToArray());
+            var ssh = new SshClient(connInfo);
+            var sftp = new SftpClient(connInfo);
+            ssh.Connect();
+            sftp.Connect();
+
+            string home = "/";
+            try { home = sftp.WorkingDirectory; } catch { /* ignore */ }
+
+            var id = mgr.Add(new SshSession(ssh, sftp, home));
+            return (true, id, home, null);
+        }
+        catch (Exception ex)
+        {
+            return (false, null, null, "连接失败: " + ex.Message);
+        }
+    }
+
+    internal static ConnectionProfile ToProfile(ConnectRequest req, int port) => new(
+        Id: Guid.NewGuid().ToString("N"),
+        Name: req.Name ?? req.Host,
+        Host: req.Host,
+        Port: port,
+        Username: req.Username,
+        AuthType: string.IsNullOrWhiteSpace(req.PrivateKey) ? "password" : "key",
+        Password: req.Password,
+        PrivateKey: req.PrivateKey,
+        Passphrase: req.Passphrase,
+        CreatedAt: DateTime.Now,
+        LastConnectedAt: DateTime.Now);
+
+    internal static async Task WriteLogEvent(HttpContext ctx, LogEntry e)
+    {
+        var json = JsonSerializer.Serialize(e);
+        await ctx.Response.WriteAsync($"data: {json}\n\n", ctx.RequestAborted);
+    }
 }
 
 /// <summary>

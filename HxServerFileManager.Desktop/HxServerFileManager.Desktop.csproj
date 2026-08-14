@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- 桌面壳不弹控制台窗口（Windows） -->
+    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
+    <SelfContained>false</SelfContained>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Photino.NET：跨平台轻量 WebView（Windows=WebView2 / macOS=WKWebView / Linux=WebKitGTK） -->
+    <PackageReference Include="Photino.NET" Version="3.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- 引用主项目，复用 Web 服务构建逻辑 -->
+    <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj" />
+  </ItemGroup>
+
+</Project>
