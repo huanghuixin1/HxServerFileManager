@@ -47,6 +47,9 @@ builder.Services.AddSingleton(new ConnectionsStore(dataDir));
 
 var app = builder.Build();
 
+// 启用 WebSocket 支持（交互终端 /api/terminal/ws 依赖）
+app.UseWebSockets();
+
 // ----------------------------------------------------------------------------
 // 登录鉴权（HxSimpleWebAuth）：密码来源优先级：
 //   1) 环境变量 HXSFM_WEB_PASSWORD（可覆盖，方便 CI/Docker 注入）；
