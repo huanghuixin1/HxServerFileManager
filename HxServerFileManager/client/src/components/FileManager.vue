@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
 
@@ -26,6 +26,48 @@ const renaming = ref(null)
 
 const uploading = ref(false)
 const fileInput = ref(null)
+
+// ---- 行右键菜单（替代操作列）----
+const menuVisible = ref(false)
+const menuRow = ref(null)
+const menuX = ref(0)
+const menuY = ref(0)
+
+function onRowContextMenu(row, _col, event) {
+  event.preventDefault()
+  menuRow.value = row
+  menuX.value = Math.min(event.clientX, window.innerWidth - 150)
+  menuY.value = Math.min(event.clientY, window.innerHeight - 200)
+  menuVisible.value = true
+}
+function closeMenu() {
+  menuVisible.value = false
+  menuRow.value = null
+}
+function menuEdit() {
+  const row = menuRow.value
+  closeMenu()
+  // 不依赖 isText 识别：非目录都能尝试编辑（后端会拒绝二进制/超大文件）
+  if (row && !row.isDirectory) emit('open-file', row.fullPath)
+}
+function menuDownload() {
+  const row = menuRow.value
+  closeMenu()
+  if (row) download(row)
+}
+function menuRename() {
+  const row = menuRow.value
+  closeMenu()
+  if (row) startRename(row)
+}
+function menuDelete() {
+  const row = menuRow.value
+  closeMenu()
+  if (row) remove(row)
+}
+
+onMounted(() => document.addEventListener('click', closeMenu))
+onUnmounted(() => document.removeEventListener('click', closeMenu))
 
 function combinePath(dir, name) {
   dir = (dir || '/').replace(/\/+$/, '')
@@ -262,6 +304,7 @@ function fmtDate(s) {
       row-key="fullPath"
       empty-text="空目录"
       @row-dblclick="(row) => (row.isDirectory ? openDir(row) : row.isText && emit('open-file', row.fullPath))"
+      @row-contextmenu="onRowContextMenu"
     >
       <el-table-column label="名称" min-width="240">
         <template #default="{ row }">
@@ -281,15 +324,28 @@ function fmtDate(s) {
       <el-table-column label="修改时间" width="180">
         <template #default="{ row }">{{ fmtDate(row.lastWriteTimeUtc) }}</template>
       </el-table-column>
-      <el-table-column label="操作" width="230" align="right">
-        <template #default="{ row }">
-          <el-button v-if="row.isText" link type="primary" size="small" @click.stop="emit('open-file', row.fullPath)">编辑</el-button>
-          <el-button link type="primary" size="small" @click.stop="download(row)">下载</el-button>
-          <el-button link size="small" @click.stop="startRename(row)">重命名</el-button>
-          <el-button link type="danger" size="small" @click.stop="remove(row)">删除</el-button>
-        </template>
-      </el-table-column>
     </el-table>
+
+    <!-- 行右键菜单：编辑/下载/重命名/删除 -->
+    <div
+      v-show="menuVisible"
+      class="ctx-menu"
+      :style="{ left: menuX + 'px', top: menuY + 'px' }"
+      @click.stop
+    >
+      <div v-if="menuRow && !menuRow.isDirectory" class="ctx-item" @click="menuEdit">
+        <el-icon :size="14"><EditPen /></el-icon>编辑
+      </div>
+      <div class="ctx-item" @click="menuDownload">
+        <el-icon :size="14"><Download /></el-icon>下载
+      </div>
+      <div class="ctx-item" @click="menuRename">
+        <el-icon :size="14"><Edit /></el-icon>重命名
+      </div>
+      <div class="ctx-item danger" @click="menuDelete">
+        <el-icon :size="14"><Delete /></el-icon>删除
+      </div>
+    </div>
 
     <!-- 新建目录 -->
     <el-dialog
@@ -417,5 +473,51 @@ function fmtDate(s) {
 }
 .fname.text .fico {
   color: #7a8794;
+}
+
+/* 行右键菜单 */
+.ctx-menu {
+  position: fixed;
+  z-index: 3000;
+  min-width: 130px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  padding: 5px;
+}
+.ctx-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  font-size: 13px;
+  color: #2a3542;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.ctx-item:hover {
+  background: var(--accent-soft);
+  color: #2d6cdf;
+}
+.ctx-item .el-icon {
+  color: #8a97a5;
+}
+.ctx-item:hover .el-icon {
+  color: #2d6cdf;
+}
+.ctx-item.danger {
+  color: #d33;
+}
+.ctx-item.danger:hover {
+  background: #fdecec;
+  color: #c0392b;
+}
+.ctx-item.danger .el-icon {
+  color: #e58a8a;
+}
+.ctx-item.danger:hover .el-icon {
+  color: #c0392b;
 }
 </style>
