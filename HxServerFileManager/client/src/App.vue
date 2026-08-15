@@ -9,6 +9,7 @@ import Terminal from './components/Terminal.vue'
 import LogPanel from './components/LogPanel.vue'
 import EditorModal from './components/EditorModal.vue'
 import LoginView from './components/LoginView.vue'
+import SystemStatus from './components/SystemStatus.vue'
 
 // ---- 登录鉴权状态：探测 /api/session，未认证时显示登录页 ----
 const authLoading = ref(true)
@@ -446,6 +447,9 @@ function closeEditor() {
     </main>
 
     <LogPanel v-if="logEnabled" />
+
+    <!-- 服务器状态：底部迷你状态栏（常驻）+ 点“详情”弹窗 -->
+    <SystemStatus v-if="activeConn" :conn-id="activeId" />
 
     <!-- 新建连接对话框（连接中也可随时打开） -->
     <el-dialog

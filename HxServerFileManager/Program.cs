@@ -730,6 +730,24 @@ app.MapPut("/api/settings/macros", (List<TerminalMacro> macros, SettingsStore st
     return Results.Ok(new { macros = store.ListMacros() });
 });
 
+// ---- 服务器状态：系统版本 / 开机时间 / CPU / 内存 / 磁盘 / 网络 ----
+// 一次 exec 通道内打包所有采集命令（SSH.NET 每次 CreateCommand 开新通道，
+// 拆开多调会争用同一会话），远程脚本输出带 ===SECTION=== 分隔，后端解析成结构化 JSON。
+app.MapGet("/api/system-status", (string connId, ConnectionManager mgr) =>
+{
+    try
+    {
+        var s = mgr.Get(connId);
+        using var cmd = s.Ssh.CreateCommand(SystemStatusHelpers.Script);
+        cmd.CommandTimeout = TimeSpan.FromSeconds(20);
+        cmd.Execute();
+        var status = SystemStatusHelpers.Parse((cmd.Result ?? "").Replace("\r\n", "\n"));
+        SystemStatusHelpers.ApplyRates(connId, status.Nets);
+        return Results.Ok(status);
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
 // ---- 空闲会话回收 ----
 var mgr = app.Services.GetRequiredService<ConnectionManager>();
 var cts = new CancellationTokenSource();
@@ -1283,5 +1301,218 @@ public sealed class SettingsStore
             _settings = _settings with { Macros = macros ?? new List<TerminalMacro>() };
             Save();
         }
+    }
+}
+
+// ---- 服务器状态：远程采集脚本 + 输出解析 ----
+
+public record DiskStatus(string Fs, string Size, string Used, string Avail, string Use, string Mount);
+public record NetStatus(string Name, string State, long RxBytes, long TxBytes, double RxRateBps = 0, double TxRateBps = 0);
+
+public record SystemStatus(
+    string? Hostname,
+    long UnixTs,
+    string? Os,
+    string? Kernel,
+    string? Arch,
+    long UptimeSeconds,
+    double? CpuPercent,
+    long MemTotal, long MemUsed, long MemFree, long MemAvailable, double MemPercent,
+    long SwapTotal, long SwapUsed, double SwapPercent,
+    List<DiskStatus> Disks,
+    List<NetStatus> Nets);
+
+/// <summary>
+/// 服务器状态采集：仅在远程执行一段 sh（兼容最小化系统：只有 /proc 和 coreutils 也能跑）。
+/// CPU 通过在 /proc/stat 上取前后两次快照（间隔 0.6s）算利用率，不依赖 top 的版本差异。
+/// </summary>
+public static class SystemStatusHelpers
+{
+    public const string Script = """
+        echo "===META==="
+        hostname 2>&1 || echo "unknown"
+        date +%s 2>&1 || echo "0"
+        echo "===OS==="
+        [ -f /etc/os-release ] && head -3 /etc/os-release 2>&1 || echo "no-os-release"
+        uname -r 2>&1 || echo "no-kernel"
+        uname -m 2>&1 || echo "no-arch"
+        echo "===UPTIME==="
+        [ -f /proc/uptime ] && head -1 /proc/uptime 2>&1 || echo "0 0"
+        echo "===CPU==="
+        c1=$(grep '^cpu ' /proc/stat 2>&1 | head -1); sleep 0.6; c2=$(grep '^cpu ' /proc/stat 2>&1 | head -1); echo "$c1"; echo "$c2"
+        echo "===MEM==="
+        [ -f /proc/meminfo ] && head -8 /proc/meminfo 2>&1 || echo "no-meminfo"
+        echo "===DISK==="
+        df -h -P 2>&1 | awk 'NR>1 && NF>=6 && $1 !~ /^tmpfs/ && $1 !~ /^devtmpfs/ {m=$6; for(i=7;i<=NF;i++) m=m" "$i; print $1"|"$2"|"$3"|"$4"|"$5"|"m}' || echo "no-df"
+        echo "===NET==="
+        # 直接从 /proc/net/dev 读全部接口（不依赖 /sys/class/net 目录遍历，容器里可能缺失）；
+        # 每接口尝试读 operstate；输出 name|state|rx|tx
+        awk 'NR>2 {
+          n=$1; sub(/:/,"",n);
+          if (n=="lo") next;
+          st="unknown";
+          f="/sys/class/net/" n "/operstate";
+          if ((getline x < f) > 0) { st=x; close(f) }
+          print n"|"st"|"$2"|"$10
+        }' /proc/net/dev 2>&1
+        echo "===END==="
+        """;
+
+    public static SystemStatus Parse(string text)
+    {
+        // 按 ===SECTION=== 分节
+        var sections = new Dictionary<string, List<string>>();
+        string cur = "";
+        foreach (var raw in text.Split('\n'))
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.StartsWith("===") && line.EndsWith("===") && line.Length > 6)
+            {
+                cur = line.Trim('=', ' ', '\r');
+                if (cur.Length > 0 && !sections.ContainsKey(cur)) sections[cur] = new List<string>();
+            }
+            else if (cur.Length > 0 && line.Length > 0)
+            {
+                sections[cur].Add(line);
+            }
+        }
+
+        var meta = sections.GetValueOrDefault("META") ?? new List<string>();
+        var hostname = meta.FirstOrDefault()?.Trim();
+        long unixTs = 0;
+        if (meta.Count > 1) long.TryParse(meta[1].Trim(), out unixTs);
+
+        // OS：os-release 的 PRETTY_NAME/NAME + 可选的 lsb_release + uname -r / -m
+        var osLines = sections.GetValueOrDefault("OS") ?? new List<string>();
+        string? os = null, kernel = null, arch = null;
+        foreach (var l in osLines)
+        {
+            if (os == null && l.StartsWith("PRETTY_NAME=", StringComparison.Ordinal))
+                os = l.Substring("PRETTY_NAME=".Length).Trim('"');
+            if (l.StartsWith("NAME=", StringComparison.Ordinal)) os ??= l.Substring(5).Trim('"');
+        }
+        if (osLines.Count >= 2)
+        {
+            kernel = osLines[^2]?.Trim();
+            arch = osLines[^1]?.Trim();
+            if (osLines.Count >= 3)
+            {
+                var mid = osLines[^3];
+                // 中间那行若不是 key=value（即 lsb_release 的自由文本），优先用作发行版名
+                if (!string.IsNullOrWhiteSpace(mid) && !mid.Contains('=')) os = mid.Trim();
+            }
+        }
+
+        // 开机时间
+        long uptime = 0;
+        var up = sections.GetValueOrDefault("UPTIME")?.FirstOrDefault()?.Trim();
+        if (up != null && double.TryParse(up.Split(' ', StringSplitOptions.RemoveEmptyEntries)[0],
+                System.Globalization.NumberStyles.Float,
+                System.Globalization.CultureInfo.InvariantCulture, out var upSec))
+            uptime = (long)upSec;
+
+        // CPU：两行 `/proc/stat`，各字段 user nice system idle iowait irq softirq steal
+        double? cpuPercent = null;
+        var cpu = sections.GetValueOrDefault("CPU") ?? new List<string>();
+        if (cpu.Count >= 2)
+        {
+            var a = TryCpu(cpu[0]); var b = TryCpu(cpu[1]);
+            if (a != null && b != null && b.Value.Total > a.Value.Total)
+            {
+                var dTot = b.Value.Total - a.Value.Total;
+                var dIdle = b.Value.Idle - a.Value.Idle;
+                cpuPercent = dTot > 0 ? Math.Clamp((1 - (double)dIdle / dTot) * 100, 0, 100) : 0;
+            }
+        }
+
+        // 内存 / 交换（kB）
+        var mem = new Dictionary<string, long>();
+        foreach (var l in sections.GetValueOrDefault("MEM") ?? new List<string>())
+        {
+            var p = l.Split(':');
+            if (p.Length == 2 && long.TryParse(p[1].Trim().Split(' ')[0], out var v)) mem[p[0]] = v;
+        }
+        long memTotal = mem.GetValueOrDefault("MemTotal");
+        long memAvailable = mem.GetValueOrDefault("MemAvailable");
+        long memFree = mem.GetValueOrDefault("MemFree");
+        long memUsed = memTotal > 0 ? Math.Max(0, memTotal - memAvailable) : 0;
+        double memPercent = memTotal > 0 ? Math.Clamp((double)memUsed / memTotal * 100, 0, 100) : 0;
+        long swapTotal = mem.GetValueOrDefault("SwapTotal");
+        long swapUsed = swapTotal > 0 ? Math.Max(0, swapTotal - mem.GetValueOrDefault("SwapFree")) : 0;
+        double swapPercent = swapTotal > 0 ? Math.Clamp((double)swapUsed / swapTotal * 100, 0, 100) : 0;
+
+        // 磁盘
+        var disks = new List<DiskStatus>();
+        foreach (var l in sections.GetValueOrDefault("DISK") ?? new List<string>())
+        {
+            var p = l.Split('|');
+            if (p.Length == 6)
+                disks.Add(new DiskStatus(p[0].Trim(), p[1].Trim(), p[2].Trim(), p[3].Trim(), p[4].Trim(), p[5].Trim()));
+        }
+
+        // 网络：name|state|rx|tx
+        var nets = new List<NetStatus>();
+        foreach (var l in sections.GetValueOrDefault("NET") ?? new List<string>())
+        {
+            var p = l.Split('|');
+            if (p.Length == 4 &&
+                long.TryParse(p[2].Trim(), out var rx) &&
+                long.TryParse(p[3].Trim(), out var tx))
+                nets.Add(new NetStatus(p[0].Trim(), p[1].Trim(), rx, tx));
+        }
+
+        // 若 /proc/uptime 缺失（很可能非 Linux），按 hostname 时间戳兜底估算不了，置 0 由前端提示
+        return new SystemStatus(
+            hostname, unixTs, os, kernel, arch, uptime,
+            cpuPercent,
+            memTotal, memUsed, memFree, memAvailable, Math.Round(memPercent, 1),
+            swapTotal, swapUsed, Math.Round(swapPercent, 1),
+            disks, nets);
+    }
+
+    private static (long Total, long Idle)? TryCpu(string line)
+    {
+        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 8 || parts[0] != "cpu") return null;
+        long tot = 0, idle = 0;
+        long[] f = new long[8];
+        for (int i = 1; i <= 7 && i < parts.Length; i++)
+        {
+            if (!long.TryParse(parts[i], out f[i])) return null;
+            tot += f[i];
+        }
+        // idle = idle(4) + iowait(5)；guest 已计入 user，不再累加
+        idle = f[4] + f[5];
+        return (tot, idle);
+    }
+
+    // ---- 网络速率：跨请求对 /proc/net/dev 的累计字节做差值 / 时间差（B/s）----
+    // 状态栏每 10s 刷新一次，故速率即该刷新窗口内的平均速率。
+    private sealed record NetSnapshot(DateTime Ts, Dictionary<string, (long Rx, long Tx)> Ifaces);
+
+    private static readonly ConcurrentDictionary<string, NetSnapshot> _netSnap = new();
+
+    public static void ApplyRates(string connId, List<NetStatus> nets)
+    {
+        if (nets.Count == 0) return;
+        var now = DateTime.UtcNow;
+        var cur = nets.ToDictionary(n => n.Name, n => (n.RxBytes, n.TxBytes));
+        if (_netSnap.TryGetValue(connId, out var last))
+        {
+            var dt = (now - last.Ts).TotalSeconds;
+            if (dt >= 0.5)
+            {
+                for (int i = 0; i < nets.Count; i++)
+                {
+                    if (last.Ifaces.TryGetValue(nets[i].Name, out var p))
+                    {
+                        var rx = Math.Max(0, nets[i].RxBytes - p.Rx) / dt;
+                        var tx = Math.Max(0, nets[i].TxBytes - p.Tx) / dt;
+                        nets[i] = nets[i] with { RxRateBps = rx, TxRateBps = tx };
+                    }
+                }
+            }
+        }
+        _netSnap[connId] = new NetSnapshot(now, cur);
     }
 }

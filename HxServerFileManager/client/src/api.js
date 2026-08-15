@@ -196,6 +196,10 @@ export const api = {
   getMacros: () => request('/api/settings/macros'),
   putMacros: (macros) =>
     request('/api/settings/macros', { method: 'PUT', body: JSON.stringify(macros) }),
+
+  // 当前连接对应服务器的系统状态（一次 SSH 采集）
+  systemStatus: (connId) =>
+    request(`/api/system-status?connId=${encodeURIComponent(connId)}`),
 }
 
 // SSE 实时日志流（EventSource 不能带请求头，token 走查询参数）
