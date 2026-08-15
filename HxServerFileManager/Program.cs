@@ -620,9 +620,14 @@ app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, Connection
                         }
                         else if (t == "resize"
                                  && doc.RootElement.TryGetProperty("cols", out var colsEl)
-                                 && doc.RootElement.TryGetProperty("rows", out var rowsEl))
+                                 && doc.RootElement.TryGetProperty("rows", out var rowsEl)
+                                 && colsEl.TryGetInt32(out var cols) && rowsEl.TryGetInt32(out var rows))
                         {
-                            // ShellStream 不支持动态 resize，忽略（与现有行为一致）
+                            // 前端容器尺寸变化（拉窗/拖分隔条/最大化）时同步 pty 尺寸，
+                            // 让 shell 的回绕列数跟随终端实际宽度
+                            cols = Math.Clamp(cols, 40, 200);
+                            rows = Math.Clamp(rows, 10, 60);
+                            s.Shell.ChangeWindowSize((uint)cols, (uint)rows, (uint)(cols * 8), (uint)(rows * 16));
                         }
                     }
                 }

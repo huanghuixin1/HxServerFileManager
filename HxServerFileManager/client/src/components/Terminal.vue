@@ -2,6 +2,7 @@
 import { ref, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Terminal as XTerm } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
 import { api } from '../api.js'
 import { useSettings } from '../useSettings.js'
@@ -192,14 +193,64 @@ function waitForSize(timeout = 2500) {
   })
 }
 
+// 行列数用 FitAddon 按真实单元格尺寸计算，尽量顶满容器（pty 与 xterm 显示使用同一行列，
+// 保证 shell 回绕列数一致）
+let fitAddon = null
+
+// 容器尺寸变化（窗口缩放 / 拖分隔条 / 终端最大化）时重算行列：
+// fit 改显示，ws resize 消息同步 pty，让 shell 回绕列数跟随终端宽度
+let sizeObserver = null
+let resizeTimer = null
+function scheduleRefit() {
+  if (!xterm || !fitAddon) return
+  if (resizeTimer) clearTimeout(resizeTimer)
+  resizeTimer = setTimeout(() => {
+    resizeTimer = null
+    if (!xterm || !fitAddon) return
+    const prevCols = xterm.cols
+    const prevRows = xterm.rows
+    try { fitAddon.fit() } catch (_) { return } // 容器不可见/无尺寸时静默跳过
+    if (xterm.cols === prevCols && xterm.rows === prevRows) return
+    if (ws && ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ type: 'resize', cols: xterm.cols, rows: xterm.rows }))
+  }, 150)
+}
+
+function startSizeObserver() {
+  stopSizeObserver()
+  if (!termHost.value) return
+  sizeObserver = new ResizeObserver(() => scheduleRefit())
+  sizeObserver.observe(termHost.value)
+}
+
+function stopSizeObserver() {
+  if (sizeObserver) { sizeObserver.disconnect(); sizeObserver = null }
+  if (resizeTimer) { clearTimeout(resizeTimer); resizeTimer = null }
+}
+
 async function openInteractive() {
   try {
     await waitForSize()
-    // pty 尺寸按容器估一个，与 xterm 显示保持一致（创建后不可变）
-    const hostEl = termHost.value
-    const cols = hostEl ? Math.min(200, Math.max(40, Math.floor(hostEl.clientWidth / 9))) : 100
-    const rows = hostEl ? Math.min(60, Math.max(10, Math.floor(hostEl.clientHeight / 18))) : 30
-    await api.terminalOpen(props.connId, cols, rows)
+
+    // 先建好 xterm 并 fit 出与容器一致的真实行列，pty 尺寸随之精确匹配
+    if (!xterm) {
+      fitAddon = new FitAddon()
+      xterm = new XTerm({
+        cursorBlink: true,
+        fontSize: 13,
+        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+        theme: { background: '#0f1620', foreground: '#d6e2ef', cursor: '#7fd1ff' },
+        scrollback: 2000,
+      })
+      xterm.loadAddon(fitAddon)
+      xterm.open(termHost.value)
+      xterm.onData((data) => {
+        sendInput(data)
+      })
+      xterm.writeln('--- 交互终端已连接（可直接输入；Ctrl+C 中断，exit 退出） ---')
+    }
+    try { fitAddon.fit() } catch (_) { /* 容器无尺寸时保持默认 80x24 */ }
+    await api.terminalOpen(props.connId, xterm.cols, xterm.rows)
 
     // 首次打开时，若 App 给了初始目录（如本地化恢复的路径）且不是根目录，注入一次 cd
     if (!initialCdDone && initialCwd && initialCwd !== '/') {
@@ -211,22 +262,6 @@ async function openInteractive() {
       }, 400) // 等 shell 提示符就绪
     } else if (!initialCdDone) {
       initialCdDone = true
-    }
-
-    if (!xterm) {
-      xterm = new XTerm({
-        cursorBlink: true,
-        fontSize: 13,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
-        theme: { background: '#0f1620', foreground: '#d6e2ef', cursor: '#7fd1ff' },
-        scrollback: 2000,
-      })
-      xterm.open(termHost.value)
-      xterm.resize(cols, rows)
-      xterm.onData((data) => {
-        sendInput(data)
-      })
-      xterm.writeln('--- 交互终端已连接（可直接输入；Ctrl+C 中断，exit 退出） ---')
     }
 
     if (!ws) {
@@ -247,6 +282,7 @@ async function openInteractive() {
       ws.onerror = () => { /* close 回调会处理重连 */ }
     }
     xterm.focus()
+    startSizeObserver()
   } catch (e) {
     if (xterm) xterm.writeln('\r\n[交互终端打开失败] ' + e.message)
   }
@@ -259,8 +295,10 @@ function sendInput(data) {
 }
 
 function closeInteractive() {
+  stopSizeObserver()
   if (ws) { try { ws.close() } catch (_) {} ws = null }
   if (xterm) { try { xterm.dispose() } catch (_) {} xterm = null }
+  fitAddon = null
 }
 
 // 文件列表导航 -> 在交互终端里执行 cd（仅交互模式生效；全屏程序运行时会被吞进程序里，属预期）
@@ -283,6 +321,7 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  stopSizeObserver()
   closeInteractive()
   // 通知后端回收 shell（尽量，失败也无妨）
   api.terminalClose(props.connId).catch(() => {})

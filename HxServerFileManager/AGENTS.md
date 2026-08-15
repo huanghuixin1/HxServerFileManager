@@ -39,6 +39,7 @@
 - `connections.json` 明文存密码/私钥，仅限本地/内网
 
 ## 进度记录
+- 2026-08-15：终端宽度自适应 —— 之前 xterm 的 cols/rows 只在打开 pty 时算一次（容器宽/9、高/18 clamp），拉窗 / 拖分隔条 / 终端最大化后终端还是原宽度。修复：**前端** Terminal.vue 用 `ResizeObserver` 监听 `.xterm-wrap`，容器尺寸变化时 150ms 防抖 `xterm.resize(cols,rows)` 并通过 ws 发 `{type:'resize',cols,rows}`（ws 未开时只改显示）；**后端** `/api/terminal/ws` 的 resize 分支从“忽略”改为调用 SSH.NET `ShellStream.ChangeWindowSize(cols, rows, cols*8, rows*16)`（2026.0.0.1 版本确实支持动态改 pty 大小，原“不支持动态 resize”注释是错的，已删），让 shell 回绕列数跟随终端实际宽度。行列计算由 `@xterm/addon-fit` 的 `fit()` 按**真实单元格尺寸**计算（pty 开多大、显示多大完全同源；打开顺序：先建 xterm+fit → `terminalOpen(xterm.cols, xterm.rows)`）。`.xterm-screen` 不按 CSS 撑满是 xterm 设计行为——它的宽度是 JS 按 列数×单元格宽 写死的内联 style，字符网格不能拉伸，硬写 `width:100%` 没意义；想顶满容器只能靠 fit 选合适列数（最多余一条不足一个单元格的窄缝）
 - 2026-08-14：前端整体切到 Element Plus（main.js 注册 EP+图标；组件全用 el-*）
 - 2026-08-14：修复 5 处字段名 bug（connId→connectionId）、断开/重连、dev proxy 端口
 - 2026-08-14：支持多服务器并发连接 —— App.vue 会话标签栏（自定义 pill tab，可关闭+确认）、新建连接对话框、每标签独立 FileManager/Terminal/EditorModal（v-show 保留状态）；后端本就支持多会话（ConcurrentDictionary），无需改动
