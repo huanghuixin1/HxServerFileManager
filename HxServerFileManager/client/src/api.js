@@ -113,6 +113,15 @@ export const api = {
   deleteConnection: (id) =>
     request(`/api/connections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
 
+  // 导出/导入连接（导出为明文 JSON，含密码/私钥，用于备份迁移）
+  exportConnections: () => request('/api/connections/export'),
+  // mode: 'merge'（去重合并，host|port|username|password 一致才判重）| 'replace'（覆盖导入）
+  importConnections: (profiles, mode = 'merge') =>
+    request(`/api/connections/import?mode=${encodeURIComponent(mode)}`, {
+      method: 'POST',
+      body: JSON.stringify(profiles),
+    }),
+
   listFiles: (connId, path) =>
     request(`/api/files?connId=${encodeURIComponent(connId)}&path=${encodeURIComponent(path)}`),
 

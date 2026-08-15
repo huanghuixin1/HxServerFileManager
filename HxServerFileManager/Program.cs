@@ -10,6 +10,7 @@ using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading.Channels;
@@ -24,8 +25,8 @@ using System.Threading.Channels;
 //   2) 文本文件在线读取 / 编辑（/api/file-content）
 //   3) 实时操作日志（/api/logs/stream，Server-Sent Events）
 //
-// 注意：connections.json 中以明文保存凭据，仅供本地/内网测试使用，
-//       请勿在公网环境直接暴露本服务。
+// 注意：connections.json 落盘时经 AES-GCM 加密（密钥见 DataCrypto，可配 HXSFM_DATA_KEY
+// 环境变量或 Data/secret.key 文件），仅供本地/内网测试使用，请勿在公网环境直接暴露本服务。
 // ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
@@ -35,7 +36,17 @@ using System.Threading.Channels;
 // ----------------------------------------------------------------------------
 
 var app = WebHost.Build(args);
+
+// Ctrl+C / SIGTERM 优雅停机：app.Run() 默认 ConsoleLifetime 已捕获信号并触发
+// ApplicationStopping（进而取消后台任务），这里仅在停止流程开始时打一行提示。
+app.Lifetime.ApplicationStopping.Register(() =>
+{
+    Console.WriteLine();
+    Console.WriteLine("[HxServerFileManager] 收到停止信号，正在优雅停止…");
+});
+
 app.Run();
+Console.WriteLine("[HxServerFileManager] 已退出");
 
 /// <summary>
 /// 构建并配置 WebApplication（中间件 + 路由 + 服务注册），但不启动。
@@ -235,6 +246,52 @@ app.MapGet("/api/connections", (ConnectionsStore store) =>
         lastConnectedAt = p.LastConnectedAt
     }).OrderByDescending(p => p.lastConnectedAt).ToList();
     return Results.Ok(new { connections = list });
+});
+
+// 导出全部已保存连接（含密码/私钥/口令等凭据，明文 JSON）—— 用户主动下载，用于备份/迁移。
+// 受同一认证中间件保护；文件内容即前端「导入」所需的数组格式。
+app.MapGet("/api/connections/export", (ConnectionsStore store) =>
+{
+    var list = store.List();
+    return Results.Ok(new { exportedAt = DateTime.Now, connections = list });
+});
+
+// 导入连接：接收明文 JSON 数组（host/username/port 必填，缺 id 自动补），
+// 按 host|port|username 去重：已存在则更新凭据、保留原 Id/创建时间，否则新增。返回各类数量。
+// 导入连接：接收明文 JSON 数组（host/username/port 必填，缺 id 自动补）。
+// ?mode=merge（默认）：按 host|port|username|password 四字段全一致判重，重复则更新、否则新增；
+// ?mode=replace：清空现有连接，整体替换为导入内容。返回各类数量。
+app.MapPost("/api/connections/import", (List<ConnectionProfile> profiles, string? mode, ConnectionsStore store, OperationLogger log) =>
+{
+    var replace = string.Equals(mode, "replace", StringComparison.OrdinalIgnoreCase);
+    var valid = new List<ConnectionProfile>();
+    var skipped = 0;
+    foreach (var p in profiles ?? new List<ConnectionProfile>())
+    {
+        if (string.IsNullOrWhiteSpace(p.Host) || string.IsNullOrWhiteSpace(p.Username) || p.Port <= 0)
+        {
+            skipped++;
+            continue;
+        }
+        valid.Add(p with
+        {
+            Id = string.IsNullOrWhiteSpace(p.Id) ? Guid.NewGuid().ToString("N") : p.Id,
+            Name = string.IsNullOrWhiteSpace(p.Name) ? $"{p.Username}@{p.Host}" : p.Name,
+            AuthType = p.AuthType == "key" ? "key" : "password",
+            CreatedAt = p.CreatedAt == default ? DateTime.Now : p.CreatedAt,
+        });
+    }
+
+    if (replace)
+    {
+        store.ReplaceAll(valid);
+        log.Log("info", "导入连接", "覆盖", $"导入 {valid.Count}，跳过 {skipped}", null);
+        return Results.Ok(new { replaced = valid.Count, skipped });
+    }
+
+    var (added, updated) = store.MergeImport(valid);
+    log.Log("info", "导入连接", "去重合并", $"新增 {added}，更新 {updated}，跳过 {skipped}", null);
+    return Results.Ok(new { added, updated, skipped });
 });
 
 // 用已保存的凭据重新连接
@@ -785,6 +842,7 @@ app.Lifetime.ApplicationStopping.Register(() => cts.Cancel());
 _ = Task.Run(() => mgr.CleanupLoop(cts.Token));
 
 Console.WriteLine($"[HxServerFileManager] Kestrel 已启动，监听 http://0.0.0.0:{listenPort}");
+Console.WriteLine("[HxServerFileManager] 按 Ctrl+C 停止服务");
         return app;
     }
 }
@@ -1241,32 +1299,124 @@ public sealed class OperationLogger
 }
 
 /// <summary>
-/// 已保存的连接配置（持久化到 Data/connections.json，凭据明文存储，仅供本地/内网）。
+/// connections.json 落盘加密：AES-GCM（.NET 内置 AesGcm，带认证防篡改）。
+/// 密钥来源（优先前者）：
+///   ① 环境变量 HXSFM_DATA_KEY —— 任意长度，SHA-256 派生 32 字节密钥，密钥不进盘（systemd/Docker 注入）
+///   ② Data/secret.key —— 首启生成的随机 32 字节密钥文件（Unix 下 chmod 600）
+/// 文件格式：前缀 "HXSFM1:" + Base64(nonce(12) || tag(16) || ciphertext)。
+/// 老明文文件由 ConnectionsStore 启动时探测，解密迁移为加密落盘。
+/// </summary>
+public static class DataCrypto
+{
+    private const string Magic = "HXSFM1:";
+    private static byte[]? _key;
+
+    public static byte[] GetKey(string dataDir)
+    {
+        _key ??= LoadOrCreateKey(dataDir);
+        return _key;
+    }
+
+    private static byte[] LoadOrCreateKey(string dataDir)
+    {
+        var env = Environment.GetEnvironmentVariable("HXSFM_DATA_KEY");
+        if (!string.IsNullOrWhiteSpace(env))
+            return SHA256.HashData(Encoding.UTF8.GetBytes(env));
+
+        var file = Path.Combine(dataDir, "secret.key");
+        if (File.Exists(file))
+        {
+            try
+            {
+                var k = Convert.FromBase64String(File.ReadAllText(file).Trim());
+                if (k.Length is 16 or 24 or 32) return k;
+            }
+            catch { /* 文件损坏则重新生成 */ }
+        }
+        var key = RandomNumberGenerator.GetBytes(32);
+        File.WriteAllText(file, Convert.ToBase64String(key));
+        try { File.SetUnixFileMode(file, UnixFileMode.UserRead | UnixFileMode.UserWrite); } catch { /* 非 Unix 忽略 */ }
+        return key;
+    }
+
+    public static string Encrypt(string plaintext, byte[] key)
+    {
+        var plain = Encoding.UTF8.GetBytes(plaintext);
+        var nonce = RandomNumberGenerator.GetBytes(12);
+        var tag = new byte[16];
+        var cipher = new byte[plain.Length];
+        using (var aes = new AesGcm(key, 16))
+            aes.Encrypt(nonce, plain, cipher, tag);
+        var blob = new byte[nonce.Length + tag.Length + cipher.Length];
+        Buffer.BlockCopy(nonce, 0, blob, 0, nonce.Length);
+        Buffer.BlockCopy(tag, 0, blob, nonce.Length, tag.Length);
+        Buffer.BlockCopy(cipher, 0, blob, nonce.Length + tag.Length, cipher.Length);
+        return Magic + Convert.ToBase64String(blob);
+    }
+
+    public static bool IsEncrypted(string content) =>
+        content.StartsWith(Magic, StringComparison.Ordinal);
+
+    public static string Decrypt(string content, byte[] key)
+    {
+        var blob = Convert.FromBase64String(content.Substring(Magic.Length));
+        var nonce = blob.AsSpan(0, 12);
+        var tag = blob.AsSpan(12, 16);
+        var cipher = blob.AsSpan(28);
+        var plain = new byte[cipher.Length];
+        using (var aes = new AesGcm(key, 16))
+            aes.Decrypt(nonce, cipher, tag, plain);
+        return Encoding.UTF8.GetString(plain);
+    }
+}
+
+/// <summary>
+/// 已保存的连接配置（持久化到 Data/connections.json，凭据经 DataCrypto AES-GCM 加密落盘，
+/// 仅在内存中以明文存在，供自动重连/导出使用）。
 /// </summary>
 public sealed class ConnectionsStore
 {
     private readonly string _file;
     private readonly object _gate = new();
+    private readonly byte[] _key;
     private List<ConnectionProfile> _profiles;
 
     public ConnectionsStore(string dataDir)
     {
         Directory.CreateDirectory(dataDir);
         _file = Path.Combine(dataDir, "connections.json");
+        _key = DataCrypto.GetKey(dataDir);
         _profiles = Load();
     }
 
     private List<ConnectionProfile> Load()
     {
         if (!File.Exists(_file)) return new();
-        try { return JsonSerializer.Deserialize<List<ConnectionProfile>>(File.ReadAllText(_file)) ?? new(); }
-        catch { return new(); }
+        string content;
+        try { content = File.ReadAllText(_file); } catch { return new(); }
+        List<ConnectionProfile> list;
+        try
+        {
+            // 大小写不敏感：兼容旧应用写的 PascalCase 文件，也兼容 camelCase（导入/手工编辑的）
+            var opts = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+            list = DataCrypto.IsEncrypted(content)
+                ? JsonSerializer.Deserialize<List<ConnectionProfile>>(DataCrypto.Decrypt(content, _key), opts) ?? new()
+                : JsonSerializer.Deserialize<List<ConnectionProfile>>(content, opts) ?? new();
+        }
+        catch { return new(); } // 损坏视为无连接，不阻断启动
+
+        // 老明文文件：读取成功后立即加密迁移落盘
+        if (!DataCrypto.IsEncrypted(content))
+        {
+            try { Save(); } catch { /* 迁移失败不阻断，下次保存仍会加密 */ }
+        }
+        return list;
     }
 
     private void Save()
     {
         var json = JsonSerializer.Serialize(_profiles, new JsonSerializerOptions { WriteIndented = true });
-        File.WriteAllText(_file, json);
+        File.WriteAllText(_file, DataCrypto.Encrypt(json, _key));
     }
 
     public IReadOnlyList<ConnectionProfile> List()
@@ -1309,6 +1459,45 @@ public sealed class ConnectionsStore
         {
             var x = _profiles.FirstOrDefault(p => p.Id == id);
             if (x != null) { _profiles.Remove(x); Save(); }
+        }
+    }
+
+    // 覆盖导入：清空现有连接，整体替换为导入列表
+    public void ReplaceAll(IEnumerable<ConnectionProfile> list)
+    {
+        lock (_gate)
+        {
+            _profiles = list.ToList();
+            Save();
+        }
+    }
+
+    // 去重合并导入：按 host|port|username|password 四字段全一致判定重复。
+    // 重复 → 用导入内容更新（保留原 Id/CreatedAt）；不重复 → 新增。
+    public (int added, int updated) MergeImport(IEnumerable<ConnectionProfile> incoming)
+    {
+        lock (_gate)
+        {
+            var added = 0;
+            var updated = 0;
+            foreach (var p in incoming)
+            {
+                var key = $"{p.Host}|{p.Port}|{p.Username}|{p.Password}";
+                var existing = _profiles.FirstOrDefault(x => $"{x.Host}|{x.Port}|{x.Username}|{x.Password}" == key);
+                if (existing is null)
+                {
+                    _profiles.Add(p);
+                    added++;
+                }
+                else
+                {
+                    _profiles.Remove(existing);
+                    _profiles.Add(p with { Id = existing.Id, CreatedAt = existing.CreatedAt });
+                    updated++;
+                }
+            }
+            Save();
+            return (added, updated);
         }
     }
 }

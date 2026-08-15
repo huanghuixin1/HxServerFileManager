@@ -8,8 +8,9 @@
 #
 # 用法：
 #   ./build.sh [选项] [target...]
+#   不带任何参数双击运行时，会弹出菜单，输入 A/B/C/D… 选择要编译的目标。
 #
-# target（缺省 = all，即桌面三平台）：
+# target（缺省：交互终端弹菜单选择；非交互环境 = all，即桌面三平台）：
 #   win-x64      Windows 10/11 x64（目标机需 WebView2 Runtime，Win10/11 基本自带）
 #   linux-x64    Linux x64（Debian/Ubuntu：sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0）
 #   linux-arm64  树莓派 / ARM 服务器（同上依赖）
@@ -75,7 +76,37 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  TARGETS=(win-x64 linux-x64 osx-arm64)
+  if [[ -t 0 ]]; then
+    # 无参数 + 交互终端（双击/直接运行）：弹出菜单让用户选择编译目标
+    echo
+    echo "══════════════════════════════════════════════════"
+    echo " HxServerFileManager 构建目标选择"
+    echo "══════════════════════════════════════════════════"
+    echo "  A) Windows 桌面壳    (win-x64)"
+    echo "  B) Linux 桌面壳      (linux-x64)"
+    echo "  C) macOS 桌面壳      (osx-arm64)"
+    echo "  D) Linux 服务端      (server / linux-x64)"
+    echo "  E) 全部桌面三平台    (win-x64 + linux-x64 + osx-arm64)"
+    echo "  F) 全部 + 服务端     (桌面三平台 + server)"
+    echo "  Q) 退出"
+    echo "----------------------------------------------"
+    while true; do
+      read -r -p "请选择 (A/B/C/D/E/F/Q): " choice
+      case "${choice,,}" in
+        a) TARGETS=(win-x64); break;;
+        b) TARGETS=(linux-x64); break;;
+        c) TARGETS=(osx-arm64); break;;
+        d) TARGETS=(server); break;;
+        e) TARGETS=(win-x64 linux-x64 osx-arm64); break;;
+        f) TARGETS=(win-x64 linux-x64 osx-arm64 server); break;;
+        q) echo "已退出"; exit 0;;
+        *) echo "无效输入，请重新选择。";;
+      esac
+    done
+  else
+    # 非交互（管道/CI）：保持默认全部桌面三平台
+    TARGETS=(win-x64 linux-x64 osx-arm64)
+  fi
 fi
 
 # mac-app 目标支持第二个位置参数指定 RID：./build.sh mac-app osx-x64

@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
 
 const props = defineProps({
@@ -10,6 +11,8 @@ const emit = defineEmits(['reconnect', 'edit'])
 const items = ref([])
 const error = ref('')
 const busyId = ref(null)
+const fileRef = ref(null)
+const importing = ref(false)
 
 async function load() {
   try {
@@ -21,6 +24,81 @@ async function load() {
 }
 onMounted(load)
 watch(() => props.reloadToken, load)
+
+// 导出：服务端解密后返回含凭据的明文 JSON，下载为文件（备份/迁移用）
+async function doExport() {
+  try {
+    const res = await api.exportConnections()
+    const data = res.connections || []
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const d = new Date()
+    const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+    a.href = url
+    a.download = `hxsfm-connections-${stamp}.json`
+    a.click()
+    URL.revokeObjectURL(url)
+    ElMessage.success(`已导出 ${data.length} 个连接（含凭据明文）`)
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+function pickFile() {
+  fileRef.value?.click()
+}
+
+// 导入：读明文 JSON（兼容裸数组或 {connections:[...]}），先选方式再交后端。
+// 去重合并：按 地址+端口+用户名+密码 四字段全一致判重，重复更新、其余新增；覆盖：清空后整体导入。
+async function onFileChanged(e) {
+  const file = e.target.files?.[0]
+  e.target.value = '' // 允许重复选择同一文件
+  if (!file) return
+  importing.value = true
+  try {
+    const text = await file.text()
+    let parsed = JSON.parse(text)
+    if (parsed && Array.isArray(parsed.connections)) parsed = parsed.connections
+    if (!Array.isArray(parsed)) throw new Error('文件格式不正确：应为连接数组 JSON（可由导出功能生成）')
+    if (parsed.length === 0) {
+      ElMessage.warning('文件中没有连接，未导入')
+      return
+    }
+
+    // 选择导入方式（确认=去重合并，取消=覆盖，关闭=放弃）
+    let mode = 'merge'
+    try {
+      await ElMessageBox.confirm(
+        `已读取 ${parsed.length} 个连接，请选择导入方式。`,
+        '导入连接',
+        {
+          confirmButtonText: '去重合并',
+          cancelButtonText: '覆盖导入',
+          distinguishCancelAndClose: true,
+          type: 'info',
+        }
+      )
+    } catch (action) {
+      if (action !== 'cancel') return // 关闭对话框 = 放弃
+      mode = 'replace'
+    }
+
+    const res = await api.importConnections(parsed, mode)
+    if (mode === 'replace') {
+      ElMessage.success(`覆盖导入完成：导入 ${res.replaced} 个${res.skipped ? `，跳过 ${res.skipped} 个` : ''}`)
+    } else {
+      const parts = [`新增 ${res.added}`, `更新 ${res.updated}`]
+      if (res.skipped) parts.push(`跳过 ${res.skipped} 个`)
+      ElMessage.success(`去重合并完成：${parts.join('，')}`)
+    }
+    await load()
+  } catch (e) {
+    ElMessage.error(e.message || '导入失败')
+  } finally {
+    importing.value = false
+  }
+}
 
 async function doReconnect(item) {
   error.value = ''
@@ -57,7 +135,24 @@ async function doDelete(item) {
 
 <template>
   <div class="card saved">
-    <h3 class="title">已保存的连接</h3>
+    <div class="head">
+      <h3 class="title">已保存的连接</h3>
+      <div class="head-actions">
+        <el-button size="small" text type="primary" :loading="importing" @click="doExport">
+          <el-icon :size="14" style="margin-right: 4px"><Upload /></el-icon>导出
+        </el-button>
+        <el-button size="small" text type="primary" :loading="importing" @click="pickFile">
+          <el-icon :size="14" style="margin-right: 4px"><Download /></el-icon>导入
+        </el-button>
+        <input
+          ref="fileRef"
+          type="file"
+          accept=".json,application/json"
+          style="display: none"
+          @change="onFileChanged"
+        />
+      </div>
+    </div>
 
     <el-alert
       v-if="error"
@@ -120,9 +215,19 @@ async function doDelete(item) {
 
 <style scoped>
 .title {
-  margin: 0 0 12px;
+  margin: 0;
   font-size: 15px;
   color: #1f2d3d;
+}
+.head {
+  display: flex;
+  align-items: center;
+  margin-bottom: 12px;
+}
+.head-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 4px;
 }
 .mb {
   margin-bottom: 12px;
