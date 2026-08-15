@@ -95,7 +95,7 @@ const props = defineProps({
   cwd: { type: String, default: '/' },
   maximized: { type: Boolean, default: false },
 })
-const emit = defineEmits(['update:cwd', 'toggle-max'])
+const emit = defineEmits(['update:cwd', 'toggle-max', 'disconnected'])
 
 // 默认交互终端（真终端）；快捷命令保留为二线工具
 const mode = ref('interactive')
@@ -141,6 +141,7 @@ function restoreFocus() {
 const termHost = ref(null)
 let xterm = null
 let ws = null
+let manualClose = false // 主动关闭 ws（切 exec / 卸载 / 重连重建），不触发断开提示
 let initialCdDone = false // 首次打开时按 cwd prop 恢复目录（刷新/重开回到上次路径）
 let oscIgnored = false // 注入恢复路径完成前忽略 OSC 7（防止 shell 初始目录覆盖恢复路径）
 // 挂载时快照初始目录：恢复路径不能被后续 OSC 7 推送覆盖（props.cwd 会随 cwdMap 变化）
@@ -265,6 +266,7 @@ async function openInteractive() {
     }
 
     if (!ws) {
+      manualClose = false
       ws = new WebSocket(api.terminalWsUrl(props.connId))
       ws.onmessage = (e) => {
         try {
@@ -279,7 +281,13 @@ async function openInteractive() {
           }
         } catch (_) { /* ignore */ }
       }
-      ws.onerror = () => { /* close 回调会处理重连 */ }
+      // 连接异常/关闭：在终端里写一条醒目提示，并通知 App 显示重连横幅
+      ws.onclose = () => {
+        if (manualClose) { manualClose = false; return } // 主动关闭不提示
+        if (xterm) writeDisconnectedBanner()
+        emit('disconnected')
+      }
+      ws.onerror = () => { /* close 回调会处理 */ }
     }
     xterm.focus()
     startSizeObserver()
@@ -294,8 +302,28 @@ function sendInput(data) {
   }
 }
 
+// 在终端里写一条醒目的断开提示（带 ANSI 配色 + 闪烁，尽量显眼）
+function writeDisconnectedBanner() {
+  if (!xterm) return
+  const line = '\r\n'
+  xterm.writeln(line + '\x1b[1;5;31m┌────────────────────────────────────────┐\x1b[0m')
+  xterm.writeln('\x1b[1;5;31m│   ⚠ SSH 连接已断开                       │\x1b[0m')
+  xterm.writeln('\x1b[1;5;31m│   按 R 键重连，或在底部横幅点「重连」   │\x1b[0m')
+  xterm.writeln('\x1b[1;5;31m└────────────────────────────────────────┘\x1b[0m' + line)
+}
+
+// 父组件重连成功后调用：重建 WebSocket，恢复输入输出
+function reconnect() {
+  if (mode.value !== 'interactive') return
+  // 关掉旧 ws（可能已 close，再保险一次）；主动关闭，不触发断开提示
+  manualClose = true
+  if (ws) { try { ws.close() } catch (_) {} ws = null }
+  nextTick(() => openInteractive())
+}
+
 function closeInteractive() {
   stopSizeObserver()
+  manualClose = true // 主动关闭（切 exec 模式 / 卸载），不触发断开提示
   if (ws) { try { ws.close() } catch (_) {} ws = null }
   if (xterm) { try { xterm.dispose() } catch (_) {} xterm = null }
   fitAddon = null
@@ -307,7 +335,7 @@ function injectCd(path) {
   sendInput(`cd ${path}\r`)
 }
 
-defineExpose({ injectCd })
+defineExpose({ injectCd, reconnect })
 
 watch(mode, (m) => {
   if (m === 'interactive') nextTick(openInteractive)

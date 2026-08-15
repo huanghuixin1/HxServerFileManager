@@ -90,6 +90,9 @@ export const api = {
 
   listConnections: () => request('/api/connections'),
 
+  // 活跃 SSH 会话健康检查：返回 [{ connectionId, connected }]
+  sessionsHealth: () => request('/api/connections/health'),
+
   reconnect: (id) =>
     request('/api/connections/reconnect', { method: 'POST', body: JSON.stringify({ connectionId: id }) }),
 

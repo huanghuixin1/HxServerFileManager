@@ -1,5 +1,5 @@
 <script setup>
-import { ref, reactive, computed, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, getToken, setToken, clearToken, setUnauthorizedHandler } from './api.js'
 import ConnectPanel from './components/ConnectPanel.vue'
@@ -146,6 +146,99 @@ async function logout() {
 
 onMounted(() => {
   checkSession()
+})
+
+// ---- SSH 连接断开检测 + 按 R 重连 ----
+// 定期轮询后端会话健康接口，发现某活跃连接断开时显示提示条，支持按 R 键重连、Esc 关闭。
+const broken = ref([])             // 已断开、等待处理的连接（元素为 connections 里的对象）
+const reconnectBusy = ref(false)
+let healthTimer = null
+const HEALTH_INTERVAL = 15000
+
+function displayName(c) {
+  return c.name || `${c.username}@${c.host}:${c.port}`
+}
+
+// 轮询会话健康：仅在「之前正常 -> 现在断开」时新增提示，避免重复弹
+async function checkSessionHealth() {
+  if (!authed.value || connections.value.length === 0) return
+  let alive = new Set()
+  try {
+    const res = await api.sessionsHealth()
+    alive = new Set((res.sessions || []).filter((s) => s.connected).map((s) => s.connectionId))
+  } catch (_) {
+    return // 后端/鉴权异常交给别处处理，这里不打扰
+  }
+  for (const c of connections.value) {
+    if (!alive.has(c.connectionId) && !broken.value.some((b) => b.connectionId === c.connectionId)) {
+      broken.value.push(c)
+    }
+  }
+  // broken 中已恢复（重新出现在存活列表/连接已移除）的清除
+  broken.value = broken.value.filter(
+    (b) => connections.value.some((c) => c.connectionId === b.connectionId) && !alive.has(b.connectionId)
+  )
+}
+
+// 重连一个断开连接（走已保存的 profileId；无 profile 的只能提示手动重连）
+async function doReconnect(conn) {
+  if (reconnectBusy.value) return
+  if (!conn.profileId) {
+    ElMessage.warning(`${displayName(conn)} 未保存为常用连接，无法自动重连，请手动重新连接`)
+    return
+  }
+  reconnectBusy.value = true
+  const oldId = conn.connectionId
+  const oldCwd = cwdMap[oldId] || conn.homeDirectory || '/'
+  try {
+    // 先把旧连接从界面摘除，并保留其工作目录，重连成功后回填到新会话
+    // 同时清掉 broken 提示：用户已发起重连，不再显示旧横幅
+    connections.value = connections.value.filter((c) => c.connectionId !== oldId)
+    delete termRefs[oldId]
+    broken.value = broken.value.filter((b) => b.connectionId !== oldId)
+    const res = await api.reconnect(conn.profileId)
+    // handleConnected 会把新会话 push 进 connections，Terminal 组件按新 connectionId
+    // 重新挂载，自动建好新 WebSocket —— 无需手动 reconnect 旧 Terminal 实例
+    handleConnected({ ...res, port: conn.port, authType: conn.authType }, oldCwd)
+    ElMessage.success(`${displayName(conn)} 已重连`)
+  } catch (e) {
+    // 重连失败：把连接放回 broken，让用户能再试
+    broken.value = broken.value.filter((b) => b.connectionId !== oldId)
+    connections.value = connections.value.filter((c) => c.connectionId !== oldId)
+    ElMessage.error(`重连 ${displayName(conn)} 失败：${e.message}`)
+  } finally {
+    reconnectBusy.value = false
+  }
+}
+
+// 终端 WebSocket 关闭（SSH 断开/网络异常）：加入 broken 提示，等用户按 R 重连
+function onTermDisconnected(conn) {
+  if (!conn) return
+  if (!connections.value.some((c) => c.connectionId === conn.connectionId)) return
+  if (broken.value.some((b) => b.connectionId === conn.connectionId)) return
+  broken.value.push(conn)
+}
+
+// 键盘：有断开连接时 R 重连第一个、Esc 关闭提示
+function onGlobalKeydown(e) {
+  if (broken.value.length === 0) return
+  const k = e.key.toLowerCase()
+  if (k === 'r' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault()
+    doReconnect(broken.value[0])
+  } else if (k === 'escape') {
+    broken.value = []
+  }
+}
+
+onMounted(() => {
+  healthTimer = setInterval(checkSessionHealth, HEALTH_INTERVAL)
+  window.addEventListener('keydown', onGlobalKeydown)
+})
+
+onUnmounted(() => {
+  if (healthTimer) clearInterval(healthTimer)
+  window.removeEventListener('keydown', onGlobalKeydown)
 })
 
 // 把当前活跃会话（profileId + 路径）写入 localStorage（防抖）
@@ -425,6 +518,7 @@ function closeEditor() {
             :maximized="termMax"
             @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
             @toggle-max="termMax = !termMax"
+            @disconnected="onTermDisconnected(c)"
           />
           <div
             v-if="!termMax"
@@ -447,6 +541,21 @@ function closeEditor() {
     </main>
 
     <LogPanel v-if="logEnabled" />
+
+    <!-- SSH 连接断开提示：按 R 重连，Esc 关闭 -->
+    <transition name="slide-down">
+      <div v-if="broken.length" class="broken-banner">
+        <el-icon class="warn"><WarningFilled /></el-icon>
+        <span class="txt">
+          连接已断开：<b>{{ broken.map(displayName).join('、') }}</b> — 按 <b class="key">R</b> 重连，
+          <b class="key">Esc</b> 关闭
+        </span>
+        <el-button size="small" type="warning" :loading="reconnectBusy" @click="doReconnect(broken[0])">
+          重连
+        </el-button>
+        <el-icon class="close" title="关闭" @click="broken = []"><Close /></el-icon>
+      </div>
+    </transition>
 
     <!-- 服务器状态：底部迷你状态栏（常驻）+ 点“详情”弹窗 -->
     <SystemStatus v-if="activeConn" :conn-id="activeId" />
@@ -702,5 +811,64 @@ function closeEditor() {
   .workspace.term-max > .term {
     flex: 1 0 100%;
   }
+}
+/* SSH 连接断开提示条 */
+.broken-banner {
+  position: fixed;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 2001;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 10px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
+  color: #7a5c00;
+  font-size: 13.5px;
+  max-width: 90vw;
+}
+.broken-banner .warn {
+  color: #faad14;
+  font-size: 18px;
+}
+.broken-banner .txt {
+  flex: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.broken-banner b.key {
+  display: inline-block;
+  min-width: 18px;
+  text-align: center;
+  padding: 0 5px;
+  margin: 0 2px;
+  border: 1px solid #d9c36a;
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: #fff;
+  color: #7a5c00;
+  font-size: 12px;
+}
+.broken-banner .close {
+  cursor: pointer;
+  color: #b9a34d;
+  font-size: 15px;
+}
+.broken-banner .close:hover {
+  color: #7a5c00;
+}
+.slide-down-enter-active,
+.slide-down-leave-active {
+  transition: all 0.25s ease;
+}
+.slide-down-enter-from,
+.slide-down-leave-to {
+  opacity: 0;
+  transform: translateX(-50%) translateY(-12px);
 }
 </style>

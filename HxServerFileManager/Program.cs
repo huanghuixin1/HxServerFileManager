@@ -264,6 +264,14 @@ app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr,
     });
 });
 
+// 活跃 SSH 会话健康检查：前端轮询以此检测连接是否断开（SSH.NET 底层检测到
+// 对端关闭/网络失败时 IsConnected 会自动变 false）。
+app.MapGet("/api/connections/health", (ConnectionManager mgr) =>
+{
+    var list = mgr.ListHealth();
+    return Results.Ok(new { sessions = list });
+});
+
 // 编辑已保存的连接（留空的字段保持不变；别名可任意设置）
 app.MapPut("/api/connections/{id}", (string id, ConnectRequest req, ConnectionsStore store) =>
 {
@@ -568,6 +576,10 @@ app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, Connection
         return Results.Empty;
     }
 
+    // shell 侧结束（SSH 断开/对端关闭）时用它取消入站读取循环，
+    // 否则主循环会一直阻塞在 ReceiveAsync 上，ws 不关，前端也就收不到断开信号。
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+
     // 输出转发任务：shell 输出 channel → WebSocket
     var pump = Task.Run(async () =>
     {
@@ -577,16 +589,27 @@ app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, Connection
             string tail;
             lock (s.ShellTail) tail = s.ShellTail.ToString();
             if (tail.Length > 0)
-                await SendWsJsonAsync(ws, new { type = "out", data = tail }, ctx.RequestAborted);
+                await SendWsJsonAsync(ws, new { type = "out", data = tail }, linked.Token);
 
-            await foreach (var chunk in ch.Reader.ReadAllAsync(ctx.RequestAborted))
+            await foreach (var chunk in ch.Reader.ReadAllAsync(linked.Token))
             {
                 var data = Encoding.UTF8.GetString(chunk);
-                await SendWsJsonAsync(ws, new { type = "out", data }, ctx.RequestAborted);
+                await SendWsJsonAsync(ws, new { type = "out", data }, linked.Token);
             }
+            // channel 正常完成 = shell 已被回收（SSH 断开或主动关闭）：告知前端
+            try
+            {
+                await SendWsJsonAsync(ws, new { type = "closed", reason = "SSH 连接已断开" }, CancellationToken.None);
+            }
+            catch { /* ws 可能已不可写 */ }
         }
         catch (OperationCanceledException) { /* 客户端断开 */ }
         catch (Exception) { /* channel 关闭等 */ }
+        finally
+        {
+            // 唤醒主循环，让它结束并关闭 ws（前端 onclose 触发断开提示）
+            try { linked.Cancel(); } catch { }
+        }
     }, ctx.RequestAborted);
 
     // 主循环：读取入站 WebSocket 帧 → shell stdin
@@ -595,7 +618,7 @@ app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, Connection
         var buf = new byte[8192];
         while (true)
         {
-            var result = await ws.ReceiveAsync(buf, ctx.RequestAborted);
+            var result = await ws.ReceiveAsync(buf, linked.Token);
             if (result.MessageType == WebSocketMessageType.Close)
                 break;
             if (result.MessageType != WebSocketMessageType.Text)
@@ -638,7 +661,9 @@ app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, Connection
     catch (OperationCanceledException) { }
     catch (WebSocketException) { }
 
-    // 等输出转发结束（取消 token 已触发，pump 会快速退出）
+    // 主循环结束（客户端发 Close 帧 / 出错 / shell 已死）：无论哪种，都要取消转发任务，
+    // 否则它会一直挂在 ReadAllAsync 上，这个请求也就永远 await 不完。
+    try { linked.Cancel(); } catch { }
     try { await pump; } catch { }
     try { await ws.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
 
@@ -835,7 +860,13 @@ public static partial class WebHost
         }
 
         var target = $"{context.Request.PathBase}{context.Request.Path}{context.Request.QueryString}";
-        var remoteIp = context.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+        // 本机访问时统一记为 127.0.0.1：HxSimpleWebAuth 会把 token 绑定到登录时的 RemoteIp，
+        // 浏览器在 localhost / 127.0.0.1 / [::1] 间漂移会让同一段 token 因来源 IP 不同被判失效
+        // （表现为"登录成功点一下就过期"）。回环本就是同一来源，归一后不再互相失效。
+        var rawIp = context.Connection.RemoteIpAddress;
+        string remoteIp = rawIp is null
+            ? "unknown"
+            : System.Net.IPAddress.IsLoopback(rawIp) ? "127.0.0.1" : rawIp.ToString();
         return new HttpRequestData(
             (method ?? context.Request.Method).ToUpperInvariant(),
             target,
@@ -901,13 +932,24 @@ public static partial class WebHost
             var connInfo = new Renci.SshNet.ConnectionInfo(req.Host, port, req.Username, authMethods.ToArray());
             var ssh = new SshClient(connInfo);
             var sftp = new SftpClient(connInfo);
+            // 心跳：拔网线/服务端假死这类「没有 FIN 的断开」靠 TCP 自身要等很久才暴露，
+            // 定期发 keepalive 让 SSH.NET 尽快把连接判死并触发 ErrorOccurred。
+            ssh.KeepAliveInterval = TimeSpan.FromSeconds(20);
+            sftp.KeepAliveInterval = TimeSpan.FromSeconds(30);
             ssh.Connect();
             sftp.Connect();
 
             string home = "/";
             try { home = sftp.WorkingDirectory; } catch { /* ignore */ }
 
-            var id = mgr.Add(new SshSession(ssh, sftp, home));
+            var session = new SshSession(ssh, sftp, home);
+            // SSH 层异常（对端主动断开 / 网络中断 / 心跳超时）时标记会话失活并关闭 shell，
+            // 让正在读 shell 输出的终端 WebSocket 能尽快结束、前端显示「连接已断开」提示。
+            ssh.ErrorOccurred += (_, _) =>
+            {
+                if (!ssh.IsConnected) session.MarkBroken();
+            };
+            var id = mgr.Add(session);
             return (true, id, home, null);
         }
         catch (Exception ex)
@@ -1071,6 +1113,9 @@ public sealed class SshSession : IDisposable
             }
             Shell = null;
             ShellAlive = false;
+            // 先完成 channel：正在 ReadAllAsync 的终端 WebSocket 转发任务会立刻结束，
+            // ws 随之关闭，前端 onclose 触发「连接已断开」提示（否则会一直挂着等数据）。
+            try { ShellOutput?.Writer.TryComplete(); } catch { }
             ShellOutput = null;
             lock (ShellTail) ShellTail.Clear();
         }
@@ -1085,6 +1130,14 @@ public sealed class SshSession : IDisposable
         try { if (Ssh.IsConnected) Ssh.Disconnect(); } catch { }
         Sftp.Dispose();
         Ssh.Dispose();
+    }
+
+    /// <summary>SSH/SFTP 连接异常时调用：关闭 shell，让所有消费 ShellOutput 的终端 WebSocket 立即结束，前端得以显示「连接已断开」。</summary>
+    public void MarkBroken()
+    {
+        DisposeShell();
+        try { if (Sftp.IsConnected) Sftp.Disconnect(); } catch { }
+        try { if (Ssh.IsConnected) Ssh.Disconnect(); } catch { }
     }
 }
 
@@ -1119,6 +1172,28 @@ public sealed class ConnectionManager
     {
         if (string.IsNullOrWhiteSpace(id)) return;
         if (_sessions.TryRemove(id, out var s)) s.Dispose();
+    }
+
+    /// <summary>列出所有活跃会话的存活状态（供前端轮询，发现断开后提示并可重连）。</summary>
+    public List<object> ListHealth()
+    {
+        var list = new List<object>();
+        foreach (var kvp in _sessions)
+        {
+            var s = kvp.Value;
+            try
+            {
+                // Ssh.IsConnected 是本地握手后的乐观标志；IsRunning 表示底层消息循环仍在。
+                // 两者任一为 false 说明对端断开或会话已失效。
+                var alive = s.Ssh.IsConnected && s.Sftp.IsConnected;
+                list.Add(new { connectionId = kvp.Key, connected = alive });
+            }
+            catch
+            {
+                list.Add(new { connectionId = kvp.Key, connected = false });
+            }
+        }
+        return list;
     }
 
     public async Task CleanupLoop(CancellationToken token)

@@ -13,6 +13,7 @@ const detailVisible = ref(false) // 「详情」弹窗
 const auto = ref(true)            // 迷你状态栏自动刷新
 const updatedAt = ref(null)
 let timer = null
+let prevNetSnap = null // 上一次的网络采样，用于计算实时上行/下行速率
 
 // ---- 格式化辅助 ----
 function formatBytes(n) {
@@ -105,6 +106,24 @@ async function load() {
   try {
     status.value = await api.systemStatus(props.connId)
     updatedAt.value = new Date()
+    // 网络速率：基于两次采样的字节差 / 时间差（bytes/s）
+    const nets = status.value?.nets || []
+    const now = Date.now()
+    if (prevNetSnap && now - prevNetSnap.ts > 800) {
+      const dt = (now - prevNetSnap.ts) / 1000
+      for (const n of nets) {
+        const p = prevNetSnap.nets.find((x) => x.name === n.name)
+        n.rxRateBps = (p && n.rxBytes >= p.rx && n.txBytes >= p.tx)
+          ? Math.max(0, (n.rxBytes - p.rx) / dt)
+          : 0
+        n.txRateBps = (p && n.rxBytes >= p.rx && n.txBytes >= p.tx)
+          ? Math.max(0, (n.txBytes - p.tx) / dt)
+          : 0
+      }
+    } else {
+      for (const n of nets) { /* 首次无差值，速率记 0 */ n.rxRateBps = 0; n.txRateBps = 0 }
+    }
+    prevNetSnap = { ts: now, nets: nets.map((n) => ({ name: n.name, rx: n.rxBytes, tx: n.txBytes })) }
   } catch (e) {
     ElMessage.error(e.message || '获取服务器状态失败')
   } finally {

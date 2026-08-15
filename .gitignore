@@ -33,3 +33,5 @@ dist
 HxServerFileManager/wwwroot/*
 HxServerFileManager/Data/*
 HxServerFileManager/configs/env.json
+_tmp_reflect
+_tmp_status_smoke
