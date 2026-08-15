@@ -1,5 +1,5 @@
 <script setup>
-import { ref, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ref, computed, nextTick, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -7,8 +7,9 @@ import '@xterm/xterm/css/xterm.css'
 import { api } from '../api.js'
 import { useSettings } from '../useSettings.js'
 
-// 终端宏（后端 Data/settings.json）：命名命令片段，点击即发送/填入
+// 终端宏（后端 Data/settings.json）：命名命令片段，点击即发送/填入。按连接（connKey）隔离
 const { macros, ensureLoaded, newId, saveMacros } = useSettings()
+const connMacros = computed(() => macros.value.filter((m) => m.connKey === props.connKey))
 const macroMgrVisible = ref(false)
 const macroEditVisible = ref(false)
 const macroEditing = ref(null) // null = 新增
@@ -57,7 +58,7 @@ async function saveMacroForm() {
       macroEditing.value.command = cmd
       macroEditing.value.updatedAt = now
     } else {
-      macros.value.push({ id: newId(), name, command: cmd, createdAt: now, updatedAt: now })
+      macros.value.push({ id: newId(), connKey: props.connKey, name, command: cmd, createdAt: now, updatedAt: now })
     }
     await saveMacros()
     ElMessage.success('已保存')
@@ -92,6 +93,7 @@ async function removeMacro(m) {
 //   interactive —— 交互终端：SSH shell + pty（xterm.js），可跑 nano/vim/需要输入的脚本
 const props = defineProps({
   connId: String,
+  connKey: { type: String, default: '' }, // 连接稳定标识（profileId 或 host@user:port），宏按此隔离
   cwd: { type: String, default: '/' },
   maximized: { type: Boolean, default: false },
 })
@@ -385,12 +387,12 @@ onUnmounted(() => {
 
     <!-- 宏按钮条：交互模式点击直接发送命令，快捷命令模式填入输入框 -->
     <div class="macro-bar">
-      <template v-if="macros.length">
-        <span class="macro-chip" v-for="m in macros" :key="m.id" :title="m.command" @click="runMacro(m)">
+      <template v-if="connMacros.length">
+        <span class="macro-chip" v-for="m in connMacros" :key="m.id" :title="m.command" @click="runMacro(m)">
           <el-icon :size="13" style="margin-right: 4px"><Promotion /></el-icon>{{ m.name }}
         </span>
       </template>
-      <span v-else class="macro-hint">还没有宏，点击「宏设置」添加常用命令（如清日志 / 查看内存）</span>
+      <span v-else class="macro-hint">这个连接还没有宏，点击「宏设置」添加常用命令（如清日志 / 查看内存）</span>
       <el-button size="small" text type="primary" style="margin-left: auto" @click="openMacroManager">
         <el-icon :size="14" style="margin-right: 3px"><Setting /></el-icon>宏设置
       </el-button>
@@ -435,7 +437,7 @@ onUnmounted(() => {
       width="560px"
       :close-on-click-modal="false"
     >
-      <el-table :data="macros" empty-text="还没有宏，点击「新增宏」添加" max-height="320">
+      <el-table :data="connMacros" empty-text="这个连接还没有宏，点击「新增宏」添加" max-height="320">
         <el-table-column label="名称" width="150">
           <template #default="{ row }">{{ row.name }}</template>
         </el-table-column>

@@ -297,6 +297,13 @@ function restoreWorkspace() {
   }
 }
 
+// 连接稳定标识：已保存连接用 profileId，未保存用 username@host:port。
+// 收藏/宏按此隔离保存 —— connectionId 每次重连都会变，不能当持久键。
+function connKeyOf(c) {
+  if (c.profileId) return 'profile:' + c.profileId
+  return `${c.username}@${c.host}:${c.port}`
+}
+
 function toConn(payload) {
   return {
     // tab 稳定身份：重连成功时 connectionId 会原地换成新会话 id，但 uid 不变，
@@ -537,6 +544,7 @@ function closeEditor() {
           <Terminal
             :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
             :conn-id="c.connectionId"
+            :conn-key="connKeyOf(c)"
             :cwd="cwdMap[c.connectionId]"
             :maximized="termMax"
             @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
@@ -552,6 +560,7 @@ function closeEditor() {
           ></div>
           <FileManager
             :conn-id="c.connectionId"
+            :conn-key="connKeyOf(c)"
             :initial-dir="c.homeDirectory"
             :sync-cwd="syncCwd"
             :external-path="syncCwd ? cwdMap[c.connectionId] : null"

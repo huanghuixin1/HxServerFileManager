@@ -1028,8 +1028,10 @@ public record FileEntry(string Name, string FullPath, bool IsDirectory, long Siz
 public record LogEntry(DateTime Time, string Level, string Connection, string Action, string Detail, string? Result);
 
 // ---- 用户偏好设置：常用目录（收藏）+ 终端宏 ----
-public record FavoriteDir(string Id, string ConnectionId, string Name, string Path, DateTime CreatedAt, DateTime UpdatedAt);
-public record TerminalMacro(string Id, string Name, string Command, DateTime CreatedAt, DateTime UpdatedAt);
+// ConnKey = 连接稳定标识（前端：已保存连接用 profileId，未保存用 username@host:port）。
+// connectionId 每次重连都会变，不能当持久键；ConnKey 保证收藏/宏跨重连仍归属同一台服务器。
+public record FavoriteDir(string Id, string ConnectionId, string ConnKey, string Name, string Path, DateTime CreatedAt, DateTime UpdatedAt);
+public record TerminalMacro(string Id, string ConnKey, string Name, string Command, DateTime CreatedAt, DateTime UpdatedAt);
 public record UserSettings(List<FavoriteDir> Favorites, List<TerminalMacro> Macros);
 
 /// <summary>

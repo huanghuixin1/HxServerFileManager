@@ -12,7 +12,13 @@ const favEditing = ref(null) // null = 新增，否则为正在编辑的收藏�
 const favEditName = ref('')
 const favEditPath = ref('')
 
-const connFavs = computed(() => favorites.value.filter((f) => f.connectionId === props.connId))
+// 收藏归属判断：优先 connKey（稳定连接标识，重连后 connectionId 会变仍归属同一台服务器）；
+// 兼容旧数据（此前按 connectionId 存的），旧数据在新会话下不再匹配属预期
+function favBelongs(f) {
+  return (f.connKey && f.connKey === props.connKey) || (f.connectionId && f.connectionId === props.connId)
+}
+
+const connFavs = computed(() => favorites.value.filter(favBelongs))
 
 function baseName(p) {
   const s = String(p || '/').replace(/\/+$/, '')
@@ -25,12 +31,12 @@ async function toggleFav() {
   const wasFav = cwdIsFav.value
   try {
     if (wasFav) {
-      favorites.value = favorites.value.filter((f) => !(f.connectionId === props.connId && f.path === cwd.value))
+      favorites.value = favorites.value.filter((f) => !(favBelongs(f) && f.path === cwd.value))
     } else {
       const now = new Date().toISOString()
       favorites.value.push({
         id: newId(),
-        connectionId: props.connId,
+        connKey: props.connKey,
         name: baseName(cwd.value),
         path: cwd.value,
         createdAt: now,
@@ -84,7 +90,7 @@ async function saveFavForm() {
     } else {
       favorites.value.push({
         id: newId(),
-        connectionId: props.connId,
+        connKey: props.connKey,
         name,
         path: path.replace(/\/+$/, '') || '/',
         createdAt: now,
@@ -121,6 +127,7 @@ async function removeFav(f) {
 
 const props = defineProps({
   connId: String,
+  connKey: { type: String, default: '' }, // 连接稳定标识（profileId 或 host@user:port），收藏按此隔离
   initialDir: { type: String, default: '/' },
   syncCwd: { type: Boolean, default: true },
   externalPath: { type: String, default: null }, // 终端推送的目录（syncCwd 开启时跟随）
