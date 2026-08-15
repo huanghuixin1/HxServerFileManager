@@ -187,6 +187,15 @@ export const api = {
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
     return `${proto}//${location.host}/api/terminal/ws?connId=${encodeURIComponent(connId)}&token=${encodeURIComponent(getToken())}`
   },
+
+  // ---- 用户偏好设置：常用目录收藏 + 终端宏（Data/settings.json）----
+  getFavorites: () => request('/api/settings/favorites'),
+  putFavorites: (favorites) =>
+    request('/api/settings/favorites', { method: 'PUT', body: JSON.stringify(favorites) }),
+
+  getMacros: () => request('/api/settings/macros'),
+  putMacros: (macros) =>
+    request('/api/settings/macros', { method: 'PUT', body: JSON.stringify(macros) }),
 }
 
 // SSE 实时日志流（EventSource 不能带请求头，token 走查询参数）

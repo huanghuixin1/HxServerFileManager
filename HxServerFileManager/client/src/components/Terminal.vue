@@ -1,8 +1,90 @@
 <script setup>
 import { ref, nextTick, watch, onMounted, onUnmounted } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Terminal as XTerm } from '@xterm/xterm'
 import '@xterm/xterm/css/xterm.css'
 import { api } from '../api.js'
+import { useSettings } from '../useSettings.js'
+
+// 终端宏（后端 Data/settings.json）：命名命令片段，点击即发送/填入
+const { macros, ensureLoaded, newId, saveMacros } = useSettings()
+const macroMgrVisible = ref(false)
+const macroEditVisible = ref(false)
+const macroEditing = ref(null) // null = 新增
+const macroEditName = ref('')
+const macroEditCmd = ref('')
+
+async function runMacro(m) {
+  if (mode.value === 'interactive') {
+    sendInput(`${m.command}\r`)
+    xterm?.focus()
+  } else {
+    command.value = m.command
+    inputRef.value?.focus()
+  }
+}
+
+function openMacroManager() {
+  macroMgrVisible.value = true
+}
+
+function startAddMacro() {
+  macroEditing.value = null
+  macroEditName.value = ''
+  macroEditCmd.value = ''
+  macroEditVisible.value = true
+}
+
+function startEditMacro(m) {
+  macroEditing.value = m
+  macroEditName.value = m.name
+  macroEditCmd.value = m.command
+  macroEditVisible.value = true
+}
+
+async function saveMacroForm() {
+  const name = macroEditName.value.trim()
+  const cmd = macroEditCmd.value.trim()
+  if (!name || !cmd) {
+    ElMessage.warning('名称和命令不能为空')
+    return
+  }
+  try {
+    const now = new Date().toISOString()
+    if (macroEditing.value) {
+      macroEditing.value.name = name
+      macroEditing.value.command = cmd
+      macroEditing.value.updatedAt = now
+    } else {
+      macros.value.push({ id: newId(), name, command: cmd, createdAt: now, updatedAt: now })
+    }
+    await saveMacros()
+    ElMessage.success('已保存')
+    macroEditVisible.value = false
+    macroEditing.value = null
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function removeMacro(m) {
+  try {
+    await ElMessageBox.confirm(`确定删除宏 “${m.name}”？`, '删除宏', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch (_) {
+    return
+  }
+  macros.value = macros.value.filter((x) => x !== m)
+  try {
+    await saveMacros()
+    ElMessage.success('已删除')
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
 
 // 两种模式：
 //   exec        —— 快捷命令：一次一命令，带 cwd 持久化 + 文件列表联动
@@ -197,6 +279,7 @@ watch(mode, (m) => {
 onMounted(() => {
   // 默认交互终端：挂载后立即打开
   if (mode.value === 'interactive') nextTick(openInteractive)
+  ensureLoaded()
 })
 
 onUnmounted(() => {
@@ -233,6 +316,19 @@ onUnmounted(() => {
       </el-button>
     </div>
 
+    <!-- 宏按钮条：交互模式点击直接发送命令，快捷命令模式填入输入框 -->
+    <div class="macro-bar">
+      <template v-if="macros.length">
+        <span class="macro-chip" v-for="m in macros" :key="m.id" :title="m.command" @click="runMacro(m)">
+          <el-icon :size="13" style="margin-right: 4px"><Promotion /></el-icon>{{ m.name }}
+        </span>
+      </template>
+      <span v-else class="macro-hint">还没有宏，点击「宏设置」添加常用命令（如清日志 / 查看内存）</span>
+      <el-button size="small" text type="primary" style="margin-left: auto" @click="openMacroManager">
+        <el-icon :size="14" style="margin-right: 3px"><Setting /></el-icon>宏设置
+      </el-button>
+    </div>
+
     <!-- 快捷命令模式 -->
     <template v-if="mode === 'exec'">
       <div id="termOut" class="out">
@@ -264,6 +360,64 @@ onUnmounted(() => {
 
     <!-- 交互终端模式（xterm.js） -->
     <div v-else class="xterm-wrap" ref="termHost"></div>
+
+    <!-- 宏管理列表 -->
+    <el-dialog
+      v-model="macroMgrVisible"
+      title="终端宏"
+      width="560px"
+      :close-on-click-modal="false"
+    >
+      <el-table :data="macros" empty-text="还没有宏，点击「新增宏」添加" max-height="320">
+        <el-table-column label="名称" width="150">
+          <template #default="{ row }">{{ row.name }}</template>
+        </el-table-column>
+        <el-table-column label="命令" min-width="200">
+          <template #default="{ row }">
+            <span class="macro-cmd-cell" :title="row.command">{{ row.command }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="130" align="right">
+          <template #default="{ row }">
+            <el-button size="small" text type="primary" @click="startEditMacro(row)">编辑</el-button>
+            <el-button size="small" text type="danger" @click="removeMacro(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="macroMgrVisible = false">关闭</el-button>
+        <el-button type="primary" plain @click="startAddMacro">
+          <el-icon style="margin-right: 4px"><Promotion /></el-icon>新增宏
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 宏新增 / 编辑 -->
+    <el-dialog
+      v-model="macroEditVisible"
+      :title="macroEditing ? '编辑宏' : '新增宏'"
+      width="480px"
+      :close-on-click-modal="false"
+      @closed="macroEditing = null"
+    >
+      <el-form label-width="56px" @submit.prevent="saveMacroForm">
+        <el-form-item label="名称">
+          <el-input v-model="macroEditName" placeholder="例如 查看磁盘" />
+        </el-form-item>
+        <el-form-item label="命令">
+          <el-input
+            v-model="macroEditCmd"
+            type="textarea"
+            :rows="3"
+            placeholder="例如 free -h && df -h"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="macroEditVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveMacroForm">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -348,6 +502,45 @@ onUnmounted(() => {
 }
 .prompt :deep(.el-input-group__append .el-button) {
   color: #d6e2ef;
+}
+.macro-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+  min-height: 26px;
+}
+.macro-chip {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  background: #eef6ff;
+  color: #2d6cdf;
+  border: 1px solid #d3e6ff;
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 12.5px;
+  white-space: nowrap;
+  transition: background 0.15s;
+}
+.macro-chip:hover {
+  background: #d9ecff;
+}
+.macro-hint {
+  color: #8a97a5;
+  font-size: 12.5px;
+}
+.macro-cmd-cell {
+  color: #6b7785;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 .xterm-wrap {
   flex: 1;

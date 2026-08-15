@@ -2,6 +2,122 @@
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api } from '../api.js'
+import { useSettings } from '../useSettings.js'
+
+// 常用目录收藏（后端 Data/settings.json）：按连接隔离，跳转/添加/管理
+const { favorites, ensureLoaded, newId, saveFavorites } = useSettings()
+const favManagerVisible = ref(false) // 「管理收藏」列表对话框
+const favEditVisible = ref(false) // 新增/编辑收藏表单
+const favEditing = ref(null) // null = 新增，否则为正在编辑的收藏对象
+const favEditName = ref('')
+const favEditPath = ref('')
+
+const connFavs = computed(() => favorites.value.filter((f) => f.connectionId === props.connId))
+
+function baseName(p) {
+  const s = String(p || '/').replace(/\/+$/, '')
+  return s === '' ? '/' : s.slice(s.lastIndexOf('/') + 1)
+}
+
+const cwdIsFav = computed(() => connFavs.value.some((f) => f.path === cwd.value))
+
+async function toggleFav() {
+  const wasFav = cwdIsFav.value
+  try {
+    if (wasFav) {
+      favorites.value = favorites.value.filter((f) => !(f.connectionId === props.connId && f.path === cwd.value))
+    } else {
+      const now = new Date().toISOString()
+      favorites.value.push({
+        id: newId(),
+        connectionId: props.connId,
+        name: baseName(cwd.value),
+        path: cwd.value,
+        createdAt: now,
+        updatedAt: now,
+      })
+    }
+    await saveFavorites()
+    ElMessage.success(wasFav ? '已取消收藏' : '已收藏')
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+function onFavCommand(cmd) {
+  if (cmd === 'toggle') toggleFav()
+  else if (cmd === 'manage') openFavManager()
+  else if (cmd && cmd.type === 'jump') goPath(cmd.fav.path)
+}
+
+function openFavManager() {
+  favManagerVisible.value = true
+}
+
+function startAddFav() {
+  favEditing.value = null
+  favEditName.value = baseName(cwd.value)
+  favEditPath.value = cwd.value
+  favEditVisible.value = true
+}
+
+function startEditFav(f) {
+  favEditing.value = f
+  favEditName.value = f.name
+  favEditPath.value = f.path
+  favEditVisible.value = true
+}
+
+async function saveFavForm() {
+  const name = favEditName.value.trim()
+  const path = favEditPath.value.trim()
+  if (!name || !path) {
+    ElMessage.warning('名称和路径不能为空')
+    return
+  }
+  try {
+    const now = new Date().toISOString()
+    if (favEditing.value) {
+      favEditing.value.name = name
+      favEditing.value.path = path.replace(/\/+$/, '') || '/'
+      favEditing.value.updatedAt = now
+    } else {
+      favorites.value.push({
+        id: newId(),
+        connectionId: props.connId,
+        name,
+        path: path.replace(/\/+$/, '') || '/',
+        createdAt: now,
+        updatedAt: now,
+      })
+    }
+    await saveFavorites()
+    ElMessage.success('已保存')
+    favEditVisible.value = false
+    favEditing.value = null
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
+
+async function removeFav(f) {
+  try {
+    await ElMessageBox.confirm(`确定删除收藏 “${f.name}”？`, '删除收藏', {
+      type: 'warning',
+      confirmButtonText: '删除',
+      cancelButtonText: '取消',
+    })
+  } catch (_) {
+    return
+  }
+  favorites.value = favorites.value.filter((x) => x !== f)
+  try {
+    await saveFavorites()
+    ElMessage.success('已删除')
+  } catch (e) {
+    ElMessage.error(e.message)
+  }
+}
 
 const props = defineProps({
   connId: String,
@@ -182,7 +298,10 @@ async function load(dir) {
   }
 }
 
-onMounted(() => load())
+onMounted(() => {
+  load()
+  ensureLoaded()
+})
 watch(() => props.connId, () => load(props.initialDir))
 
 // 用户主动导航：跳目录并通知 App 同步会话 cwd（终端提示符/下一条命令跟随）
@@ -353,6 +472,40 @@ function fmtDate(s) {
         <el-button size="small" @click="load()">
           <el-icon style="margin-right: 4px"><Refresh /></el-icon>刷新
         </el-button>
+        <el-dropdown trigger="click" @command="onFavCommand">
+          <el-button size="small" type="warning" plain>
+            <el-icon style="margin-right: 4px"><Star /></el-icon>收藏
+            <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+          </el-button>
+          <template #dropdown>
+            <el-dropdown-menu>
+              <el-dropdown-item
+                command="toggle"
+                :icon="cwdIsFav ? 'StarFilled' : 'Star'"
+              >
+                {{ cwdIsFav ? '取消收藏当前目录' : `收藏当前目录（${baseName(cwd)}）` }}
+              </el-dropdown-item>
+              <el-dropdown-item command="manage">
+                <el-icon style="margin-right: 6px"><Setting /></el-icon>管理收藏…
+              </el-dropdown-item>
+              <el-dropdown-item v-if="connFavs.length" divided disabled>
+                —— {{ connFavs.length }} 个收藏 ——
+              </el-dropdown-item>
+              <el-dropdown-item
+                v-for="f in connFavs"
+                :key="f.id"
+                :command="{ type: 'jump', fav: f }"
+              >
+                <el-icon style="margin-right: 6px"><FolderOpened /></el-icon>
+                <span class="fav-name" :title="f.path">{{ f.name }}</span>
+                <span class="fav-path">{{ f.path }}</span>
+              </el-dropdown-item>
+              <el-dropdown-item v-if="!connFavs.length" divided disabled>
+                收藏后会出现在这里，点击直达
+              </el-dropdown-item>
+            </el-dropdown-menu>
+          </template>
+        </el-dropdown>
         <el-dropdown trigger="click" @command="onToolCommand">
           <el-button size="small" type="primary" plain>
             <el-icon style="margin-right: 4px"><Menu /></el-icon>操作
@@ -472,6 +625,59 @@ function fmtDate(s) {
         <el-button type="primary" @click="doRename">确定</el-button>
       </template>
     </el-dialog>
+
+    <!-- 常用目录：收藏列表管理 -->
+    <el-dialog
+      v-model="favManagerVisible"
+      title="常用目录"
+      width="560px"
+      :close-on-click-modal="false"
+    >
+      <el-table :data="connFavs" empty-text="还没有收藏，点击「新增收藏」保存当前目录" max-height="320">
+        <el-table-column label="名称" min-width="140">
+          <template #default="{ row }">{{ row.name }}</template>
+        </el-table-column>
+        <el-table-column label="路径" min-width="180">
+          <template #default="{ row }">
+            <span class="fav-path-cell" :title="row.path">{{ row.path }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="130" align="right">
+          <template #default="{ row }">
+            <el-button size="small" text type="primary" @click="startEditFav(row)">编辑</el-button>
+            <el-button size="small" text type="danger" @click="removeFav(row)">删除</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="favManagerVisible = false">关闭</el-button>
+        <el-button type="primary" plain @click="startAddFav">
+          <el-icon style="margin-right: 4px"><Star /></el-icon>新增收藏
+        </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 常用目录：新增 / 编辑 -->
+    <el-dialog
+      v-model="favEditVisible"
+      :title="favEditing ? '编辑收藏' : '新增收藏'"
+      width="440px"
+      :close-on-click-modal="false"
+      @closed="favEditing = null"
+    >
+      <el-form label-width="56px" @submit.prevent="saveFavForm">
+        <el-form-item label="名称">
+          <el-input v-model="favEditName" placeholder="例如 项目日志" />
+        </el-form-item>
+        <el-form-item label="路径">
+          <el-input v-model="favEditPath" placeholder="/var/log/app 或 /root" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="favEditVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveFavForm">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -525,6 +731,27 @@ function fmtDate(s) {
 .sync-cb {
   margin-right: 4px;
   white-space: nowrap;
+}
+.fav-name {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.fav-path {
+  color: #9aa7b5;
+  font-size: 12px;
+  margin-left: 8px;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.fav-path-cell {
+  color: #6b7785;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
 }
 .tools {
   display: flex;

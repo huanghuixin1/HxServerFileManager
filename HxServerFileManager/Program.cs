@@ -45,9 +45,6 @@ public static partial class WebHost
 {
     public static WebApplication Build(string[] args)
     {
-        var builder = WebApplication.CreateBuilder(args);
-        Console.Error.WriteLine($"[DBG] exeDir={AppContext.BaseDirectory} cwd={Directory.GetCurrentDirectory()} wwwrootExists={Directory.Exists(Path.Combine(AppContext.BaseDirectory, "wwwroot"))}");
-
         // ---- ContentRoot 解析 ----
         // ASP.NET 默认把 ContentRoot 设为启动时 cwd，但 GUI 应用经 Finder / 文件管理器
         // 双击启动时 cwd 是 /（或不在程序目录），会找不到 wwwroot（白屏）并在错误位置写 Data。
@@ -55,6 +52,9 @@ public static partial class WebHost
         //   1) 环境变量 HXSFM_CONTENT_ROOT（显式指定，最优先）；
         //   2) 可执行文件所在目录（内含 wwwroot 时 —— 桌面壳 .app / 独立运行都满足）；
         //   3) 回退 cwd（保持"从启动目录读配置"的旧行为，迁移期兜底）。
+        // ⚠️ 必须在 CreateBuilder 之前算好经 WebApplicationOptions 传入：新建 builder 后
+        //    Environment.ContentRootPath / UseContentRoot 修改都会被 Build() 阶段重新解析覆盖
+        //    （.NET 8+ 实测无效），options.ContentRootPath 是唯一权威入口。
         var contentRoot = Environment.GetEnvironmentVariable("HXSFM_CONTENT_ROOT");
         if (string.IsNullOrEmpty(contentRoot))
         {
@@ -63,7 +63,12 @@ public static partial class WebHost
                 ? exeDir
                 : Directory.GetCurrentDirectory();
         }
-        builder.Environment.ContentRootPath = contentRoot;
+
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = contentRoot,
+        });
 
         // 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 5101）
         var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 5101;
@@ -79,6 +84,8 @@ public static partial class WebHost
         builder.Services.AddSingleton<OperationLogger>();
         var dataDir = Path.Combine(builder.Environment.ContentRootPath, "Data");
         builder.Services.AddSingleton(new ConnectionsStore(dataDir));
+        // 用户偏好设置：常用目录收藏 + 终端宏（Data/settings.json）
+        builder.Services.AddSingleton(new SettingsStore(dataDir));
 
         var app = builder.Build();
 
@@ -704,6 +711,25 @@ app.MapGet("/api/logs/stream", async (HttpContext ctx, OperationLogger log) =>
 // 健康检查
 app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }));
 
+// ---- 用户偏好设置：常用目录收藏 + 终端宏（Data/settings.json）----
+app.MapGet("/api/settings/favorites", (SettingsStore store) =>
+    Results.Ok(new { favorites = store.ListFavorites() }));
+
+app.MapPut("/api/settings/favorites", (List<FavoriteDir> favorites, SettingsStore store) =>
+{
+    store.ReplaceFavorites(favorites);
+    return Results.Ok(new { favorites = store.ListFavorites() });
+});
+
+app.MapGet("/api/settings/macros", (SettingsStore store) =>
+    Results.Ok(new { macros = store.ListMacros() }));
+
+app.MapPut("/api/settings/macros", (List<TerminalMacro> macros, SettingsStore store) =>
+{
+    store.ReplaceMacros(macros);
+    return Results.Ok(new { macros = store.ListMacros() });
+});
+
 // ---- 空闲会话回收 ----
 var mgr = app.Services.GetRequiredService<ConnectionManager>();
 var cts = new CancellationTokenSource();
@@ -935,6 +961,11 @@ public record TerminalInputRequest(string ConnectionId, string Data);
 public record FileEntry(string Name, string FullPath, bool IsDirectory, long Size, DateTime LastWriteTimeUtc, bool IsText);
 
 public record LogEntry(DateTime Time, string Level, string Connection, string Action, string Detail, string? Result);
+
+// ---- 用户偏好设置：常用目录（收藏）+ 终端宏 ----
+public record FavoriteDir(string Id, string ConnectionId, string Name, string Path, DateTime CreatedAt, DateTime UpdatedAt);
+public record TerminalMacro(string Id, string Name, string Command, DateTime CreatedAt, DateTime UpdatedAt);
+public record UserSettings(List<FavoriteDir> Favorites, List<TerminalMacro> Macros);
 
 /// <summary>
 /// 一个到 Linux 服务器的 SSH/SFTP 会话。
@@ -1194,3 +1225,63 @@ public record ConnectionProfile(
     string? Passphrase,
     DateTime CreatedAt,
     DateTime LastConnectedAt);
+
+// 用户偏好设置存储：Data/settings.json（常用目录收藏 + 终端宏），
+// 与 ConnectionsStore 同款 JSON 持久化；写时先写临时文件再原子替换，避免中途崩溃损坏 JSON。
+public sealed class SettingsStore
+{
+    private readonly string _file;
+    private readonly object _gate = new();
+    private UserSettings _settings;
+
+    public SettingsStore(string dataDir)
+    {
+        Directory.CreateDirectory(dataDir);
+        _file = Path.Combine(dataDir, "settings.json");
+        _settings = Load();
+    }
+
+    private static UserSettings Empty() => new(new List<FavoriteDir>(), new List<TerminalMacro>());
+
+    private UserSettings Load()
+    {
+        if (!File.Exists(_file)) return Empty();
+        try { return JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(_file)) ?? Empty(); }
+        catch { return Empty(); } // 文件损坏视为无设置，不阻断启动
+    }
+
+    private void Save()
+    {
+        var tmp = _file + ".tmp";
+        File.WriteAllText(tmp, JsonSerializer.Serialize(_settings, new JsonSerializerOptions { WriteIndented = true }));
+        File.Move(tmp, _file, overwrite: true);
+    }
+
+    public IReadOnlyList<FavoriteDir> ListFavorites()
+    {
+        lock (_gate) return _settings.Favorites.ToList();
+    }
+
+    public IReadOnlyList<TerminalMacro> ListMacros()
+    {
+        lock (_gate) return _settings.Macros.ToList();
+    }
+
+    public void ReplaceFavorites(List<FavoriteDir> favorites)
+    {
+        lock (_gate)
+        {
+            _settings = _settings with { Favorites = favorites ?? new List<FavoriteDir>() };
+            Save();
+        }
+    }
+
+    public void ReplaceMacros(List<TerminalMacro> macros)
+    {
+        lock (_gate)
+        {
+            _settings = _settings with { Macros = macros ?? new List<TerminalMacro>() };
+            Save();
+        }
+    }
+}
