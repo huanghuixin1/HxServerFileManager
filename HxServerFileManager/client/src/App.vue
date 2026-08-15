@@ -121,6 +121,7 @@ function onUnauthorized() {
   authed.value = false
   connections.value = []
   activeId.value = null
+  broken.value = []
   termRefs && Object.keys(termRefs).forEach((k) => delete termRefs[k])
   Object.keys(cwdMap).forEach((k) => delete cwdMap[k])
   // 界面已回登录页，后端会话由空闲回收兜底
@@ -139,6 +140,7 @@ async function logout() {
   }
   connections.value = []
   activeId.value = null
+  broken.value = []
   Object.keys(termRefs).forEach((k) => delete termRefs[k])
   Object.keys(cwdMap).forEach((k) => delete cwdMap[k])
   authed.value = false
@@ -170,13 +172,14 @@ async function checkSessionHealth() {
     return // 后端/鉴权异常交给别处处理，这里不打扰
   }
   for (const c of connections.value) {
+    if (c.pending) continue // 连接中：尚未建立，跳过健康检查
     if (!alive.has(c.connectionId) && !broken.value.some((b) => b.connectionId === c.connectionId)) {
       broken.value.push(c)
     }
   }
   // broken 中已恢复（重新出现在存活列表/连接已移除）的清除
   broken.value = broken.value.filter(
-    (b) => connections.value.some((c) => c.connectionId === b.connectionId) && !alive.has(b.connectionId)
+    (b) => !b.pending && connections.value.some((c) => c.connectionId === b.connectionId) && !alive.has(b.connectionId)
   )
 }
 
@@ -266,14 +269,16 @@ function persistWorkspace() {
   if (persistTimer) clearTimeout(persistTimer)
   persistTimer = setTimeout(() => {
     try {
-      const sessions = connections.value.map((c) => ({
-        profileId: c.profileId || null,
-        name: c.name || '',
-        host: c.host,
-        port: c.port,
-        username: c.username,
-        cwd: cwdMap[c.connectionId] || '/',
-      }))
+      const sessions = connections.value
+        .filter((c) => !c.pending) // 连接中的占位 tab 不持久化
+        .map((c) => ({
+          profileId: c.profileId || null,
+          name: c.name || '',
+          host: c.host,
+          port: c.port,
+          username: c.username,
+          cwd: cwdMap[c.connectionId] || '/',
+        }))
       localStorage.setItem(WS_KEY, JSON.stringify({ sessions, ts: Date.now() }))
     } catch (_) { /* 忽略存储异常 */ }
   }, 400)
@@ -339,6 +344,9 @@ async function disconnectConn(connId) {
   try {
     await api.disconnect(connId)
   } catch (_) { /* 忽略：会话可能已被后端回收 */ }
+  // 断开时 Terminal 的 ws close 会在 tab 移除前触发 onTermDisconnected，
+  // 这里把该连接从 broken 中一并清掉，避免手动关闭后仍弹「连接已断开」
+  broken.value = broken.value.filter((b) => b.connectionId !== connId)
   const idx = connections.value.findIndex((c) => c.connectionId === connId)
   if (idx >= 0) connections.value.splice(idx, 1)
   delete cwdMap[connId]
@@ -373,12 +381,32 @@ function onCwdChanged(connId, path) {
 
 async function disconnectActive() {
   if (!activeConn.value) return
+  if (activeConn.value.pending) {
+    // 连接中的占位 tab：仅关闭标签
+    connections.value = connections.value.filter((c) => c.uid !== activeConn.value.uid)
+    delete cwdMap[activeId.value]
+    const rest = connections.value
+    activeId.value = rest.length ? rest[rest.length - 1].connectionId : null
+    persistWorkspace()
+    return
+  }
   await disconnectConn(activeId.value)
 }
 
 async function onTabRemove(name) {
   const conn = connections.value.find((c) => c.connectionId === name)
   if (!conn) return
+  if (conn.pending) {
+    // 连接中的占位 tab：直接移除，后端会话仍会建立，由空闲回收兜底
+    connections.value = connections.value.filter((c) => c.uid !== conn.uid)
+    delete cwdMap[name]
+    if (activeId.value === name) {
+      const rest = connections.value
+      activeId.value = rest.length ? rest[rest.length - 1].connectionId : null
+    }
+    persistWorkspace()
+    return
+  }
   try {
     await ElMessageBox.confirm(
       `断开连接 “${conn.name || `${conn.username}@${conn.host}:${conn.port}`}” ？`,
@@ -391,13 +419,57 @@ async function onTabRemove(name) {
   await disconnectConn(name)
 }
 
-// 用已保存的连接快速打开（无需重新输入）
+// 用已保存的连接快速打开（无需重新输入）。
+// 连接较慢时先占位开一个「正在连接」tab，成功后再原地填充真实会话（uid 不变，不重挂载工作区）。
 async function openSaved(p) {
+  const uid = Math.random().toString(36).slice(2) + Date.now().toString(36)
+  const placeholder = {
+    ...toConn({
+      connectionId: 'pending-' + uid,
+      profileId: p.id,
+      host: p.host,
+      username: p.username,
+      port: p.port,
+      authType: p.authType,
+      name: p.name || '',
+    }),
+    uid,
+    pending: true,
+  }
+  connections.value.push(placeholder)
+  activeId.value = placeholder.connectionId
+  cwdMap[placeholder.connectionId] = '/'
   try {
     const res = await api.reconnect(p.id)
-    handleConnected({ ...res, port: p.port, authType: p.authType })
+    const idx = connections.value.findIndex((c) => c.uid === uid)
+    if (idx < 0) return // tab 已被用户关闭，会话交由后端空闲回收
+    const conn = toConn({
+      ...res,
+      port: p.port,
+      authType: p.authType,
+      name: res.name || p.name || '',
+    })
+    conn.uid = uid // 保留 uid：工作区（Terminal/FileManager）不重挂载
+    const oldId = placeholder.connectionId
+    delete cwdMap[oldId]
+    cwdMap[conn.connectionId] = conn.homeDirectory || '/'
+    if (termRefs[oldId]) {
+      termRefs[conn.connectionId] = termRefs[oldId]
+      delete termRefs[oldId]
+    }
+    connections.value.splice(idx, 1, conn)
+    if (activeId.value === oldId) activeId.value = conn.connectionId
+    loadSaved() // 刷新排序/别名
+    persistWorkspace()
   } catch (e) {
-    ElMessage.error(e.message)
+    const idx = connections.value.findIndex((c) => c.uid === uid)
+    if (idx >= 0) connections.value.splice(idx, 1)
+    delete cwdMap[placeholder.connectionId]
+    if (activeId.value === placeholder.connectionId) {
+      const rest = connections.value
+      activeId.value = rest.length ? rest[rest.length - 1].connectionId : null
+    }
+    ElMessage.error(`连接 ${p.name || `${p.username}@${p.host}:${p.port}`} 失败：${e.message}`)
   }
 }
 
@@ -508,7 +580,12 @@ function closeEditor() {
         :aria-selected="activeId === c.connectionId"
         @click="activeId = c.connectionId"
       >
-        <span class="t-dot" :class="{ on: activeId === c.connectionId }"></span>
+        <el-icon
+          v-if="c.pending"
+          class="t-loading is-loading"
+          :size="12"
+        ><Loading /></el-icon>
+        <span v-else class="t-dot" :class="{ on: activeId === c.connectionId }"></span>
         <span class="t-label" :title="`${c.username}@${c.host}:${c.port}`">
           {{ c.name || `${c.username}@${c.host}:${c.port}` }}
         </span>
@@ -540,34 +617,41 @@ function closeEditor() {
           :class="{ 'term-max': termMax }"
           :style="{ '--term-w': termWidth + '%', '--term-h': termHeight + '%' }"
         >
-          <!-- 终端在左（默认更宽），文件列表在右（可窄） -->
-          <Terminal
-            :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
-            :conn-id="c.connectionId"
-            :conn-key="connKeyOf(c)"
-            :cwd="cwdMap[c.connectionId]"
-            :maximized="termMax"
-            @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
-            @toggle-max="termMax = !termMax"
-            @disconnected="onTermDisconnected(c)"
-          />
-          <div
-            v-if="!termMax"
-            class="ws-divider"
-            :class="{ narrow: isNarrow }"
-            :title="isNarrow ? '按住上下拖拽调整高度' : '按住左右拖拽调整宽度'"
-            @pointerdown="startResize"
-          ></div>
-          <FileManager
-            :conn-id="c.connectionId"
-            :conn-key="connKeyOf(c)"
-            :initial-dir="c.homeDirectory"
-            :sync-cwd="syncCwd"
-            :external-path="syncCwd ? cwdMap[c.connectionId] : null"
-            @open-file="(p) => openEditor(c.connectionId, p)"
-            @navigate="(p) => onNavigate(c.connectionId, p)"
-            @update:sync-cwd="(v) => (syncCwd = v)"
-          />
+          <!-- 连接中：占位提示，连接完成后才渲染终端/文件列表 -->
+          <div v-if="c.pending" class="conn-pending">
+            <el-icon class="is-loading" :size="28"><Loading /></el-icon>
+            <span>正在连接 {{ c.name || `${c.username}@${c.host}:${c.port}` }}…</span>
+          </div>
+          <template v-else>
+            <!-- 终端在左（默认更宽），文件列表在右（可窄） -->
+            <Terminal
+              :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
+              :conn-id="c.connectionId"
+              :conn-key="connKeyOf(c)"
+              :cwd="cwdMap[c.connectionId]"
+              :maximized="termMax"
+              @update:cwd="(p) => onCwdChanged(c.connectionId, p)"
+              @toggle-max="termMax = !termMax"
+              @disconnected="onTermDisconnected(c)"
+            />
+            <div
+              v-if="!termMax"
+              class="ws-divider"
+              :class="{ narrow: isNarrow }"
+              :title="isNarrow ? '按住上下拖拽调整高度' : '按住左右拖拽调整宽度'"
+              @pointerdown="startResize"
+            ></div>
+            <FileManager
+              :conn-id="c.connectionId"
+              :conn-key="connKeyOf(c)"
+              :initial-dir="c.homeDirectory"
+              :sync-cwd="syncCwd"
+              :external-path="syncCwd ? cwdMap[c.connectionId] : null"
+              @open-file="(p) => openEditor(c.connectionId, p)"
+              @navigate="(p) => onNavigate(c.connectionId, p)"
+              @update:sync-cwd="(v) => (syncCwd = v)"
+            />
+          </template>
         </div>
       </section>
     </main>
@@ -589,8 +673,8 @@ function closeEditor() {
       </div>
     </transition>
 
-    <!-- 服务器状态：底部迷你状态栏（常驻）+ 点“详情”弹窗 -->
-    <SystemStatus v-if="activeConn" :conn-id="activeId" />
+    <!-- 服务器状态：底部迷你状态栏（常驻）+ 点“详情”弹窗（连接中不显示） -->
+    <SystemStatus v-if="activeConn && !activeConn.pending" :conn-id="activeId" />
 
     <!-- 新建连接对话框（连接中也可随时打开） -->
     <el-dialog
@@ -742,6 +826,10 @@ function closeEditor() {
   background: #c0c8d0;
   flex-shrink: 0;
 }
+.t-loading {
+  color: #2d6cdf;
+  flex-shrink: 0;
+}
 .t-dot.on {
   background: #2ecc71;
 }
@@ -777,6 +865,19 @@ function closeEditor() {
   display: flex;
   height: 100%;
   min-height: 0;
+}
+.conn-pending {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: #2d6cdf;
+  font-size: 14px;
+  background: #fafcff;
+  border: 1px dashed #c9d6e8;
+  border-radius: 10px;
 }
 .workspace > .term {
   /* 终端在左，默认 58%，拖拽调宽（flex-basis 由 --term-w 控制） */
