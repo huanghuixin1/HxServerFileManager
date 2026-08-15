@@ -17,36 +17,43 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- 引用主项目，复用 Web 服务构建逻辑 -->
-    <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj" />
+    <!-- 引用主项目，复用 Web 服务构建逻辑。SetRuntimeIdentifier 让主项目与桌面壳用相同 RID 输出 -->
+    <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj"
+                      SetRuntimeIdentifier="true" />
   </ItemGroup>
 
   <!--
-    主项目的 CopyWwwrootToOutput Target 不会在引用方构建时执行，
-    这里从主项目源目录把 wwwroot 镜像到桌面壳输出目录（先清后拷，同主项目逻辑）。
+    wwwroot 是通过自定义 target 镜像的（非 Content 项），dotnet publish 不会自动带入。
+    Build/Publish 都执行：$(OutDir)、$(PublishDir) 双份镜像（先清后拷，同主项目逻辑）。
+    缺了发布目录里的 wwwroot，桌面壳启动后会因静态资源 404 而白屏。
   -->
-  <Target Name="CopyWwwrootToDesktopOutput" AfterTargets="Build">
+  <Target Name="CopyWwwrootToDesktopOutput" AfterTargets="Build;Publish">
     <ItemGroup>
       <WwwrootSource Include="$(MSBuildThisFileDirectory)..\HxServerFileManager\wwwroot\**\*" />
-      <WwwrootStale Include="$(OutDir)wwwroot\**\*" />
+      <WwwrootStale Include="$(OutDir)wwwroot\**\*;$(PublishDir)wwwroot\**\*" />
     </ItemGroup>
     <Delete Files="@(WwwrootStale)" ContinueOnError="true" />
     <Copy SourceFiles="@(WwwrootSource)"
           DestinationFiles="@(WwwrootSource->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(WwwrootSource)"
+          DestinationFiles="@(WwwrootSource->'$(PublishDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
     <Message Importance="high"
-             Text="wwwroot -&gt; $(OutDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
+             Text="wwwroot -&gt; $(OutDir)wwwroot 与 $(PublishDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
   </Target>
 
   <!--
-    主项目是 Exe（top-level statement 要求），ProjectReference 会把它的 exe 也复制过来。
-    桌面壳只需要 DLL，删掉多余的 HxServerFileManager.exe，避免给用户两个 exe 造成困惑。
+    主项目是 Exe（top-level statement 要求），ProjectReference 会把它的启动器/宿主也复制过来。
+    桌面壳只需要 DLL：Windows 下多出 HxServerFileManager.exe，macOS/Linux 下多出无扩展名的
+    HxServerFileManager 二进制，连同 .pdb 与 .runtimeconfig.json 一并从输出和发布目录删掉，
+    避免用户面对两个可执行文件分不清该点哪个。
+    Build 后删除 $(OutDir) 里的，Publish 还会把主项目产物拷进 $(PublishDir)，需再删一次。
   -->
-  <Target Name="RemoveRedundantExe" AfterTargets="Build">
+  <Target Name="RemoveRedundantExe" AfterTargets="Build;Publish">
     <ItemGroup>
-      <RedundantExe Include="$(OutDir)HxServerFileManager.exe" />
-      <RedundantPdb Include="$(OutDir)HxServerFileManager.pdb" />
+      <RedundantHost Include="$(OutDir)HxServerFileManager.exe;$(OutDir)HxServerFileManager;$(PublishDir)HxServerFileManager.exe;$(PublishDir)HxServerFileManager" />
+      <RedundantSide Include="$(OutDir)HxServerFileManager.pdb;$(PublishDir)HxServerFileManager.pdb;$(OutDir)HxServerFileManager.runtimeconfig.json;$(PublishDir)HxServerFileManager.runtimeconfig.json" />
     </ItemGroup>
-    <Delete Files="@(RedundantExe);@(RedundantPdb)" ContinueOnError="true" />
+    <Delete Files="@(RedundantHost);@(RedundantSide)" ContinueOnError="true" />
   </Target>
 
 </Project>

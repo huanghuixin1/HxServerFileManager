@@ -47,6 +47,23 @@ public static partial class WebHost
     {
         var builder = WebApplication.CreateBuilder(args);
 
+        // ---- ContentRoot 解析 ----
+        // ASP.NET 默认把 ContentRoot 设为启动时 cwd，但 GUI 应用经 Finder / 文件管理器
+        // 双击启动时 cwd 是 /（或不在程序目录），会找不到 wwwroot（白屏）并在错误位置写 Data。
+        // 这里改为与位置无关的顺序：
+        //   1) 环境变量 HXSFM_CONTENT_ROOT（显式指定，最优先）；
+        //   2) 可执行文件所在目录（内含 wwwroot 时 —— 桌面壳 .app / 独立运行都满足）；
+        //   3) 回退 cwd（保持"从启动目录读配置"的旧行为，迁移期兜底）。
+        var contentRoot = Environment.GetEnvironmentVariable("HXSFM_CONTENT_ROOT");
+        if (string.IsNullOrEmpty(contentRoot))
+        {
+            var exeDir = AppContext.BaseDirectory;
+            contentRoot = Directory.Exists(Path.Combine(exeDir, "wwwroot"))
+                ? exeDir
+                : Directory.GetCurrentDirectory();
+        }
+        builder.Environment.ContentRootPath = contentRoot;
+
         // 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 5101）
         var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 5101;
         builder.WebHost.UseKestrel(kestrel =>
