@@ -21,6 +21,7 @@
 - 会话工作目录联动：`SshSession.Cwd` 为会话级 cwd（连接时初始化为 SFTP 工作目录）。`/api/command` 把命令包装为 `cd <cwd> && <cmd>; rc=$?; pwd; exit $rc`，解析末尾 pwd 行更新 cwd 并返回；`/api/cwd` 供文件列表导航时同步会话 cwd。前端 App.vue 持 `cwdMap`（每连接共享），FileManager「同步路径」checkbox（默认开）控制双向联动——开：终端 cd ⇄ 文件列表导航互相跟随；关：两边完全独立（终端 cd 不动文件列表，文件列表导航也不注入终端 cd、不同步 cwd）
 - **交互终端路径同步（OSC 7）**：后端 `EnsureShell` 注入 `PROMPT_COMMAND`（printf OSC 7 序列 `\033]7;file://$HOSTNAME$PWD\007`）+ 自定义 PS1。bash 每次打印提示符前输出 OSC 7 携带当前目录；前端 Terminal.vue 在 SSE 数据里正则提取（跨 chunk 缓冲，`extractOsc7`），剥掉序列再 `xterm.write`，解析出的 path 通过 `update:cwd` 推给 App 同步文件列表。反向：App.vue 的 `onNavigate`（文件列表导航）调用 `termRefs[connId].injectCd(path)` 向交互终端写 `cd <path>\r`（Terminal 内判断是否交互模式；全屏程序运行时会被吞进程序，属预期）。**「同步路径」关闭时 `onNavigate`/`onCwdChanged` 直接 return，两端互不干扰**。OSC 7 依赖 bash（非 bash 时仅失去路径同步）
 - `client/vite.config.js`：dev proxy 指向 `http://localhost:5101`
+- `wwwroot`文件夹是client里的前端代码编译后的内容 不用再读取
 
 ## 登录鉴权（HxSimpleWebAuth）
 - 鉴权库：`libs/HxSimpleWebAuth.dll`（从 BackDatabase 项目拷来，net8 程序集 net10 可引用；csproj `<Reference HintPath=libs\...>` + `<None Include=libs\**\* CopyToOutputDirectory>`，构建会拷到 bin）。API：`new WebAdminAuth(password, logDirectory, envVarName)`；`Authorize(HttpRequestData)` 校验 Bearer token；`Handle(HttpRequestData, path)` 处理登录/登出（登录 POST body 用 `{"key": "<密码>"}`，返回 `{token, expiresAt}`，错误时 `{error, locked, remainingAttempts}`）；`IsAuthPath(path)` 判定 `/api/auth/login|logout`；`HttpRequestData(Method, Target, Headers, Body, RemoteIp)`；`ApiResponse(StatusCode, Body, AllowHeader)` + `Json/Error` 静态方法。**token 只认 Authorization: Bearer 头，不认查询参数**
@@ -39,6 +40,8 @@
 - `connections.json` 明文存密码/私钥，仅限本地/内网
 
 ## 进度记录
+- 2026-08-15：登录「记住密码」—— 原来「记住我」只存 token，token 过期/登出后回登录页还要重输密码；现在勾选后把密码存 localStorage（`hxsfm_remember_pwd`），登录页 onMounted 自动回填；登录成功且勾选→存、取消勾选→删；**登出不删密码**（否则记住就没意义）。明文存，与 connections.json 明文凭据同一安全口径（仅本地/内网）
+- 2026-08-15：去掉会话断开时的刷屏 toast —— SystemStatus.vue 的 10s 自动轮询失败（SSH 断开/空闲回收后 `Client not connected.`）会每 10 秒弹一次错；改为后台轮询 `load(true)` 静默失败（断开提示交给 App 的会话健康横幅），仅用户手动刷新/打开详情时才 toast
 - 2026-08-15：终端宽度自适应 —— 之前 xterm 的 cols/rows 只在打开 pty 时算一次（容器宽/9、高/18 clamp），拉窗 / 拖分隔条 / 终端最大化后终端还是原宽度。修复：**前端** Terminal.vue 用 `ResizeObserver` 监听 `.xterm-wrap`，容器尺寸变化时 150ms 防抖 `xterm.resize(cols,rows)` 并通过 ws 发 `{type:'resize',cols,rows}`（ws 未开时只改显示）；**后端** `/api/terminal/ws` 的 resize 分支从“忽略”改为调用 SSH.NET `ShellStream.ChangeWindowSize(cols, rows, cols*8, rows*16)`（2026.0.0.1 版本确实支持动态改 pty 大小，原“不支持动态 resize”注释是错的，已删），让 shell 回绕列数跟随终端实际宽度。行列计算由 `@xterm/addon-fit` 的 `fit()` 按**真实单元格尺寸**计算（pty 开多大、显示多大完全同源；打开顺序：先建 xterm+fit → `terminalOpen(xterm.cols, xterm.rows)`）。`.xterm-screen` 不按 CSS 撑满是 xterm 设计行为——它的宽度是 JS 按 列数×单元格宽 写死的内联 style，字符网格不能拉伸，硬写 `width:100%` 没意义；想顶满容器只能靠 fit 选合适列数（最多余一条不足一个单元格的窄缝）
 - 2026-08-14：前端整体切到 Element Plus（main.js 注册 EP+图标；组件全用 el-*）
 - 2026-08-14：修复 5 处字段名 bug（connId→connectionId）、断开/重连、dev proxy 端口

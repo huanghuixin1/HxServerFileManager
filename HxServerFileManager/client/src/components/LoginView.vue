@@ -1,5 +1,5 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { api } from '../api.js'
 
 const emit = defineEmits(['authed'])
@@ -8,6 +8,16 @@ const password = ref('')
 const remember = ref(true)
 const loading = ref(false)
 const error = ref('')
+
+// 记住密码：勾选「记住我」登录成功后把密码存本机，下次回到登录页自动回填。
+// 明文存 localStorage（本工具已有 connections.json 明文凭据的先例，仅限本地/内网）；
+// 登出不删——不然 token 过期/登出后还得重输，记住就没意义了。
+const PWD_KEY = 'hxsfm_remember_pwd'
+function loadSavedPwd() {
+  const saved = localStorage.getItem(PWD_KEY)
+  if (saved) password.value = saved
+}
+onMounted(loadSavedPwd)
 
 async function submit() {
   if (!password.value) {
@@ -18,6 +28,9 @@ async function submit() {
   error.value = ''
   try {
     const res = await api.login(password.value, remember.value)
+    // 记住密码：勾选则存，取消勾选则清掉
+    if (remember.value) localStorage.setItem(PWD_KEY, password.value)
+    else localStorage.removeItem(PWD_KEY)
     emit('authed', { token: res.token, remember: remember.value })
   } catch (e) {
     if (e.locked) {
@@ -54,7 +67,7 @@ async function submit() {
       />
 
       <div class="login-row">
-        <el-checkbox v-model="remember">记住我（本机免重复输入）</el-checkbox>
+        <el-checkbox v-model="remember">记住密码（本机免重复输入）</el-checkbox>
       </div>
 
       <el-button

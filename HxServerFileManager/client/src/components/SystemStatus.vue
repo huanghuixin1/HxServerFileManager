@@ -100,7 +100,9 @@ function barWidth(p) {
 }
 
 // ---- 采集 ----
-async function load() {
+// silent=true：后台自动刷新（10s 轮询），失败不弹 toast——会话断开时
+// 避免每 10 秒弹一次 "Client not connected." 刷屏，断开状态由 App 的会话健康横幅提示
+async function load(silent = false) {
   if (!props.connId) return
   loading.value = true
   try {
@@ -125,7 +127,7 @@ async function load() {
     }
     prevNetSnap = { ts: now, nets: nets.map((n) => ({ name: n.name, rx: n.rxBytes, tx: n.txBytes })) }
   } catch (e) {
-    ElMessage.error(e.message || '获取服务器状态失败')
+    if (!silent) ElMessage.error(e.message || '获取服务器状态失败')
   } finally {
     loading.value = false
   }
@@ -134,7 +136,7 @@ async function load() {
 function startAuto() {
   stopAuto()
   if (!auto.value || !props.connId) return
-  timer = setInterval(load, 10000) // 常驻条 10s 一次，省得频繁打 SSH
+  timer = setInterval(() => load(true), 10000) // 常驻条 10s 一次，省得频繁打 SSH；后台失败静默
 }
 
 function stopAuto() {
