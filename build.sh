@@ -138,9 +138,85 @@ publish_desktop() {
   dotnet publish "$DESKTOP_PROJECT" -c Release -r "$rid" \
     "${sc_flag[@]}" \
     -p:PublishSingleFile="$SINGLE_FILE" \
+    -p:IncludeNativeLibrariesForSelfExtract=false \
     -o "$outdir"
   local bin="$outdir/HxServerFileManager.Desktop"
   [[ -f "$bin" ]] && chmod +x "$bin"   # Windows 无执行位，补上便于 tar/zip 传输
+
+    # Linux 桌面壳：额外生成 .desktop 启动器（图中双击入口）。
+  # Linux 桌面应用不靠双击裸二进制启动（GNOME 会当文本打开/拒绝运行），
+  # 需要 .desktop 启动器（相当于 Windows .lnk / macOS .app）。
+  # ⚠️ 启动器文件名避开 "HxServerFileManager.Desktop"：Windows 构建机文件系统
+  #    大小写不敏感，同名不同大小写会直接把编译出的二进制覆盖掉（实测踩坑）。
+  # 这里生成两个版本：
+  #   hxsfm.desktop            —— 相对路径版，与二进制同目录使用（拷贝整个文件夹即可）；
+  #   install-desktop.sh       —— 一键装到桌面 + 应用菜单，自动写绝对路径并设信任标记。
+  if [[ "$rid" == linux-* ]]; then
+    cat > "$outdir/hxsfm.desktop" <<'DESK'
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=HxServerFileManager
+GenericName=SSH File Manager
+Comment=基于 Kestrel + SSH.NET 的服务器文件管理 / WebSSH
+Exec=sh -c 'cd "$(dirname "$1")" && exec ./HxServerFileManager.Desktop' sh %k
+Terminal=false
+Categories=Network;FileManager;Development;
+StartupNotify=false
+DESK
+    chmod +x "$outdir/hxsfm.desktop"
+
+    cat > "$outdir/install-desktop.sh" <<'SH'
+#!/usr/bin/env bash
+# 一键把 HxServerFileManager 安装到「桌面 + 应用菜单」。
+# 用法：./install-desktop.sh    （在应用文件夹内执行）
+set -euo pipefail
+APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BIN="$APP_DIR/HxServerFileManager.Desktop"
+[[ -x "$BIN" ]] || { echo "错误：未找到 $BIN" >&2; exit 1; }
+
+# 找桌面目录（XDG 惯例 + 回退 ~/Desktop）
+DESKTOP_DIR="${XDG_DESKTOP_DIR:-}"
+if [[ -z "$DESKTOP_DIR" ]]; then
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    DESKTOP_DIR="$(xdg-user-dir DESKTOP)"
+  fi
+fi
+[[ -n "$DESKTOP_DIR" ]] || DESKTOP_DIR="$HOME/Desktop"
+mkdir -p "$DESKTOP_DIR"
+
+cat > "$DESKTOP_DIR/HxServerFileManager.desktop" <<DESKCAT
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=HxServerFileManager
+GenericName=SSH File Manager
+Comment=基于 Kestrel + SSH.NET 的服务器文件管理 / WebSSH
+Exec="$BIN"
+Icon=utilities-terminal
+Terminal=false
+Categories=Network;FileManager;Development;
+StartupNotify=false
+DESKCAT
+chmod +x "$DESKTOP_DIR/HxServerFileManager.desktop"
+
+# GNOME 的「运行前确认」信任标记
+if command -v gio >/dev/null 2>&1; then
+  gio set "$DESKTOP_DIR/HxServerFileManager.desktop" metadata::trusted true || true
+fi
+
+# 一并注册到应用菜单（可选）
+if command -v desktop-file-install >/dev/null 2>&1 && [[ -w /usr/share/applications ]]; then
+  desktop-file-install --dir=/usr/share/applications "$DESKTOP_DIR/HxServerFileManager.desktop" || true
+fi
+
+echo "✔ 已生成桌面启动器：$DESKTOP_DIR/HxServerFileManager.desktop"
+echo "  双击即可打开（GNOME 若提示，点「允许启动」即可）"
+SH
+    chmod +x "$outdir/install-desktop.sh"
+    echo "  ✔ 已生成：$outdir/hxsfm.desktop（同目录相对版，双击它即可）"
+    echo "  ✔ 已生成：$outdir/install-desktop.sh（一键装到桌面+应用菜单）"
+  fi
   pack "$rid"
 }
 
@@ -187,6 +263,7 @@ build_mac_app() {
   dotnet publish "$DESKTOP_PROJECT" -c Release -r "$rid" \
     "${sc_flag[@]}" \
     -p:PublishSingleFile="$SINGLE_FILE" \
+    -p:IncludeNativeLibrariesForSelfExtract=false \
     -o "$stage"
 
   # 组装 .app
