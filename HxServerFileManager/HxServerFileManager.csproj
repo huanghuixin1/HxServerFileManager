@@ -7,10 +7,6 @@
     <Nullable>enable</Nullable>
     <!-- 被 Desktop 项目引用时，不要继承 RID 导致 self-contained 冲突（NETSDK1151） -->
     <SelfContained>false</SelfContained>
-    <!-- 与 Desktop 壳保持同一 RID，保证两边输出路径一致。
-         否则 VS 发布时（带 RID 传播 + 构建加速）会去引用 obj\...\win-x64\ref\ 下的
-         ref 程序集，而主项目此前按无 RID 路径构建，该文件不存在导致 CS/MD 找不到元数据。 -->
-    <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
   </PropertyGroup>
 
   <ItemGroup>

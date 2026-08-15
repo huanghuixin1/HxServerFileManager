@@ -46,6 +46,7 @@ public static partial class WebHost
     public static WebApplication Build(string[] args)
     {
         var builder = WebApplication.CreateBuilder(args);
+        Console.Error.WriteLine($"[DBG] exeDir={AppContext.BaseDirectory} cwd={Directory.GetCurrentDirectory()} wwwrootExists={Directory.Exists(Path.Combine(AppContext.BaseDirectory, "wwwroot"))}");
 
         // ---- ContentRoot 解析 ----
         // ASP.NET 默认把 ContentRoot 设为启动时 cwd，但 GUI 应用经 Finder / 文件管理器
@@ -85,7 +86,7 @@ public static partial class WebHost
 app.UseWebSockets();
 
 // ----------------------------------------------------------------------------
-// 登录鉴权（HxSimpleWebAuth）：密码来源优先级：
+// 登录鉴权（HxSimpleWebAuth）：密码来源优先级： 
 //   1) 环境变量 HXSFM_WEB_PASSWORD（可覆盖，方便 CI/Docker 注入）；
 //   2) configs/env.json 的 authPwd 字段（模板见 configs/env.json.example，存密码用）。
 // - 配置了密码：所有 /api（除 /api/session 与 /api/auth/*）必须带有效 Bearer token；
