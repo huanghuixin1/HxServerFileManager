@@ -191,20 +191,40 @@ async function doReconnect(conn) {
   const oldId = conn.connectionId
   const oldCwd = cwdMap[oldId] || conn.homeDirectory || '/'
   try {
-    // 先把旧连接从界面摘除，并保留其工作目录，重连成功后回填到新会话
-    // 同时清掉 broken 提示：用户已发起重连，不再显示旧横幅
-    connections.value = connections.value.filter((c) => c.connectionId !== oldId)
-    delete termRefs[oldId]
-    broken.value = broken.value.filter((b) => b.connectionId !== oldId)
     const res = await api.reconnect(conn.profileId)
-    // handleConnected 会把新会话 push 进 connections，Terminal 组件按新 connectionId
-    // 重新挂载，自动建好新 WebSocket —— 无需手动 reconnect 旧 Terminal 实例
-    handleConnected({ ...res, port: conn.port, authType: conn.authType }, oldCwd)
-    ElMessage.success(`${displayName(conn)} 已重连`)
+    const newId = res.connectionId
+    const tab = connections.value.find((c) => c.connectionId === oldId)
+    if (!tab) {
+      // tab 已被用户关闭：按新会话直接新增
+      broken.value = broken.value.filter((b) => b.connectionId !== oldId)
+      handleConnected({ ...res, port: conn.port, authType: conn.authType }, oldCwd)
+      ElMessage.success(`${displayName(conn)} 已重连`)
+    } else {
+      // 就地重连：不重建 tab。连接对象原地换成新会话 id（uid 不变，工作区不重挂载），
+      // 终端组件实例保留，xterm 滚动历史原样显示，只需重建 WebSocket 恢复输入输出
+      tab.profileId = res.profileId || tab.profileId
+      tab.host = res.host || tab.host
+      tab.username = res.username || tab.username
+      tab.homeDirectory = res.homeDirectory || tab.homeDirectory
+      tab.connectionId = newId
+      cwdMap[newId] = oldCwd
+      delete cwdMap[oldId]
+      if (termRefs[oldId]) {
+        termRefs[newId] = termRefs[oldId]
+        delete termRefs[oldId]
+      }
+      if (activeId.value === oldId) activeId.value = newId
+      broken.value = broken.value.filter((b) => b.connectionId !== oldId)
+      // 同一 xterm 实例上按新 connId 重建 WebSocket（Terminal.reconnect 关旧 ws 后重开）
+      termRefs[newId]?.reconnect?.()
+      ElMessage.success(`${displayName(tab)} 已重连`)
+    }
   } catch (e) {
-    // 重连失败：把连接放回 broken，让用户能再试
+    // 重连失败：**不删 tab**，连接对象原样保留（含旧 connectionId），
+    // 并把连接重新放回 broken，横幅继续提示可按 R 再试
     broken.value = broken.value.filter((b) => b.connectionId !== oldId)
-    connections.value = connections.value.filter((c) => c.connectionId !== oldId)
+    if (connections.value.some((c) => c.connectionId === oldId) && !broken.value.some((b) => b.connectionId === oldId))
+      broken.value.push(conn)
     ElMessage.error(`重连 ${displayName(conn)} 失败：${e.message}`)
   } finally {
     reconnectBusy.value = false
@@ -279,6 +299,9 @@ function restoreWorkspace() {
 
 function toConn(payload) {
   return {
+    // tab 稳定身份：重连成功时 connectionId 会原地换成新会话 id，但 uid 不变，
+    // 保证工作区（Terminal/FileManager 组件实例）不因 v-for key 变化而重挂载、终端历史不丢
+    uid: Math.random().toString(36).slice(2) + Date.now().toString(36),
     connectionId: payload.connectionId,
     profileId: payload.profileId || null,
     host: payload.host,
@@ -505,7 +528,7 @@ function closeEditor() {
         <div
           v-for="c in connections"
           v-show="activeId === c.connectionId"
-          :key="c.connectionId"
+          :key="c.uid"
           class="workspace"
           :class="{ 'term-max': termMax }"
           :style="{ '--term-w': termWidth + '%', '--term-h': termHeight + '%' }"

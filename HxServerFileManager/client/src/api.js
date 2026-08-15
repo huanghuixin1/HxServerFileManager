@@ -30,6 +30,14 @@ function onUnauthorized() {
   if (unauthorizedHandler) unauthorizedHandler()
 }
 
+// SSH.NET 底层异常（会话被空闲回收/远端断开后抛 "Client not connected." 之类）统一成友好文案，
+// 避免各界面把英文堆栈直接透传给用户。出现该文案 = 连接已死，App 会通过会话健康横幅提示重连。
+function normalizeError(msg) {
+  return /client not connected|not connected|connection (is )?closed/i.test(msg)
+    ? '连接已断开，请重新连接'
+    : msg
+}
+
 async function request(url, options = {}) {
   const token = getToken()
   const headers = { ...(options.headers || {}) }
@@ -49,7 +57,7 @@ async function request(url, options = {}) {
       const body = await res.json()
       if (body && body.error) msg = body.error
     } catch (_) { /* ignore */ }
-    throw new Error(msg)
+    throw new Error(normalizeError(msg))
   }
   // 204 / 无内容
   const ct = res.headers.get('content-type') || ''
@@ -146,7 +154,7 @@ export const api = {
     if (!res.ok) {
       let msg = `上传失败 (${res.status})`
       try { const b = await res.json(); if (b && b.error) msg = b.error } catch (_) {}
-      throw new Error(msg)
+      throw new Error(normalizeError(msg))
     }
     return await res.json()
   },
