@@ -131,6 +131,13 @@ export const api = {
       body: JSON.stringify({ connectionId: connId, path, name }),
     }),
 
+  // 批量创建远端目录（上传文件夹用：父目录/空目录一并建，已存在则跳过）
+  ensureDirs: (connId, path, dirs) =>
+    request('/api/ensure-dirs', {
+      method: 'POST',
+      body: JSON.stringify({ connectionId: connId, path, dirs }),
+    }),
+
   rename: (connId, dir, oldName, newPath) =>
     request('/api/rename', {
       method: 'POST',

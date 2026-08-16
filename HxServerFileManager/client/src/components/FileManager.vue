@@ -427,38 +427,60 @@ async function doRename() {
 function triggerUpload() {
   fileInput.value.click()
 }
-async function onFileSelected(e) {
-  const files = e.target.files
-  if (!files || files.length === 0) return
 
-  // 预校验：单个文件超上限直接拦截，避免传一半才 413；后端不限制（Infinity）时跳过
+// 路径拼接（cwd 可能以 / 结尾或为 /）
+function joinPath(dir, name) {
+  if (!dir || dir === '/') return `/${name}`
+  return `${dir.replace(/\/+$/, '')}/${name}`
+}
+
+// 预校验：单个文件超上限直接拦截，避免传一半才 413；后端不限制（Infinity）时跳过。
+// 返回是否通过；不通过时已弹错误提示
+function checkUploadLimits(items) {
   const limited = Number.isFinite(uploadLimitBytes.value)
-  const tooBig = limited ? [...files].filter((f) => f.size > uploadLimitBytes.value) : []
+  const tooBig = limited ? items.filter((it) => it.file.size > uploadLimitBytes.value) : []
   if (tooBig.length) {
     const limitMb = Math.round(uploadLimitBytes.value / 1024 / 1024)
     ElMessage.error(
-      `以下文件超过单文件 ${limitMb}MB 上限，未开始上传：${tooBig.map((f) => f.name).join('、')}`
+      `以下文件超过单文件 ${limitMb}MB 上限，未开始上传：${tooBig.map((it) => it.name).join('、')}`
     )
-    fileInput.value.value = ''
-    return
+    return false
   }
+  return true
+}
 
+// 统一上传队列：先建目录（父级在前，含空目录；已存在则后端跳过），再逐文件上传。
+// items = [{ file, relDir, name }]；relDir 为相对当前目录的子路径（'' = 直接放当前目录）
+async function runUploads(dirs, items) {
   uploading.value = true
   error.value = ''
-  uploadTotal.value = files.length
+  uploadTotal.value = items.length
   uploadAbort.value = new AbortController()
   try {
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i]
-      uploadIndex.value = i + 1
-      uploadName.value = f.name
-      uploadProgress.value = 0
-      await api.uploadFile(props.connId, cwd.value, f, (p) => {
-        uploadProgress.value = p
-      }, uploadAbort.value.signal)
+    if (dirs.length && !uploadAbort.value.signal.aborted) {
+      await api.ensureDirs(props.connId, cwd.value, dirs)
     }
-    ElMessage.success(`成功上传 ${files.length} 个文件`)
-    await load()
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i]
+      uploadIndex.value = i + 1
+      uploadName.value = it.relDir ? `${it.relDir}/${it.name}` : it.name
+      uploadProgress.value = 0
+      await api.uploadFile(
+        props.connId,
+        it.relDir ? joinPath(cwd.value, it.relDir) : cwd.value,
+        it.file,
+        (p) => {
+          uploadProgress.value = p
+        },
+        uploadAbort.value.signal
+      )
+    }
+    if (uploadAbort.value?.signal.aborted) {
+      ElMessage.info('已取消上传')
+    } else {
+      ElMessage.success(`成功上传 ${items.length} 个文件`)
+      await load()
+    }
   } catch (e) {
     if (uploadAbort.value?.signal.aborted) {
       ElMessage.info('已取消上传')
@@ -470,6 +492,80 @@ async function onFileSelected(e) {
     uploadAbort.value = null
     fileInput.value.value = ''
   }
+}
+
+async function onFileSelected(e) {
+  const files = e.target.files
+  if (!files || files.length === 0) return
+  const items = [...files].map((f) => ({ file: f, relDir: '', name: f.name }))
+  if (!checkUploadLimits(items)) return
+  await runUploads([], items)
+}
+
+// 递归遍历选中的目录（FileSystemEntry）：
+// dirs 收集全部目录相对路径（含空目录，父级在前），items 收集文件
+async function collectEntries(entry, basePath, dirs, items) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject))
+    items.push({ file, relDir: basePath, name: entry.name })
+    return
+  }
+  const dirPath = basePath ? `${basePath}/${entry.name}` : entry.name
+  dirs.push(dirPath)
+  const reader = entry.createReader()
+  // readEntries 每次最多返回 100 条，需循环读到空为止
+  for (;;) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject))
+    if (!batch.length) break
+    for (const child of batch) await collectEntries(child, dirPath, dirs, items)
+  }
+}
+
+// ---- 拖拽上传：文件/文件夹/混搭一次拖入（浏览器唯一能同时选文件和文件夹的方式）----
+const dragOver = ref(false)
+let dragDepth = 0
+
+function onDragEnter() {
+  dragDepth++
+  dragOver.value = true
+}
+function onDragLeave() {
+  dragDepth = Math.max(0, dragDepth - 1)
+  if (dragDepth === 0) dragOver.value = false
+}
+
+async function onDrop(e) {
+  dragDepth = 0
+  dragOver.value = false
+  if (uploading.value) {
+    ElMessage.warning('已有上传任务进行中，请先完成或停止')
+    return
+  }
+  const dirs = []
+  const items = []
+  const entries = [...(e.dataTransfer?.items || [])]
+    .filter((it) => it.kind === 'file')
+    .map((it) => it.webkitGetAsEntry())
+    .filter(Boolean)
+  if (entries.length) {
+    for (const entry of entries) {
+      if (entry.isFile) {
+        const file = await new Promise((resolve, reject) => entry.file(resolve, reject))
+        items.push({ file, relDir: '', name: entry.name })
+      } else {
+        // 文件夹：递归遍历（含空目录、保留相对结构）
+        await collectEntries(entry, '', dirs, items)
+      }
+    }
+  } else {
+    // 兼容兜底：webkitGetAsEntry 不可用时退回 dataTransfer.files（文件夹会丢失）
+    for (const f of e.dataTransfer?.files || []) {
+      items.push({ file: f, relDir: '', name: f.name })
+    }
+  }
+  if (!items.length && !dirs.length) return
+  if (!checkUploadLimits(items)) return
+  await runUploads(dirs, items)
 }
 
 function stopUpload() {
@@ -515,7 +611,13 @@ function fmtDate(s) {
 </script>
 
 <template>
-  <div class="card fm">
+  <div
+    class="card fm"
+    @dragenter.prevent="onDragEnter"
+    @dragover.prevent
+    @dragleave.prevent="onDragLeave"
+    @drop.prevent="onDrop"
+  >
     <div class="fm-toolbar">
       <div class="crumbs">
         <span class="crumb-link root" @click="goPath('/')">/</span>
@@ -766,6 +868,11 @@ function fmtDate(s) {
         <el-button type="primary" @click="saveFavForm">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 拖拽上传提示层（拖入文件/文件夹时显示） -->
+    <div v-if="dragOver" class="drop-overlay">
+      <div class="drop-hint">松开以上传文件 / 文件夹</div>
+    </div>
   </div>
 </template>
 
@@ -779,6 +886,29 @@ function fmtDate(s) {
   /* 屏蔽浏览器原生文本选中（行选择/拖拽时不出高亮） */
   user-select: none;
   -webkit-user-select: none;
+}
+
+/* 拖拽上传提示层：盖住整个面板（z-index 需高于 upload-panel 的 3000） */
+.drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 4000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(45, 108, 223, 0.06);
+  border: 2px dashed #2d6cdf;
+  border-radius: 10px;
+  pointer-events: none;
+}
+.drop-hint {
+  padding: 14px 28px;
+  background: #fff;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+  color: #2d6cdf;
+  font-size: 14px;
+  font-weight: 600;
 }
 .fm-toolbar {
   display: flex;

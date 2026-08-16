@@ -435,6 +435,24 @@ app.MapPost("/api/mkdir", (PathRequest req, ConnectionManager mgr, OperationLogg
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
 
+// 批量创建远端目录（上传文件夹用：父目录与空目录一并建，已存在则跳过，可重复执行）
+app.MapPost("/api/ensure-dirs", (EnsureDirsRequest req, ConnectionManager mgr, OperationLogger log) =>
+{
+    try
+    {
+        var s = mgr.Get(req.ConnectionId);
+        var created = 0;
+        foreach (var name in req.Dirs ?? Array.Empty<string>())
+        {
+            EnsureRemoteDir(s, CombinePath(req.Path, name));
+            created++;
+        }
+        log.Log("info", req.ConnectionId, "创建目录", $"{created} 个（上传文件夹）");
+        return Results.Ok(new { created });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
 // 重命名 / 移动
 app.MapPost("/api/rename", (RenameRequest req, ConnectionManager mgr, OperationLogger log) =>
 {
@@ -921,6 +939,20 @@ public static partial class WebHost
         return dir + "/" + name.TrimStart('/');
     }
 
+    // 递归创建远端目录（已存在则跳过）—— 上传文件夹时目标目录/中间目录可能还不存在。
+    // remoteDir 必须是绝对路径（CombinePath 产物），逐段累积并补齐缺失层级；已存在时幂等跳过
+    internal static void EnsureRemoteDir(SshSession s, string remoteDir)
+    {
+        if (string.IsNullOrWhiteSpace(remoteDir)) return;
+        var cur = "";
+        foreach (var seg in remoteDir.TrimStart('/').Split('/', StringSplitOptions.RemoveEmptyEntries))
+        {
+            cur += "/" + seg;
+            if (!s.Sftp.Exists(cur))
+                s.Sftp.CreateDirectory(cur);
+        }
+    }
+
     // 单引号转义，用于安全地把路径拼进 sh 命令
     internal static string Shq(string s) => "'" + s.Replace("'", "'\\''") + "'";
 
@@ -1157,6 +1189,7 @@ public record ConnectRequest(
 
 public record IdRequest(string ConnectionId);
 public record PathRequest(string ConnectionId, string Path, string Name);
+public record EnsureDirsRequest(string ConnectionId, string Path, string[]? Dirs);
 public record RenameRequest(string ConnectionId, string Path, string Name, string NewPath);
 public record CommandRequest(string ConnectionId, string Command);
 public record FileContentRequest(string ConnectionId, string Path, string Content);
