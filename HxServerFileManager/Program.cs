@@ -2149,7 +2149,9 @@ public static class SystemStatusHelpers
         echo "===MEM==="
         [ -f /proc/meminfo ] && head -8 /proc/meminfo 2>&1 || echo "no-meminfo"
         echo "===DISK==="
-        df -h -P 2>&1 | awk 'NR>1 && NF>=6 && $1 !~ /^tmpfs/ && $1 !~ /^devtmpfs/ {m=$6; for(i=7;i<=NF;i++) m=m" "$i; print $1"|"$2"|"$3"|"$4"|"$5"|"m}' || echo "no-df"
+        # 排除 docker/containerd 的容器挂载（/var/lib/docker/overlay2/<hash>、/var/lib/docker/containers/<id> 等
+        # 每容器一条、数量爆炸且都是同一磁盘重复数据；/var/lib/docker 根挂载本身保留，能看到数据盘真实占用）
+        df -h -P 2>&1 | awk 'NR>1 && NF>=6 && $1 !~ /^tmpfs/ && $1 !~ /^devtmpfs/ && $6 !~ /^\/var\/lib\/docker\// && $6 !~ /^\/var\/lib\/containerd\// {m=$6; for(i=7;i<=NF;i++) m=m" "$i; print $1"|"$2"|"$3"|"$4"|"$5"|"m}' || echo "no-df"
         echo "===NET==="
         # 直接从 /proc/net/dev 读全部接口（不依赖 /sys/class/net 目录遍历，容器里可能缺失）；
         # 每接口尝试读 operstate；输出 name|state|rx|tx

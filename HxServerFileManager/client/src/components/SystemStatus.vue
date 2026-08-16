@@ -175,13 +175,24 @@ const shortOs = computed(() => {
   return os.length > 26 ? os.slice(0, 26) + '…' : os
 })
 
-// 迷你条磁盘区：过滤掉虚拟/swap 分区，优先根分区靠前，最多显示 3 个挂载盘
+// docker/containerd 容器挂载（/var/lib/docker/overlay2/<hash>、containers/<id>/shm 等）每容器一条且都是
+// 同一磁盘的重复数据，磁盘视图里排除；/var/lib/docker 根挂载本身保留（能看到数据盘真实占用）
+function isContainerMount(d) {
+  const m = String(d.mount || '')
+  return m.startsWith('/var/lib/docker/') || m.startsWith('/var/lib/containerd/')
+}
+
+// 详情弹窗磁盘表：过滤容器挂载（后端 df 脚本也会过滤，这里双保险）
+const viewDisks = computed(() => (status.value?.disks || []).filter((d) => !isContainerMount(d)))
+
+// 迷你条磁盘区：过滤掉虚拟/swap 分区 + 容器挂载，优先根分区靠前，最多显示 3 个挂载盘
 const mainDisks = computed(() => {
   const disks = status.value?.disks || []
   const real = disks.filter((d) => {
     const fs = String(d.fs || '')
     const m = String(d.mount || '')
     if (m === '/dev/shm') return false
+    if (isContainerMount(d)) return false
     if (/^(tmpfs|devtmpfs|squashfs|udev|ramfs|shm|proc|sysfs)/.test(fs)) return false
     return true
   })
@@ -353,7 +364,7 @@ function formatRate(bps) {
             <div class="ss-card-label">
               <el-icon><FolderOpened /></el-icon>磁盘
             </div>
-            <el-table :data="status.disks" empty-text="未采集到磁盘信息" size="small" max-height="220">
+            <el-table :data="viewDisks" empty-text="未采集到磁盘信息" size="small" max-height="220">
               <el-table-column prop="mount" label="挂载点" min-width="120" />
               <el-table-column prop="fs" label="文件系统" min-width="120" show-overflow-tooltip />
               <el-table-column prop="size" label="容量" width="80" />
