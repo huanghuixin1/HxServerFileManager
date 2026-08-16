@@ -7,6 +7,10 @@
     <Nullable>enable</Nullable>
     <!-- 被 Desktop 项目引用时，不要继承 RID 导致 self-contained 冲突（NETSDK1151） -->
     <SelfContained>false</SelfContained>
+    <!-- 应用图标：仓库根目录 logo.ico（嵌入 exe，Windows 资源管理器/任务栏显示） -->
+    <ApplicationIcon>..\logo.ico</ApplicationIcon>
+    <!-- 不产出独立 .pdb 文件：调试符号内嵌进程序集（产物目录干净，同时保留调试能力） -->
+    <DebugType>embedded</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
@@ -23,8 +27,9 @@
   <ItemGroup>
     <None Include="libs\**\*" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+  <!-- 源 Data 目录任何文件都不随构建拷贝（Data 由运行时在 ContentRoot 下按需生成） -->
   <ItemGroup>
-    <None Remove="Data\connections.json" />
+    <None Remove="Data\**\*" />
   </ItemGroup>
 
   <!--
@@ -52,5 +57,18 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
+
+  <!--
+    构建/发布输出清理：Data 目录是运行时在 ContentRoot 下按需生成的（连接/密钥/设置），
+    不应随构建产物分发 —— 构建和发布后把输出目录里的 Data 内容清掉（含历史遗留文件）。
+    首次运行时应用会自行重建空的 Data。
+  -->
+  <Target Name="CleanOutputData" AfterTargets="Build;Publish">
+    <ItemGroup>
+      <OutputData Include="$(OutDir)Data\**\*;$(PublishDir)Data\**\*" />
+    </ItemGroup>
+    <Delete Files="@(OutputData)" ContinueOnError="true" />
+    <RemoveDir Directories="$(OutDir)Data;$(PublishDir)Data" ContinueOnError="true" />
+  </Target>
 
 </Project>

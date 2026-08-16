@@ -8,6 +8,10 @@
     <!-- 桌面壳不弹控制台窗口（Windows） -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
+    <!-- 应用图标：仓库根目录 logo.ico（嵌入 exe；并复制一份到输出目录供窗口 SetIconFile 运行时加载） -->
+    <ApplicationIcon>..\logo.ico</ApplicationIcon>
+    <!-- 不产出独立 .pdb 文件：调试符号内嵌进程序集（产物目录干净，同时保留调试能力） -->
+    <DebugType>embedded</DebugType>
   </PropertyGroup>
 
   <ItemGroup>
@@ -20,6 +24,13 @@
     <!-- 引用主项目，复用 Web 服务构建逻辑。SetRuntimeIdentifier 让主项目与桌面壳用相同 RID 输出 -->
     <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj"
                       SetRuntimeIdentifier="true" />
+  </ItemGroup>
+
+  <!-- 窗口图标：logo.png 作为内嵌资源打包（构建产物不落散文件），
+       启动时解出到临时目录供 Photino SetIconFile 加载（PNG 三平台通用）。
+       注意：不要改用 logo.ico —— gdk-pixbuf 的 ICO 加载器对现代多尺寸 ico 支持很差。 -->
+  <ItemGroup>
+    <EmbeddedResource Include="..\logo.png" LogicalName="logo.png" />
   </ItemGroup>
 
   <!--
@@ -48,6 +59,20 @@
     避免用户面对两个可执行文件分不清该点哪个。
     Build 后删除 $(OutDir) 里的，Publish 还会把主项目产物拷进 $(PublishDir)，需再删一次。
   -->
+  <!--
+    构建/发布输出清理：Data 目录是运行时在 ContentRoot 下按需生成的（连接/密钥/设置），
+    不应随构建产物分发 —— 构建和发布后把输出目录里的 Data 内容清掉（含历史遗留文件）。
+    首次运行时应用会自行重建空的 Data。
+  -->
+  <Target Name="CleanOutputData" AfterTargets="Build;Publish">
+    <ItemGroup>
+      <!-- 同时清掉历史版本曾复制进输出的 logo.ico 散文件（当前 logo 已改为内嵌资源，不再拷贝） -->
+      <OutputData Include="$(OutDir)Data\**\*;$(PublishDir)Data\**\*;$(OutDir)logo.ico;$(PublishDir)logo.ico" />
+    </ItemGroup>
+    <Delete Files="@(OutputData)" ContinueOnError="true" />
+    <RemoveDir Directories="$(OutDir)Data;$(PublishDir)Data" ContinueOnError="true" />
+  </Target>
+
   <Target Name="RemoveRedundantExe" AfterTargets="Build;Publish">
     <ItemGroup>
       <RedundantHost Include="$(OutDir)HxServerFileManager.exe;$(OutDir)HxServerFileManager;$(PublishDir)HxServerFileManager.exe;$(PublishDir)HxServerFileManager" />

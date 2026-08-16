@@ -135,6 +135,10 @@ publish_desktop() {
   echo "══════════════════════════════════════════════════"
   echo "▶ 发布桌面壳：$rid  ($SC_NOTE)"
   echo "══════════════════════════════════════════════════"
+  # 先清空再发布：dotnet publish 重复发布到同一目录（DeleteExistingFiles）会把
+  # 已存在但不在当前发布列表的文件清掉，也可能因中途失败留下不完整产物（缺原生库等）。
+  # 干净目录发布保证产物完整、无残留（mac-app 用 staging 目录也是同一原因）。
+  rm -rf "$outdir"
   dotnet publish "$DESKTOP_PROJECT" -c Release -r "$rid" \
     "${sc_flag[@]}" \
     -p:PublishSingleFile="$SINGLE_FILE" \
@@ -143,7 +147,7 @@ publish_desktop() {
   local bin="$outdir/HxServerFileManager.Desktop"
   [[ -f "$bin" ]] && chmod +x "$bin"   # Windows 无执行位，补上便于 tar/zip 传输
 
-    # Linux 桌面壳：额外生成 .desktop 启动器（图中双击入口）。
+  # Linux 桌面壳：额外生成 .desktop 启动器（图中双击入口）。
   # Linux 桌面应用不靠双击裸二进制启动（GNOME 会当文本打开/拒绝运行），
   # 需要 .desktop 启动器（相当于 Windows .lnk / macOS .app）。
   # ⚠️ 启动器文件名避开 "HxServerFileManager.Desktop"：Windows 构建机文件系统
@@ -152,6 +156,12 @@ publish_desktop() {
   #   hxsfm.desktop            —— 相对路径版，与二进制同目录使用（拷贝整个文件夹即可）；
   #   install-desktop.sh       —— 一键装到桌面 + 应用菜单，自动写绝对路径并设信任标记。
   if [[ "$rid" == linux-* ]]; then
+    # 应用图标：Linux 没有可执行文件内嵌图标机制，桌面图标必须靠 .desktop 的 Icon= 引用一个
+    # 图标文件，这里把 logo.png 一并放进发布目录（GNOME/gdk-pixbuf 对 .ico 支持差，用 PNG）。
+    cp "logo.png" "$outdir/logo.png"
+
+    # 注意 Icon= 用主题名 hxsfm 而非相对路径：.desktop 规范只认主题图标名或绝对路径，
+    # 相对路径解析不了（应用首次启动会自装主题图标，见 Desktop/Program.cs InstallLinuxIcon）
     cat > "$outdir/hxsfm.desktop" <<'DESK'
 [Desktop Entry]
 Type=Application
@@ -160,6 +170,8 @@ Name=HxServerFileManager
 GenericName=SSH File Manager
 Comment=基于 Kestrel + SSH.NET 的服务器文件管理 / WebSSH
 Exec=sh -c 'cd "$(dirname "$1")" && exec ./HxServerFileManager.Desktop' sh %k
+Icon=hxsfm
+StartupWMClass=HxServerFileManager.Desktop
 Terminal=false
 Categories=Network;FileManager;Development;
 StartupNotify=false
@@ -173,7 +185,14 @@ DESK
 set -euo pipefail
 APP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$APP_DIR/HxServerFileManager.Desktop"
-[[ -x "$BIN" ]] || { echo "错误：未找到 $BIN" >&2; exit 1; }
+if [[ ! -f "$BIN" ]]; then
+  echo "错误：未找到 $BIN" >&2
+  exit 1
+fi
+# 跨平台拷贝（zip/Windows 传输等）经常丢失可执行位，这里直接补上，不需要用户手动 chmod
+chmod +x "$BIN"
+# 同目录的便携版启动器也要可执行位（GNOME 只运行带 +x 的 .desktop）
+if [[ -f "$APP_DIR/hxsfm.desktop" ]]; then chmod +x "$APP_DIR/hxsfm.desktop"; fi
 
 # 找桌面目录（XDG 惯例 + 回退 ~/Desktop）
 DESKTOP_DIR="${XDG_DESKTOP_DIR:-}"
@@ -185,6 +204,14 @@ fi
 [[ -n "$DESKTOP_DIR" ]] || DESKTOP_DIR="$HOME/Desktop"
 mkdir -p "$DESKTOP_DIR"
 
+# 把图标装入用户图标主题：.desktop 的 Icon= 只认主题图标名或绝对路径，主题名最可靠
+ICON_DIR="$HOME/.local/share/icons/hicolor"
+for s in 256 128 64 48 32; do
+  mkdir -p "$ICON_DIR/${s}x${s}/apps"
+  cp "$APP_DIR/logo.png" "$ICON_DIR/${s}x${s}/apps/hxsfm.png"
+done
+gtk-update-icon-cache -f -t "$ICON_DIR" >/dev/null 2>&1 || true
+
 cat > "$DESKTOP_DIR/HxServerFileManager.desktop" <<DESKCAT
 [Desktop Entry]
 Type=Application
@@ -193,7 +220,8 @@ Name=HxServerFileManager
 GenericName=SSH File Manager
 Comment=基于 Kestrel + SSH.NET 的服务器文件管理 / WebSSH
 Exec="$BIN"
-Icon=utilities-terminal
+Icon=hxsfm
+StartupWMClass=HxServerFileManager.Desktop
 Terminal=false
 Categories=Network;FileManager;Development;
 StartupNotify=false
