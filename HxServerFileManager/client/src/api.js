@@ -153,6 +153,9 @@ export const api = {
   // 下载：<a download> 不能带请求头，token 放查询参数（后端会转成 Authorization 头）
   downloadUrl: (connId, path) =>
     `/api/download?connId=${encodeURIComponent(connId)}&path=${encodeURIComponent(path)}&token=${encodeURIComponent(getToken())}`,
+  // 批量下载（多选文件/文件夹）：桌面壳 POST 此地址，远端 tar 流解包到本地文件夹
+  downloadManyUrl: (connId) =>
+    `/api/download-many?connId=${encodeURIComponent(connId)}&token=${encodeURIComponent(getToken())}`,
 
   // 上传：用 XMLHttpRequest 以支持上传进度回调（fetch 无 upload 进度事件）。
   // onProgress(percent 0-100) 可选；signal 传 AbortController.signal 可取消（xhr.abort）。
@@ -320,4 +323,106 @@ export function openLogStream(onMessage) {
   }
   es.onerror = () => { /* EventSource 会自动重连 */ }
   return es
+}
+
+// ---- 桌面壳（Photino）消息桥 ----
+// JS→C#：window.external.sendMessage(JSON)；C#→JS：window.external.receiveMessage = fn（Photino 注入）。
+// 仅存在于桌面壳（WebView2）；普通浏览器里 window.external 没有 sendMessage，静默跳过。
+// 协议：请求 { op, ... } → C# 处理 → 响应 { op: '<op>Result', ... }，按 op 分发一次性回调。
+const desktopOps = {}
+if (typeof window !== 'undefined' && window.external?.sendMessage) {
+  // Photino 注入的 receiveMessage 是「传入回调注册」的函数（内部监听 chrome.webview 的 message 事件），
+  // 必须调用它注册回调（如 window.external.receiveMessage(cb)），不能赋值覆盖，否则 C#→JS 消息收不到
+  window.external.receiveMessage((raw) => {
+    let msg = null
+    try { msg = JSON.parse(raw) } catch (_) { return }
+    const h = desktopOps[msg?.op]
+    if (h) { delete desktopOps[msg.op]; h(msg) }
+  })
+}
+
+let desktopMode = null
+// 是否运行在桌面壳里（/api/health 的 desktop 标记，由桌面壳进程设 HXSFM_DESKTOP=1 产生）
+export async function isDesktop() {
+  if (desktopMode === null) {
+    try {
+      const h = await api.health()
+      desktopMode = !!h.desktop
+    } catch (_) {
+      desktopMode = false
+    }
+  }
+  return desktopMode
+}
+
+// 桌面壳：弹原生「另存为」对话框让用户选保存路径，把内容写入所选位置。
+// 返回写入路径；用户取消返回 null；非桌面环境或出错 reject。浏览器端请走 <a download>。
+export function desktopSaveTextFile(defaultName, content, timeoutMs = 60000) {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.external?.sendMessage) {
+      reject(new Error('当前不是桌面环境，无法选择保存路径'))
+      return
+    }
+    const timer = setTimeout(() => {
+      delete desktopOps.saveFileResult
+      reject(new Error('保存对话框无响应'))
+    }, timeoutMs)
+    desktopOps.saveFileResult = (msg) => {
+      clearTimeout(timer)
+      if (msg.ok) resolve(msg.path)
+      else if (msg.canceled) resolve(null)
+      else reject(new Error(msg.error || '保存失败'))
+    }
+    window.external.sendMessage(JSON.stringify({ op: 'saveFile', defaultName, content }))
+  })
+}
+
+let downloadManySeq = 0
+// 桌面壳：弹原生文件夹选择器选一个本地目录，远端 tar 流解包到该目录（保留目录结构）。
+// 返回 { promise, cancel }：promise 解析为 { path, count }（用户取消/停止返回 null）或 reject；
+// cancel() 发取消消息终止本次下载（对应「停止下载」按钮）。非桌面环境 reject。
+// onProgress(file) 回传当前解包的文件名（节流后）。不设超时，等 C# 回传结果。
+export function desktopDownloadMany(url, paths, onProgress) {
+  let cancelFn = null
+  const promise = new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.external?.sendMessage) {
+      reject(new Error('当前不是桌面环境，无法选择保存文件夹'))
+      return
+    }
+    const id = 'dm' + ++downloadManySeq + '-' + Date.now()
+    desktopOps.downloadManyProgress = (msg) => onProgress?.(msg.file)
+    desktopOps.downloadManyResult = (msg) => {
+      // 多连接并发批量下载时结果可能串台：C# 回执带 id，只处理本次任务的结果
+      if (msg.id && msg.id !== id) return
+      delete desktopOps.downloadManyProgress
+      if (msg.ok) resolve({ path: msg.path, count: msg.count })
+      else if (msg.canceled) resolve(null)
+      else reject(new Error(msg.innerError || msg.error || '批量下载失败'))
+    }
+    window.external.sendMessage(JSON.stringify({ op: 'downloadMany', id, url, paths }))
+    cancelFn = () => {
+      if (window.external?.sendMessage) {
+        window.external.sendMessage(JSON.stringify({ op: 'downloadManyCancel', id }))
+      }
+    }
+  })
+  return { promise, cancel: () => cancelFn?.() }
+}
+
+// 桌面壳：弹原生「另存为」对话框选保存路径，由 C# 端从 url 流式下载到所选位置（不走 JS 桥传大文件）。
+// 返回写入路径；用户取消返回 null；非桌面环境或出错 reject。浏览器端请走 <a download>。
+// 下载耗时可能较长，不设超时，等 C# 回传结果。
+export function desktopDownloadFile(url, defaultName) {
+  return new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.external?.sendMessage) {
+      reject(new Error('当前不是桌面环境，无法选择保存路径'))
+      return
+    }
+    desktopOps.downloadFileResult = (msg) => {
+      if (msg.ok) resolve(msg.path)
+      else if (msg.canceled) resolve(null)
+      else reject(new Error(msg.innerError || msg.error || '下载失败'))
+    }
+    window.external.sendMessage(JSON.stringify({ op: 'downloadFile', url, defaultName }))
+  })
 }

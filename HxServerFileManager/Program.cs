@@ -101,6 +101,9 @@ public static partial class WebHost
             // 允许较大文件上传（默认 1GB；HXSFM_MAX_UPLOAD_MB 或 env.json 的 maxUploadMb 可配置；
             // 0 = 不限制，桌面壳即为该模式）
             kestrel.Limits.MaxRequestBodySize = maxUploadMb > 0 ? maxUploadMb * 1024 * 1024L : null;
+            // 关掉响应最低速率限制（默认 240 B/s + 5s 宽限，对响应同样生效）：大文件/慢速远端
+            // 下载时响应稍慢会被 Kestrel 掐断（表现为“下载超时”），本地应用没必要限速
+            kestrel.Limits.MinResponseDataRate = null;
         });
 
         // 单例：会话表 / 操作日志 / 连接存储
@@ -510,19 +513,104 @@ app.MapPost("/api/upload", async (HttpContext ctx, ConnectionManager mgr, Operat
 });
 
 // 下载文件（流式）
-app.MapGet("/api/download", async (string connId, string path, ConnectionManager mgr, OperationLogger log) =>
+// 手动流式下发（不用 Results.File）：① 大文件/慢速远端场景每写一块 Touch 一次，防止 30 分钟
+// 空闲回收把正在下载的会话断掉；② 中途出错能捕获并返回明确错误（Results.File 的流由 Kestrel 托管，
+// 出错只能默默中断连接，桌面端表现为“下载失败/超时”）。
+app.MapGet("/api/download", async (string connId, string path, HttpContext ctx, ConnectionManager mgr, OperationLogger log) =>
 {
     try
     {
         var s = mgr.Get(connId);
-        var stream = s.Sftp.OpenRead(path);
-        var name = Path.GetFileName(path);
         log.Log("info", connId, "下载", path);
-        return Results.File(stream, "application/octet-stream", name);
+        var name = Path.GetFileName(path);
+        await using var stream = s.Sftp.OpenRead(path);
+        ctx.Response.ContentType = "application/octet-stream";
+        ctx.Response.Headers.ContentDisposition = $"attachment; filename*=UTF-8''{Uri.EscapeDataString(name)}";
+        ctx.Response.ContentLength = stream.Length;
+        var buf = new byte[64 * 1024];
+        int n;
+        while ((n = await stream.ReadAsync(buf, ctx.RequestAborted)) > 0)
+        {
+            await ctx.Response.Body.WriteAsync(buf.AsMemory(0, n), ctx.RequestAborted);
+            s.Touch(); // 下载期间保持会话活跃，防空闲回收
+        }
+        // 响应体已直接写入（Response Started），此时返回 Results.Ok() 会再次 set_StatusCode 抛
+        // “StatusCode cannot be set because the response has already started”，Kestrel 把已发送一半的
+        // 连接直接掐断（客户端表现“Error while copying content to a stream / response ended prematurely”）。
+        // 用 Results.Empty（不触碰状态码）让响应正常收尾。
+        return Results.Empty;
     }
     catch (Exception ex)
     {
-        return Results.BadRequest(new { error = ex.Message });
+        // 响应头未发送时返回明确错误；已开始发送则只能中断（Kestrel 收尾，客户端收到连接重置）
+        return ctx.Response.HasStarted ? Results.Empty : Results.BadRequest(new { error = ex.Message });
+    }
+});
+
+// 批量下载（多选文件/文件夹 → 在远端 tar 打流直出，本地解包保留目录结构）。
+// 桌面壳弹文件夹选择器选一个本地目录，把流解包到该目录；浏览器端无选文件夹能力，只能逐个下载文件。
+// 打包在远端执行（tar 在 Linux 普遍预装），一个 exec 通道流式输出，不占本机内存。
+// 注意：SshCommand.Execute() 会把全部输出缓冲进内存，这里必须 BeginExecute + 读 OutputStream 流式消费。
+app.MapPost("/api/download-many", async (DownloadManyRequest req, HttpContext ctx, ConnectionManager mgr, OperationLogger log) =>
+{
+    try
+    {
+        var connId = req.ConnectionId ?? ctx.Request.Query["connId"].ToString();
+        if (string.IsNullOrWhiteSpace(connId) || req.Paths is not { Length: > 0 } paths)
+            return Results.BadRequest(new { error = "缺少连接或选中项" });
+        var s = mgr.Get(connId);
+
+        // 所有选中项必须来自同一目录（文件列表是单目录多选），共同父目录 = 第一项的父目录
+        var parent = WebHost.ParentDir(paths[0]);
+        foreach (var p in paths)
+        {
+            if (!Path.IsPathRooted(p))
+                return Results.BadRequest(new { error = "路径必须为绝对路径：" + p });
+            if (WebHost.ParentDir(p) != parent)
+                return Results.BadRequest(new { error = "选中项不在同一目录，无法批量下载" });
+            // 预校验存在性：tar 遇到不存在的项会整体失败，先拦下来给明确错误
+            if (!s.Sftp.Exists(p))
+                return Results.BadRequest(new { error = "路径不存在：" + p });
+        }
+
+        // 相对名逐个 Shq 转义（防空格/特殊字符），-C parent 切换基准目录。
+        // 不用 --ignore-failed-read：busybox tar（Docker 常见）不支持该选项会直接失败；
+        // 存在性已在上面预校验，剩下「存在但读不了」的极端情况让客户端解包报错即可。
+        // -- 结束选项解析：选中项以 - 开头（如 -foo.txt）时 tar 会把它当选项导致整包 0 输出（实测
+        // busybox tar 1.37 与 GNU tar 都支持 --）。
+        var names = string.Join(' ', paths.Select(p => WebHost.Shq(p[parent.Length..].TrimStart('/'))));
+        var cmdLine = $"tar -C {WebHost.Shq(parent)} -cf - -- {names}";
+
+        log.Log("info", connId, "批量下载", $"{paths.Length} 项：{string.Join(", ", paths)}");
+        ctx.Response.ContentType = "application/octet-stream";
+        ctx.Response.Headers.ContentDisposition =
+            $"attachment; filename*=UTF-8''hxsfm-download-{DateTime.Now:yyyyMMdd-HHmmss}.tar";
+
+        using var cmd = s.Ssh.CreateCommand(cmdLine);
+        cmd.CommandTimeout = TimeSpan.FromHours(2);
+        var ar = cmd.BeginExecute(); // 不阻塞：OutputStream 边产边读（Execute() 会全部缓冲进内存）
+        try
+        {
+            await using var outStream = cmd.OutputStream;
+            var buf = new byte[64 * 1024];
+            int n;
+            while ((n = await outStream.ReadAsync(buf, ctx.RequestAborted)) > 0)
+            {
+                await ctx.Response.Body.WriteAsync(buf.AsMemory(0, n), ctx.RequestAborted);
+                s.Touch(); // 长时间传输期间保持会话活跃，防空闲回收
+            }
+            cmd.EndExecute(ar); // 流读完再收尾；中途异常则跳过（using 关闭通道会终止远端 tar）
+        }
+        catch (OperationCanceledException) { throw; } // 客户端断开：Dispose 关通道终止远端 tar
+        // 同 /api/download：响应体已开始，返回 Results.Ok() 会抛“StatusCode cannot be set because
+        // the response has already started”导致 Kestrel 掐断连接（客户端报 response ended prematurely），
+        // 必须用 Results.Empty 正常收尾。
+        return Results.Empty;
+    }
+    catch (Exception ex)
+    {
+        // 响应头未发送时返回明确错误；已开始发送则只能中断
+        return ctx.Response.HasStarted ? Results.Empty : Results.BadRequest(new { error = ex.Message });
     }
 });
 
@@ -938,11 +1026,13 @@ app.MapGet("/api/logs/stream", async (HttpContext ctx, OperationLogger log) =>
     catch (OperationCanceledException) { /* 客户端断开 / 服务停机 */ }
 });
 
-// 健康检查（顺带返回单文件上传上限，前端据此预校验；maxUploadBytes = 0 表示不限制）
+// 健康检查（顺带返回单文件上传上限，前端据此预校验；maxUploadBytes = 0 表示不限制；
+// desktop = 是否运行在桌面壳里，前端据此走原生保存对话框等桌面专属交互）
 app.MapGet("/api/health", () => Results.Ok(new
 {
     status = "ok",
     maxUploadBytes = maxUploadMb > 0 ? maxUploadMb * 1024 * 1024L : 0,
+    desktop = Environment.GetEnvironmentVariable("HXSFM_DESKTOP") == "1",
 }));
 
 // ---- 用户偏好设置：常用目录收藏 + 终端宏（Data/settings.json）----
@@ -999,6 +1089,14 @@ public static partial class WebHost
         dir = (dir ?? "/").TrimEnd('/');
         if (dir == "") dir = "";
         return dir + "/" + name.TrimStart('/');
+    }
+
+    internal static string ParentDir(string p)
+    {
+        p = (p ?? "/").TrimEnd('/');
+        if (p == "") return "/";
+        var i = p.LastIndexOf('/');
+        return i <= 0 ? "/" : p[..i];
     }
 
     // 递归创建远端目录（已存在则跳过）—— 上传文件夹时目标目录/中间目录可能还不存在。
@@ -1278,6 +1376,7 @@ public record EnsureDirsRequest(string ConnectionId, string Path, string[]? Dirs
 public record RenameRequest(string ConnectionId, string Path, string Name, string NewPath);
 public record CommandRequest(string ConnectionId, string Command);
 public record ServerCopyRequest(string SourceConnId, string TargetConnId, string[]? Items, string TargetDir);
+public record DownloadManyRequest(string? ConnectionId, string[]? Paths);
 public record ServerCopyItemState(string Path, string State, string? Message);
 public record FileContentRequest(string ConnectionId, string Path, string Content);
 public record CwdRequest(string ConnectionId, string Path);

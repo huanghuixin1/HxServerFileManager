@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../api.js'
+import { api, isDesktop, desktopSaveTextFile } from '../api.js'
 
 const props = defineProps({
   reloadToken: { type: Number, default: 0 },
@@ -25,18 +25,26 @@ async function load() {
 onMounted(load)
 watch(() => props.reloadToken, load)
 
-// 导出：服务端解密后返回含凭据的明文 JSON，下载为文件（备份/迁移用）
+// 导出：服务端解密后返回含凭据的明文 JSON，写为文件（备份/迁移用）。
+// 桌面壳：弹原生「另存为」对话框让用户选保存路径；浏览器：<a download> 下载到默认目录。
 async function doExport() {
   try {
     const res = await api.exportConnections()
     const data = res.connections || []
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
+    const json = JSON.stringify(data, null, 2)
     const d = new Date()
     const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+    const filename = `hxsfm-connections-${stamp}.json`
+    if (await isDesktop()) {
+      const path = await desktopSaveTextFile(filename, json)
+      if (path) ElMessage.success(`已导出 ${data.length} 个连接到 ${path}`)
+      return
+    }
+    const blob = new Blob([json], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
     a.href = url
-    a.download = `hxsfm-connections-${stamp}.json`
+    a.download = filename
     a.click()
     URL.revokeObjectURL(url)
     ElMessage.success(`已导出 ${data.length} 个连接（含凭据明文）`)

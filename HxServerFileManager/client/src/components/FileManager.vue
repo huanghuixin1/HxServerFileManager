@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api } from '../api.js'
+import { api, isDesktop, desktopDownloadFile, desktopDownloadMany } from '../api.js'
 import { useSettings } from '../useSettings.js'
 
 // 常用目录收藏（后端 Data/settings.json）：按连接隔离，跳转/添加/管理
@@ -151,6 +151,13 @@ const renaming = ref(null)
 
 const uploading = ref(false)
 const deleting = ref(false)
+// 批量下载（多选文件/文件夹 → 桌面端选一个文件夹整包下载）状态
+const downloading = ref(false)
+const downloadName = ref('')
+const downloadCount = ref(0)
+let downloadCancel = null // 桌面端：desktopDownloadMany 返回的 cancel()（停止下载按钮）
+let downloadAbort = false // 浏览器端：逐个 <a download> 循环的终止标记
+let downloadCanceled = false // 用户主动点了「停止下载」
 const fileInput = ref(null)
 // 上传进度：当前文件 i/n、文件名、百分比；uploadAbort 用于「停止上传」
 const uploadIndex = ref(0)
@@ -163,10 +170,11 @@ const uploadAbort = ref(null)
 const uploadLimitBytes = ref(1024 * 1024 * 1024)
 
 // 列表加载中状态：目录刷新 / 删除 / 上传共用遮罩，附文字区分（上传详情见 upload-panel）
-const tableLoading = computed(() => loading.value || deleting.value || uploading.value)
+const tableLoading = computed(() => loading.value || deleting.value || uploading.value || downloading.value)
 const loadingText = computed(() => {
   if (uploading.value) return ''
   if (deleting.value) return '删除中…'
+  if (downloading.value) return '下载中…'
   return ''
 })
 
@@ -178,6 +186,12 @@ const menuY = ref(0)
 
 function onRowContextMenu(row, _col, event) {
   event.preventDefault()
+  // 标准文件管理器行为：右键未选中的行时先把选中集切到该行；右键多选中的成员则保持多选
+  if (!selectedSet.value.has(row.fullPath)) {
+    tableRef.value?.clearSelection()
+    tableRef.value?.toggleRowSelection(row, true)
+    lastSelected = row
+  }
   menuRow.value = row
   menuX.value = Math.min(event.clientX, window.innerWidth - 150)
   menuY.value = Math.min(event.clientY, window.innerHeight - 200)
@@ -196,7 +210,13 @@ function menuEdit() {
 function menuDownload() {
   const row = menuRow.value
   closeMenu()
-  if (row) download(row)
+  if (!row) return
+  // 右键的是多选中的一员：下载整个选中集（批量，选文件夹）；否则单文件
+  if (selectedItems.value.length > 1 && selectedSet.value.has(row.fullPath)) {
+    downloadSelected()
+    return
+  }
+  download(row)
 }
 function menuRename() {
   const row = menuRow.value
@@ -206,7 +226,13 @@ function menuRename() {
 function menuDelete() {
   const row = menuRow.value
   closeMenu()
-  if (row) remove(row)
+  if (!row) return
+  // 右键的是多选中的一员：删除整个选中集（与「操作→删除」一致）；否则单文件
+  if (selectedItems.value.length > 1 && selectedSet.value.has(row.fullPath)) {
+    batchDelete()
+    return
+  }
+  remove(row)
 }
 
 onMounted(() => document.addEventListener('click', closeMenu))
@@ -251,6 +277,7 @@ function onRowClick(row, _col, event) {
 function onToolCommand(cmd) {
   if (cmd === 'mkdir') newDirVisible.value = true
   else if (cmd === 'upload') triggerUpload()
+  else if (cmd === 'download') downloadSelected()
   else if (cmd === 'send') {
     emit('send-to-connection', selectedItems.value.map((i) => i.fullPath))
   } else if (cmd === 'delete') batchDelete()
@@ -375,13 +402,97 @@ watch(
   { immediate: true }
 )
 
-function download(item) {
+async function download(item) {
+  const name = item.name || baseName(item.fullPath) || 'download'
+  // 桌面壳：弹原生「另存为」对话框选保存位置，由 C# 端流式下载落盘（大文件不走 JS 桥）
+  if (await isDesktop()) {
+    const url = new URL(api.downloadUrl(props.connId, item.fullPath), location.href).href
+    try {
+      const path = await desktopDownloadFile(url, name)
+      if (path) ElMessage.success(`已下载到 ${path}`)
+    } catch (e) {
+      ElMessage.error(e.message)
+    }
+    return
+  }
   const a = document.createElement('a')
   a.href = api.downloadUrl(props.connId, item.fullPath)
-  a.download = item.name
+  a.download = name
   document.body.appendChild(a)
   a.click()
   a.remove()
+}
+
+// 批量下载（操作菜单）：选中多个文件/文件夹 → 桌面端只选一个本地文件夹，整包下载保留目录结构
+async function downloadSelected() {
+  const sel = selectedItems.value
+  if (!sel.length) {
+    ElMessage.warning('请先选中要下载的文件')
+    return
+  }
+  // 单个文件保持原「另存为」行为（可改文件名）；多选或含目录走「选文件夹」批量下载
+  if (sel.length === 1 && !sel[0].isDirectory) {
+    download(sel[0])
+    return
+  }
+  if (await isDesktop()) {
+    const url = new URL(api.downloadManyUrl(props.connId), location.href).href
+    const paths = sel.map((i) => i.fullPath)
+    downloading.value = true
+    downloadCount.value = 0
+    downloadCanceled = false
+    downloadCancel = null
+    try {
+      const { promise, cancel } = desktopDownloadMany(url, paths, (file) => {
+        downloadName.value = file
+        downloadCount.value++
+      })
+      downloadCancel = cancel
+      const res = await promise
+      if (res) ElMessage.success(`已下载 ${res.count} 个文件到 ${res.path}`)
+      else if (downloadCanceled) ElMessage.info('已取消批量下载')
+    } catch (e) {
+      ElMessage.error(e.message)
+    } finally {
+      downloading.value = false
+      downloadCancel = null
+    }
+    return
+  }
+  // 浏览器：无选文件夹能力，逐个下载文件（目录结构丢失，提示）
+  const dirs = sel.filter((i) => i.isDirectory)
+  if (dirs.length) ElMessage.warning('浏览器不支持选择保存文件夹，选中的目录将跳过，只下载文件')
+  const files = sel.filter((i) => !i.isDirectory)
+  downloading.value = true
+  downloadCount.value = 0
+  downloadCanceled = false
+  downloadAbort = false
+  try {
+    for (let i = 0; i < files.length && !downloadAbort; i++) {
+      const f = files[i]
+      downloadName.value = f.name
+      downloadCount.value = i + 1
+      const a = document.createElement('a')
+      a.href = api.downloadUrl(props.connId, f.fullPath)
+      a.download = f.name
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      if (!downloadAbort) await new Promise((r) => setTimeout(r, 300)) // 留间隔避免被浏览器拦成「连续下载」
+    }
+    if (downloadAbort) ElMessage.info('已取消批量下载')
+  } finally {
+    downloading.value = false
+  }
+}
+
+// 「停止下载」：桌面端取消 C# 在途任务（远端 tar 随之终止、清理已解包部分文件）；
+// 浏览器端终止逐个下载循环
+function stopDownload() {
+  downloadCanceled = true
+  downloadAbort = true
+  downloadCancel?.()
+  downloadCancel = null
 }
 
 async function remove(item) {
@@ -703,6 +814,10 @@ function fmtDate(s) {
               <el-dropdown-item command="upload" :disabled="uploading">
                 <el-icon style="margin-right: 6px"><Upload /></el-icon>{{ uploading ? '上传中…' : '上传' }}
               </el-dropdown-item>
+              <el-dropdown-item command="download" :disabled="downloading || selectedItems.length === 0">
+                <el-icon style="margin-right: 6px"><Download /></el-icon>{{ downloading ? '下载中…' : '下载' }}
+                <span v-if="selectedItems.length" class="dd-count">{{ selectedItems.length }}</span>
+              </el-dropdown-item>
               <el-dropdown-item
                 command="send"
                 :disabled="selectedItems.length === 0 || !hasOtherConns"
@@ -764,6 +879,19 @@ function fmtDate(s) {
         <template #default="{ row }">{{ fmtDate(row.lastWriteTimeUtc) }}</template>
       </el-table-column>
     </el-table>
+
+    <!-- 批量下载进度面板：当前解包的文件名 + 不定进度条（tar 流条目数不可预知，用不定长进度）+ 停止下载 -->
+    <div v-if="downloading" class="upload-panel">
+      <div class="up-line">
+        <span class="up-name" :title="downloadName">{{ downloadName || '正在连接…' }}</span>
+        <span class="up-count">已 {{ downloadCount }}</span>
+      </div>
+      <el-progress :percentage="100" :indeterminate="true" :duration="2" :stroke-width="8" :show-text="false" />
+      <div class="up-foot">
+        <span class="up-pct">下载中…</span>
+        <el-button size="small" type="danger" plain @click="stopDownload">停止下载</el-button>
+      </div>
+    </div>
 
     <!-- 上传进度面板：当前文件 i/n + 文件名 + 进度条 + 百分比 + 停止上传 -->
     <div v-if="uploading" class="upload-panel">
