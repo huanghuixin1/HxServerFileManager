@@ -11,7 +11,7 @@
 
 ## 长期规则
 - 支持PC和手机端浏览（响应式布局，media query 单列切换）
-
+- 每次对话即将结束时，如果有前端代码的修改一定要编译一次
 ## 重要文件
 - `Program.cs`：全部后端逻辑（最小 API + 单文件类型定义）。**JSON body 绑定一律读 `ConnectionId`**（camelCase `connectionId`），前端 `api.js` 必须发 `connectionId` 字段，发 `connId` 会静默绑定为 null（历史教训，见已知问题）
 - `client/src/App.vue`：多连接标签页架构。`connections[]` 存所有活跃会话，`activeId` 当前标签；标签可关闭（确认后断开）；工作区用 `v-show` 按连接渲染，保证每会话的终端历史/文件浏览器状态独立
@@ -41,6 +41,7 @@
 - `connections.json` 明文存密码/私钥，仅限本地/内网
 
 ## 进度记录
+- 2026-08-16：交互终端剪贴板 —— ① **选中即复制**：xterm `onSelectionChange` 监听选区变化，非空即写入剪贴板（优先 `navigator.clipboard.writeText`，页面聚焦时免授权；失败退回隐藏 textarea + `document.execCommand('copy')`，兜底路径结束后 `xterm.focus()` 还焦点）。② **右键粘贴**：XTerm 选项 `rightClickSelectsWord: false`（右键不再选单词），在 `termHost` 上接管 `contextmenu` 事件（preventDefault + stopPropagation）→ `navigator.clipboard.readText()` 读剪贴板后发送；WebView2 的 ClipboardRead 权限只拦「无用户手势」读取，右键是用户手势可直接读；读取失败提示用 Ctrl+V。③ **回车执行确认**：粘贴内容以 `\r`/`\n` 结尾时弹自定义 el-dialog（textarea 可编辑）——「执行」发送（可能编辑过的）内容并补回车运行、「仅粘贴」去掉末尾换行只发送不执行、「取消」放弃；Ctrl+Enter 快捷执行，关窗后 `xterm.focus()` 恢复终端焦点。不改后端
 - 2026-08-16：服务器间直传（发送到连接，不经本机中转）—— 在两个已打开的连接之间直接传文件/文件夹：数据全程在两端服务器之间流动（源机执行 scp 直连目标机），本机只下发指令 + 轮询状态。① 后端 `POST /api/server-copy`（源/目标连接 id + 选中项绝对路径 + 目标目录）：校验两会话存在、源≠目标（host|port|username 相同拒绝）、路径绝对；目标目录不存在时用**目标机已有 SFTP 会话** `EnsureRemoteDir` 补建；`SshSession` 新增连接元数据（Host/Port/Username/Password/PrivateKey/Passphrase，ConnectInternal 填充）。② 作业模型 `ServerCopyJobs`：内存注册表 + 后台 `Task.Run`，逐项在**源机**执行 `scp -r -P <port> -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15`；目标认证：密码 → 源机有 sshpass 则 `sshpass -p` 喂密码，没有则先试免密（失败提示装 sshpass 或配密钥互信）；私钥 → base64 经 shell 写 /tmp 临时文件 + `scp -i`，结束即删（带口令私钥不支持，明确报错）；路径安全：源路径 `Shq`、远端路径 `EscapeScpRemote` 反斜杠转义后整体 Shq（scp 把 : 后路径交远端 shell 解析，两层转义防空格/特殊字符）；`GET /api/server-copy/{jobId}` 轮询每项 pending/running/done/failed + 总体 state；作业完成 1 小时后清理；`cmd.CommandTimeout` 2 小时防挂死。③ 前端：FileManager「操作」下拉加「发送到连接…」（无选中项或没有其他连接时禁用，带选中数量徽标）；App 弹对话框：单选目标连接（排除当前 tab + 按 host:port:username 去重，pending 占位 tab 不算）、目标目录输入（默认 = 源选中项所在目录，回车即发）；发送后 1.2s 轮询进度（el-progress + 每项状态图标/失败原因），完成时把目标连接的 FileManager `refreshToken` +1 触发其列表刷新
 - 2026-08-16：上传文件夹 + 拖拽上传 —— ① 文件列表支持**拖拽上传**（浏览器文件选择框无法同时选文件+文件夹，拖拽是唯一能混选的方式）：面板 `@dragenter/@dragover/@dragleave/@drop`，拖入时浮出「松开以上传文件 / 文件夹」遮罩（`.drop-overlay` z-index 4000，高于 upload-panel 的 3000）；`dataTransfer.items → webkitGetAsEntry()` 递归遍历（`collectEntries`）：`dirs` 收集全部目录相对路径（含空目录、父级在前）、`items` 收集文件（带 `relDir`）；`webkitGetAsEntry` 不可用时兜底退回 `dataTransfer.files`（文件夹丢失）。② 上传统一走 `runUploads(dirs, items)`：先 `POST /api/ensure-dirs` 批量建目录（已存在跳过、可重复执行），再逐文件上传（目标 = cwd/relDir，进度面板显示相对路径如 `myfolder/sub/file.txt`）；单文件大小预校验、停止上传与文件上传一致；上传中拖入会提示先完成/停止。③ 「上传文件夹」选择器入口移除（拖拽已覆盖），「操作」下拉只留一个「上传」（多选文件）。④ 后端：`EnsureRemoteDir(s, dir)` 递归补建缺失层级（逐段 `Sftp.Exists` + `CreateDirectory`，幂等跳过）+ `POST /api/ensure-dirs`（批量）；`/api/mkdir` 保持原语义
 - 2026-08-16：双击打开文件提速 —— 根因：`/api/file-content` 用 JSON 返回，System.Text.Json 默认把所有非 ASCII（中文等）转义成 `\uXXXX`，大文本膨胀 3-6 倍且服务端转义 + 浏览器 JSON.parse 都极耗 CPU，且整文件读进内存后才返回（首字节迟迟不到；终端 cat 走已开 PTY 的 SSE 推流，首字节 ~1 RTT）。修复：① 改为**原始字节流返回**（`Results.Stream` + 传 fileLength 带 Content-Length），不再 JSON 包裹；② 二进制检查改为**开头 64KB NUL 嗅探**（真实二进制头部必有 NUL），通过后流式下发；③ 前端 `api.getFileContent` 改 fetch 流式读取（`onProgress({loaded,total,percent,chunk})` 回调），EditorModal 边收边显示 + 顶部进度条（chunk 攒在 pendingParts，~120ms 节流刷一次，结束后以完整内容为准）

@@ -106,6 +106,10 @@ const lines = ref([])
 const busy = ref(false)
 const inputRef = ref(null)
 
+// 粘贴执行确认：右键粘贴的内容以换行结尾时弹窗，可编辑后决定是否执行
+const pasteDraftVisible = ref(false)
+const pasteDraft = ref('')
+
 // ---- 快捷命令（exec）----
 function push(type, text) {
   String(text ?? '').split('\n').forEach((l) => lines.value.push({ type, text: l }))
@@ -244,12 +248,20 @@ async function openInteractive() {
         fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
         theme: { background: '#0f1620', foreground: '#d6e2ef', cursor: '#7fd1ff' },
         scrollback: 2000,
+        rightClickSelectsWord: false, // 右键留给粘贴用，不选中单词
       })
       xterm.loadAddon(fitAddon)
       xterm.open(termHost.value)
       xterm.onData((data) => {
         sendInput(data)
       })
+      // 选中即复制：选区变化时自动写入剪贴板，不用手动 Ctrl+C
+      xterm.onSelectionChange(() => {
+        const sel = xterm.getSelection()
+        if (sel) copyToClipboard(sel)
+      })
+      // 右键粘贴：接管 contextmenu，从剪贴板读取内容后发送
+      termHost.value.addEventListener('contextmenu', onTermContextMenu)
       xterm.writeln('--- 交互终端已连接（可直接输入；Ctrl+C 中断，exit 退出） ---')
     }
     try { fitAddon.fit() } catch (_) { /* 容器无尺寸时保持默认 80x24 */ }
@@ -304,6 +316,80 @@ function sendInput(data) {
   }
 }
 
+// ---- 剪贴板：选中即复制 + 右键粘贴（带回车执行确认）----
+// 复制到剪贴板：优先 Clipboard API（页面聚焦时无需授权），失败退回隐藏 textarea + execCommand
+async function copyToClipboard(text) {
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch (_) { /* 权限/上下文不允许，走下面兜底 */ }
+  }
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.setAttribute('readonly', '')
+  ta.style.position = 'fixed'
+  ta.style.top = '-9999px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  ta.setSelectionRange(0, text.length)
+  try { document.execCommand('copy') } catch (_) {}
+  document.body.removeChild(ta)
+  xterm?.focus() // 兜底路径短暂移走了焦点，还给终端
+}
+
+// 处理待粘贴内容：末尾是换行时弹窗询问是否执行（内容可编辑）
+function handlePasteText(text) {
+  if (!text) return
+  if (/[\r\n]$/.test(text)) {
+    pasteDraft.value = text
+    pasteDraftVisible.value = true
+  } else {
+    sendInput(text)
+  }
+}
+
+// 读取剪贴板并发送（右键触发；右键是用户手势，Clipboard API 可直接读）
+async function pasteFromClipboard() {
+  let text = ''
+  if (navigator.clipboard?.readText) {
+    try { text = await navigator.clipboard.readText() } catch (_) { text = '' }
+  }
+  if (!text) {
+    ElMessage.warning('剪贴板为空或无权读取，请用 Ctrl+V 粘贴')
+    return
+  }
+  handlePasteText(text)
+  xterm?.focus()
+}
+
+// 右键事件：阻止浏览器菜单，改为粘贴
+function onTermContextMenu(e) {
+  if (!xterm) return
+  e.preventDefault()
+  e.stopPropagation()
+  pasteFromClipboard()
+}
+
+// 弹窗「执行」：发送（可能被编辑过的）内容，末尾补回车让 shell 执行
+function doPasteExecute() {
+  const t = pasteDraft.value
+  pasteDraftVisible.value = false
+  if (!t) return
+  sendInput(/[\r\n]$/.test(t) ? t : t + '\r')
+  xterm?.focus()
+}
+
+// 弹窗「仅粘贴」：去掉末尾换行后发送，不触发执行
+function doPastePlain() {
+  const t = pasteDraft.value
+  pasteDraftVisible.value = false
+  if (!t) return
+  sendInput(t.replace(/[\r\n]+$/, ''))
+  xterm?.focus()
+}
+
 // 在终端里写一条醒目的断开提示（带 ANSI 配色 + 闪烁，尽量显眼）
 function writeDisconnectedBanner() {
   if (!xterm) return
@@ -328,6 +414,7 @@ function closeInteractive() {
   manualClose = true // 主动关闭（切 exec 模式 / 卸载），不触发断开提示
   if (ws) { try { ws.close() } catch (_) {} ws = null }
   if (xterm) { try { xterm.dispose() } catch (_) {} xterm = null }
+  if (termHost.value) termHost.value.removeEventListener('contextmenu', onTermContextMenu)
   fitAddon = null
 }
 
@@ -487,6 +574,29 @@ onUnmounted(() => {
         <el-button type="primary" @click="saveMacroForm">保存</el-button>
       </template>
     </el-dialog>
+
+    <!-- 粘贴执行确认：右键粘贴的内容以换行结尾时弹窗，可编辑后决定是否执行 -->
+    <el-dialog
+      v-model="pasteDraftVisible"
+      title="粘贴内容以回车结尾，是否执行？"
+      width="600px"
+      :close-on-click-modal="false"
+      @closed="xterm?.focus()"
+    >
+      <p class="paste-tip">可修改下面内容：<b>执行</b> 发送到终端并回车运行；<b>仅粘贴</b> 只粘贴不执行（去掉末尾回车）。</p>
+      <el-input
+        v-model="pasteDraft"
+        type="textarea"
+        :rows="8"
+        placeholder="要发送到终端的内容"
+        @keydown.ctrl.enter.prevent="doPasteExecute"
+      />
+      <template #footer>
+        <el-button @click="pasteDraftVisible = false">取消</el-button>
+        <el-button @click="doPastePlain">仅粘贴</el-button>
+        <el-button type="primary" @click="doPasteExecute">执行</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -610,6 +720,12 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: middle;
+}
+.paste-tip {
+  margin: 0 0 10px;
+  color: #56606c;
+  font-size: 13px;
+  line-height: 1.6;
 }
 .xterm-wrap {
   flex: 1;
