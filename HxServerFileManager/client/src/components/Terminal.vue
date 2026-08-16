@@ -616,7 +616,7 @@ onUnmounted(() => {
   min-height: 0;
   background: #0f1620;
   border-radius: 10px;
-  padding: 8px;
+  padding: 8px 8px 16px; /* 底部多留白，终端滚动到底时最后一行不贴边 */
   overflow: hidden;
 }
 .xterm-wrap :deep(.xterm) {
