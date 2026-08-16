@@ -81,8 +81,8 @@ public static partial class WebHost
             ContentRootPath = contentRoot,
         });
 
-        // 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 5101）
-        var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 5101;
+        // 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 15511）
+        var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 15511;
         builder.WebHost.UseKestrel(kestrel =>
         {
             kestrel.ListenAnyIP(listenPort);
@@ -99,6 +99,28 @@ public static partial class WebHost
         builder.Services.AddSingleton(new SettingsStore(dataDir));
 
         var app = builder.Build();
+
+// ----------------------------------------------------------------------------
+// 全局停机令牌：收到停止信号（Ctrl+C / SIGTERM / 桌面壳关窗）时统一收尾。
+//
+// 背景：/api/logs/stream、/api/terminal/stream、/api/terminal/ws 都是"永不自行结束"的长连接
+// （SSE 一直推、WebSocket 一直等输入）。Kestrel 优雅停机时对这类进行中的请求只能干等
+// HostOptions.ShutdownTimeout（默认 30s）超时强杀 —— 表现就是"收到停止信号但进程半天不退"，
+// docker stop 默认 10s 后还会直接 SIGKILL。因此必须在停机开始时主动取消这些循环。
+//
+// shutdownCts 必须在路由注册之前创建（后面的路由 lambda 要引用它）。停机时：
+//   1) shutdownCts.Cancel() —— 三个长连接端点都把该令牌链进各自的取消源，循环立即结束；
+//   2) 后台关闭全部 SSH 会话（DisposeShell 让终端输出 channel 完成，读它的循环一并收尾；
+//      SSH/SFTP 断开则清掉 keepalive 等后台占用）。放后台执行，避免 SSH.NET 断开阻塞停机。
+// ----------------------------------------------------------------------------
+var shutdownCts = new CancellationTokenSource();
+var mgr = app.Services.GetRequiredService<ConnectionManager>();
+app.Lifetime.ApplicationStopping.Register(() =>
+{
+    shutdownCts.Cancel();
+    _ = Task.Run(() => mgr.DisposeAll());
+});
+_ = Task.Run(() => mgr.CleanupLoop(shutdownCts.Token));
 
 // 启用 WebSocket 支持（交互终端 /api/terminal/ws 依赖）
 app.UseWebSockets();
@@ -584,22 +606,25 @@ app.MapGet("/api/terminal/stream", async (string connId, HttpContext ctx, Connec
     ctx.Response.Headers.Append("Connection", "keep-alive");
     ctx.Response.Headers.Append("X-Accel-Buffering", "no");
 
+    // 客户端断开或服务停机（shutdownCts）都会取消本循环，否则停机会被这个长连接拖住
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, shutdownCts.Token);
+
     string tail;
     lock (s.ShellTail) tail = s.ShellTail.ToString();
     if (tail.Length > 0)
-        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "out", data = tail })}\n\n", ctx.RequestAborted);
+        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "out", data = tail })}\n\n", cts.Token);
     await ctx.Response.Body.FlushAsync();
 
     try
     {
-        await foreach (var chunk in ch.Reader.ReadAllAsync(ctx.RequestAborted))
+        await foreach (var chunk in ch.Reader.ReadAllAsync(cts.Token))
         {
             var data = Encoding.UTF8.GetString(chunk);
-            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "out", data })}\n\n", ctx.RequestAborted);
+            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(new { type = "out", data })}\n\n", cts.Token);
             await ctx.Response.Body.FlushAsync();
         }
     }
-    catch (OperationCanceledException) { /* 客户端断开 */ }
+    catch (OperationCanceledException) { /* 客户端断开 / 服务停机 */ }
     // 响应已开始，不能返回 Results.Ok()（会因重复设置状态码抛异常）；Empty 不触碰状态码
     return Results.Empty;
 });
@@ -633,9 +658,9 @@ app.MapGet("/api/terminal/ws", async (string connId, HttpContext ctx, Connection
         return Results.Empty;
     }
 
-    // shell 侧结束（SSH 断开/对端关闭）时用它取消入站读取循环，
-    // 否则主循环会一直阻塞在 ReceiveAsync 上，ws 不关，前端也就收不到断开信号。
-    using var linked = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted);
+    // shell 侧结束（SSH 断开/对端关闭）或服务停机（shutdownCts）时用它取消入站读取循环，
+    // 否则主循环会一直阻塞在 ReceiveAsync 上，ws 不关，停机也会被这个请求拖住。
+    using var linked = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, shutdownCts.Token);
 
     // 输出转发任务：shell 输出 channel → WebSocket
     var pump = Task.Run(async () =>
@@ -779,20 +804,23 @@ app.MapGet("/api/logs/stream", async (HttpContext ctx, OperationLogger log) =>
     ctx.Response.Headers.Append("Connection", "keep-alive");
     ctx.Response.Headers.Append("X-Accel-Buffering", "no");
 
+    // 客户端断开或服务停机（shutdownCts）都会取消本循环，否则停机会被这个长连接拖住
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, shutdownCts.Token);
+
     // 先回放最近若干条，避免新客户端看不到历史
     foreach (var e in log.Recent)
-        await WriteLogEvent(ctx, e);
+        await WriteLogEvent(ctx, e, cts.Token);
     await ctx.Response.Body.FlushAsync();
 
     try
     {
-        await foreach (var e in log.Stream.WithCancellation(ctx.RequestAborted))
+        await foreach (var e in log.Stream.WithCancellation(cts.Token))
         {
-            await WriteLogEvent(ctx, e);
+            await WriteLogEvent(ctx, e, cts.Token);
             await ctx.Response.Body.FlushAsync();
         }
     }
-    catch (OperationCanceledException) { /* 客户端断开 */ }
+    catch (OperationCanceledException) { /* 客户端断开 / 服务停机 */ }
 });
 
 // 健康检查
@@ -834,12 +862,6 @@ app.MapGet("/api/system-status", (string connId, ConnectionManager mgr) =>
     }
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
-
-// ---- 空闲会话回收 ----
-var mgr = app.Services.GetRequiredService<ConnectionManager>();
-var cts = new CancellationTokenSource();
-app.Lifetime.ApplicationStopping.Register(() => cts.Cancel());
-_ = Task.Run(() => mgr.CleanupLoop(cts.Token));
 
 Console.WriteLine($"[HxServerFileManager] Kestrel 已启动，监听 http://0.0.0.0:{listenPort}");
 Console.WriteLine("[HxServerFileManager] 按 Ctrl+C 停止服务");
@@ -1029,10 +1051,10 @@ public static partial class WebHost
         CreatedAt: DateTime.Now,
         LastConnectedAt: DateTime.Now);
 
-    internal static async Task WriteLogEvent(HttpContext ctx, LogEntry e)
+    internal static async Task WriteLogEvent(HttpContext ctx, LogEntry e, CancellationToken ct)
     {
         var json = JsonSerializer.Serialize(e);
-        await ctx.Response.WriteAsync($"data: {json}\n\n", ctx.RequestAborted);
+        await ctx.Response.WriteAsync($"data: {json}\n\n", ct);
     }
 }
 
@@ -1232,6 +1254,15 @@ public sealed class ConnectionManager
     {
         if (string.IsNullOrWhiteSpace(id)) return;
         if (_sessions.TryRemove(id, out var s)) s.Dispose();
+    }
+
+    /// <summary>停机时关闭全部会话（断开 SSH/SFTP，Shell 输出 channel 完成，终端长连接随之收尾）。</summary>
+    public void DisposeAll()
+    {
+        foreach (var kvp in _sessions)
+        {
+            if (_sessions.TryRemove(kvp.Key, out var s)) s.Dispose();
+        }
     }
 
     /// <summary>列出所有活跃会话的存活状态（供前端轮询，发现断开后提示并可重连）。</summary>
