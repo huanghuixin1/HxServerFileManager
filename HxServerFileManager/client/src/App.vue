@@ -23,6 +23,19 @@ const connectVisible = ref(false)
 const logEnabled = ref(false) // 实时操作日志默认隐藏，顶部按钮可随时开关
 const editor = ref({ open: false, connId: null, path: null })
 
+// ---- 服务器间直传（发送到连接）：选目标连接 + 目标目录 + 进度轮询 ----
+const serverCopyVisible = ref(false)
+const scpPhase = ref('pick') // pick | copying | done | error
+const scpSourceLabel = ref('')
+const scpItems = ref([])
+const scpTargetConnId = ref(null)
+const scpTargetDir = ref('')
+const scpJob = ref(null)
+let scpJobId = null
+let scpTimer = null
+// 直传完成后给目标连接的 FileManager 发刷新信号（值 +1 即触发 reload）
+const refreshTokens = reactive({})
+
 // 已保存连接（来自后端 connections.json）：下拉快速打开 + 管理/编辑
 const savedList = ref([])
 const savedReload = ref(0)
@@ -33,6 +46,21 @@ const editVisible = ref(false)
 const activeConn = computed(
   () => connections.value.find((c) => c.connectionId === activeId.value) || null
 )
+
+// 可发送的目标连接：排除当前 tab 与连接中的占位 tab，按 host:port:username 去重
+const serverCopyTargets = computed(() => {
+  const cur = activeConn.value
+  if (!cur) return []
+  const seen = new Set()
+  return connections.value.filter((c) => {
+    if (c.pending || c.connectionId === cur.connectionId) return false
+    const key = `${c.host}:${c.port}:${c.username}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+})
+const hasOtherConns = computed(() => serverCopyTargets.value.length > 0)
 
 // 窄屏（单列布局）时分隔条是横向的，拖拽调高度
 const isNarrow = ref(window.matchMedia('(max-width: 1000px)').matches)
@@ -262,6 +290,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (healthTimer) clearInterval(healthTimer)
   window.removeEventListener('keydown', onGlobalKeydown)
+  stopScpPolling()
 })
 
 // 把当前活跃会话（profileId + 路径）写入 localStorage（防抖）
@@ -503,6 +532,91 @@ function openEditor(connId, path) {
 function closeEditor() {
   editor.value = { open: false, connId: null, path: null }
 }
+
+// ---- 服务器间直传（发送到连接）----
+function parentDirOf(p) {
+  p = (p || '/').replace(/\/+$/, '')
+  if (p === '' || p === '/') return '/'
+  const i = p.lastIndexOf('/')
+  return i <= 0 ? '/' : p.slice(0, i)
+}
+
+// FileManager 发来选中项路径：打开「选择目标连接」对话框，默认目标目录 = 选中项所在目录
+function onSendToConnection(paths) {
+  const cur = activeConn.value
+  if (!cur || !paths || !paths.length) return
+  scpSourceLabel.value = cur.name || `${cur.username}@${cur.host}:${cur.port}`
+  scpItems.value = paths
+  scpTargetConnId.value = null
+  scpTargetDir.value = parentDirOf(paths[0])
+  scpJob.value = null
+  scpPhase.value = 'pick'
+  serverCopyVisible.value = true
+}
+
+function stopScpPolling() {
+  if (scpTimer) {
+    clearInterval(scpTimer)
+    scpTimer = null
+  }
+}
+
+function resetServerCopy() {
+  stopScpPolling()
+  scpJobId = null
+}
+
+async function startServerCopy() {
+  const cur = activeConn.value
+  if (!cur || !scpTargetConnId.value) return
+  const targetDir = scpTargetDir.value.trim()
+  if (!targetDir.startsWith('/')) {
+    ElMessage.warning('目标目录必须是绝对路径（以 / 开头）')
+    return
+  }
+  scpPhase.value = 'copying'
+  scpJob.value = null
+  try {
+    const res = await api.serverCopy({
+      sourceConnId: cur.connectionId,
+      targetConnId: scpTargetConnId.value,
+      items: scpItems.value,
+      targetDir,
+    })
+    scpJobId = res.jobId
+    scpTimer = setInterval(pollServerCopy, 1200)
+    pollServerCopy() // 立即查一次
+  } catch (e) {
+    scpPhase.value = 'error'
+    scpJob.value = { state: 'failed', error: e.message, items: [], done: 0, total: scpItems.value.length }
+    ElMessage.error(e.message)
+  }
+}
+
+async function pollServerCopy() {
+  if (!scpJobId) return
+  try {
+    const st = await api.serverCopyStatus(scpJobId)
+    scpJob.value = st
+    if (st.state === 'done') {
+      stopScpPolling()
+      scpPhase.value = 'done'
+      // 目标 tab 在应用里打开着：通知它的文件列表刷新
+      const tid = scpTargetConnId.value
+      if (tid) refreshTokens[tid] = (refreshTokens[tid] || 0) + 1
+      ElMessage.success(`已发送 ${st.done}/${st.total} 项到 ${st.target}:${st.targetDir}`)
+    } else if (st.state === 'failed') {
+      stopScpPolling()
+      scpPhase.value = 'error'
+      ElMessage.error(`发送失败：${st.error || '未知错误'}`)
+    }
+  } catch (e) {
+    // 任务可能已过期（长时间没轮询）或后端不可达
+    stopScpPolling()
+    scpPhase.value = 'error'
+    ElMessage.error(e.message)
+  }
+}
 </script>
 
 <template>
@@ -647,9 +761,12 @@ function closeEditor() {
               :initial-dir="c.homeDirectory"
               :sync-cwd="syncCwd"
               :external-path="syncCwd ? cwdMap[c.connectionId] : null"
+              :has-other-conns="hasOtherConns"
+              :refresh-token="refreshTokens[c.connectionId] || 0"
               @open-file="(p) => openEditor(c.connectionId, p)"
               @navigate="(p) => onNavigate(c.connectionId, p)"
               @update:sync-cwd="(v) => (syncCwd = v)"
+              @send-to-connection="onSendToConnection"
             />
           </template>
         </div>
@@ -716,6 +833,93 @@ function closeEditor() {
       :path="editor.path"
       @close="closeEditor"
     />
+
+    <!-- 服务器间直传：选择目标连接 + 目标目录 + 传输进度（不经本机中转） -->
+    <el-dialog
+      v-model="serverCopyVisible"
+      :title="scpPhase === 'pick' ? '发送到连接' : '发送进度'"
+      width="min(560px, 94vw)"
+      :close-on-click-modal="false"
+      @closed="resetServerCopy"
+    >
+      <div v-if="scpPhase === 'pick'" class="scp-pick">
+        <div class="scp-line">
+          源：<b>{{ scpSourceLabel }}</b>，已选 {{ scpItems.length }} 项
+        </div>
+        <div class="scp-label">选择目标连接（{{ serverCopyTargets.length }} 个可用）</div>
+        <el-radio-group v-model="scpTargetConnId" class="scp-radios">
+          <el-radio
+            v-for="t in serverCopyTargets"
+            :key="t.connectionId"
+            :value="t.connectionId"
+            class="scp-radio"
+          >
+            <span class="scp-radio-name">{{ t.name || `${t.username}@${t.host}:${t.port}` }}</span>
+            <span class="scp-radio-sub">{{ t.username }}@{{ t.host }}:{{ t.port }}</span>
+          </el-radio>
+        </el-radio-group>
+        <div v-if="!serverCopyTargets.length" class="scp-none">
+          没有其他活跃连接，请先再打开一个连接
+        </div>
+        <div class="scp-label">目标目录（在目标服务器上）</div>
+        <el-input
+          v-model="scpTargetDir"
+          placeholder="/绝对路径，默认与源选中项所在目录相同"
+          @keyup.enter="startServerCopy"
+        />
+      </div>
+
+      <div v-else class="scp-progress">
+        <div class="scp-line">
+          {{ scpJob && scpJob.state === 'failed' ? '发送失败' : `正在发送 ${scpJob ? scpJob.done : 0}/${scpJob ? scpJob.total : 0}` }}
+        </div>
+        <el-progress
+          v-if="scpJob && scpJob.total"
+          :percentage="Math.round(((scpJob.done || 0) / scpJob.total) * 100)"
+          :stroke-width="10"
+          :status="scpJob.state === 'failed' ? 'exception' : scpJob.state === 'done' ? 'success' : undefined"
+        />
+        <div class="scp-items">
+          <div
+            v-for="it in (scpJob ? scpJob.items : [])"
+            :key="it.path"
+            class="scp-item"
+            :class="it.state"
+          >
+            <el-icon class="scp-ico">
+              <SuccessFilled v-if="it.state === 'done'" />
+              <Loading v-else-if="it.state === 'running'" class="is-loading" />
+              <CircleCloseFilled v-else-if="it.state === 'failed'" />
+              <Clock v-else />
+            </el-icon>
+            <span class="scp-item-path" :title="it.path">{{ it.path }}</span>
+            <span v-if="it.state === 'failed' && it.message" class="scp-item-msg">{{ it.message }}</span>
+          </div>
+        </div>
+        <el-alert
+          v-if="scpJob && scpJob.error"
+          :title="scpJob.error"
+          type="error"
+          :closable="false"
+          show-icon
+          class="scp-alert"
+        />
+      </div>
+
+      <template #footer>
+        <el-button @click="serverCopyVisible = false">
+          {{ scpPhase === 'copying' ? '后台运行' : '关闭' }}
+        </el-button>
+        <el-button
+          v-if="scpPhase === 'pick'"
+          type="primary"
+          :disabled="!scpTargetConnId"
+          @click="startServerCopy"
+        >
+          开始发送
+        </el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -1003,5 +1207,120 @@ function closeEditor() {
 .slide-down-leave-to {
   opacity: 0;
   transform: translateX(-50%) translateY(-12px);
+}
+
+/* ---- 服务器间直传对话框 ---- */
+.scp-pick {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.scp-line {
+  font-size: 13.5px;
+  color: #2a3542;
+}
+.scp-line b {
+  color: #1f2d3d;
+}
+.scp-label {
+  font-size: 13px;
+  color: #5b6b7b;
+  margin-top: 8px;
+}
+.scp-radios {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+.scp-radio {
+  height: auto;
+  margin-right: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  transition: border-color 0.15s;
+}
+.scp-radio:hover {
+  border-color: #b9cbe8;
+}
+.scp-radio.is-active {
+  border-color: #2d6cdf;
+}
+.scp-radio .el-radio__label {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 8px;
+}
+.scp-radio-name {
+  font-size: 13.5px;
+  font-weight: 600;
+  color: #2a3542;
+}
+.scp-radio-sub {
+  font-size: 12px;
+  color: #8a97a5;
+}
+.scp-none {
+  font-size: 13px;
+  color: #c0392b;
+  padding: 6px 0;
+}
+.scp-progress .el-progress {
+  margin-top: 4px;
+}
+.scp-items {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow: auto;
+  margin-top: 12px;
+}
+.scp-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  font-size: 13px;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.scp-item .scp-ico {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: #b6c0cc;
+}
+.scp-item.done .scp-ico {
+  color: #2ecc71;
+}
+.scp-item.running .scp-ico {
+  color: #2d6cdf;
+}
+.scp-item.failed {
+  background: #fdecec;
+}
+.scp-item.failed .scp-ico {
+  color: #c0392b;
+}
+.scp-item-path {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, monospace;
+  color: #2a3542;
+}
+.scp-item-msg {
+  color: #c0392b;
+  font-size: 12px;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scp-alert {
+  margin-top: 12px;
 }
 </style>

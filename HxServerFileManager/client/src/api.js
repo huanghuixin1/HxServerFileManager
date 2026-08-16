@@ -258,6 +258,16 @@ export const api = {
       body: JSON.stringify({ connectionId: connId, command }),
     }),
 
+  // 服务器间直传（不经本机中转）：在源服务器上 scp 到目标服务器，返回 { jobId, total }
+  serverCopy: (payload) =>
+    request('/api/server-copy', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  // 直传进度：{ id, total, done, state, error, source, target, targetDir, items }
+  serverCopyStatus: (jobId) => request(`/api/server-copy/${encodeURIComponent(jobId)}`),
+
   setCwd: (connId, path) =>
     request('/api/cwd', {
       method: 'POST',

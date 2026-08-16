@@ -131,8 +131,10 @@ const props = defineProps({
   initialDir: { type: String, default: '/' },
   syncCwd: { type: Boolean, default: true },
   externalPath: { type: String, default: null }, // 终端推送的目录（syncCwd 开启时跟随）
+  hasOtherConns: { type: Boolean, default: false }, // 是否存在其他活跃连接（决定「发送到连接」是否可用）
+  refreshToken: { type: Number, default: 0 }, // App 在服务器间直传完成后 +1，触发本列表重新加载
 })
-const emit = defineEmits(['open-file', 'navigate', 'update:sync-cwd'])
+const emit = defineEmits(['open-file', 'navigate', 'update:sync-cwd', 'send-to-connection'])
 
 const cwd = ref(props.initialDir || '/')
 const items = ref([])
@@ -245,11 +247,13 @@ function onRowClick(row, _col, event) {
   }
 }
 
-// 「操作」下拉：新建目录 / 上传 / 批量删除
+// 「操作」下拉：新建目录 / 上传 / 发送到连接 / 批量删除
 function onToolCommand(cmd) {
   if (cmd === 'mkdir') newDirVisible.value = true
   else if (cmd === 'upload') triggerUpload()
-  else if (cmd === 'delete') batchDelete()
+  else if (cmd === 'send') {
+    emit('send-to-connection', selectedItems.value.map((i) => i.fullPath))
+  } else if (cmd === 'delete') batchDelete()
 }
 
 // 当前选中项（来自当前目录列表）
@@ -340,6 +344,14 @@ onMounted(() => {
     .catch(() => {})
 })
 watch(() => props.connId, () => load(props.initialDir))
+
+// 服务器间直传完成后，App 把目标连接对应的 refreshToken +1，这里收到后重新加载列表
+watch(
+  () => props.refreshToken,
+  (v) => {
+    if (v > 0) load()
+  }
+)
 
 // 用户主动导航：跳目录并通知 App 同步会话 cwd（终端提示符/下一条命令跟随）
 function goPath(p) {
@@ -691,6 +703,14 @@ function fmtDate(s) {
               <el-dropdown-item command="upload" :disabled="uploading">
                 <el-icon style="margin-right: 6px"><Upload /></el-icon>{{ uploading ? '上传中…' : '上传' }}
               </el-dropdown-item>
+              <el-dropdown-item
+                command="send"
+                :disabled="selectedItems.length === 0 || !hasOtherConns"
+                :title="!hasOtherConns ? '需要同时打开至少两个连接' : ''"
+              >
+                <el-icon style="margin-right: 6px"><Share /></el-icon>发送到连接…
+                <span v-if="selectedItems.length" class="dd-count">{{ selectedItems.length }}</span>
+              </el-dropdown-item>
               <el-dropdown-item command="delete" :disabled="selectedItems.length === 0" divided>
                 <el-icon style="margin-right: 6px"><Delete /></el-icon>删除{{ selectedItems.length ? `（${selectedItems.length}）` : '' }}
               </el-dropdown-item>
@@ -950,6 +970,11 @@ function fmtDate(s) {
 .sync-cb {
   margin-right: 4px;
   white-space: nowrap;
+}
+.dd-count {
+  margin-left: auto;
+  font-size: 12px;
+  color: #8a97a5;
 }
 .fav-name {
   max-width: 120px;

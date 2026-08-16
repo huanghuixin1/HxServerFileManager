@@ -13,6 +13,7 @@ using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading.Channels;
 
 // ----------------------------------------------------------------------------
@@ -625,6 +626,67 @@ app.MapPost("/api/command", (CommandRequest req, ConnectionManager mgr, Operatio
 });
 
 // ----------------------------------------------------------------------------
+// 服务器间直传（不经本机中转）：在源服务器上执行 scp 把选中项复制到目标服务器。
+// 数据路径 A -> B 全程在两端服务器之间流动；本机只下发指令并轮询每项状态。
+// ----------------------------------------------------------------------------
+
+// 发起直传：返回 jobId，前端轮询 /api/server-copy/{jobId} 查看进度。
+// 目标目录不存在时先用目标机已有 SFTP 会话补建（免去在源机上拼 mkdir 命令）。
+app.MapPost("/api/server-copy", (ServerCopyRequest req, ConnectionManager mgr, OperationLogger log) =>
+{
+    try
+    {
+        var src = mgr.Get(req.SourceConnId);
+        var dst = mgr.Get(req.TargetConnId);
+        if (req.Items is not { Length: > 0 })
+            return Results.BadRequest(new { error = "请先选中要发送的文件或文件夹" });
+        foreach (var p in req.Items)
+            if (string.IsNullOrWhiteSpace(p) || !p.StartsWith('/'))
+                return Results.BadRequest(new { error = $"源路径必须是绝对路径：{p}" });
+        if (string.IsNullOrWhiteSpace(req.TargetDir) || !req.TargetDir.TrimStart().StartsWith('/'))
+            return Results.BadRequest(new { error = "目标目录必须是绝对路径（以 / 开头）" });
+
+        // 同一台服务器（host|port|username 相同）直接拒绝：服务器间直传才有意义
+        if (string.Equals(src.Host, dst.Host, StringComparison.OrdinalIgnoreCase)
+            && src.Port == dst.Port
+            && string.Equals(src.Username, dst.Username, StringComparison.Ordinal))
+            return Results.BadRequest(new { error = "目标连接与源是同一台服务器，请直接复制/重命名" });
+
+        var targetDir = req.TargetDir.TrimEnd('/');
+        if (targetDir.Length == 0) targetDir = "/";
+        try { EnsureRemoteDir(dst, targetDir); }
+        catch (Exception ex) { return Results.BadRequest(new { error = $"创建目标目录失败：{ex.Message}" }); }
+
+        var srcLabel = $"{src.Username}@{src.Host}:{src.Port}";
+        var dstLabel = $"{dst.Username}@{dst.Host}:{dst.Port}";
+        var job = ServerCopyJobs.Add(new ServerCopyJob(srcLabel, dstLabel, req.Items, targetDir));
+        ServerCopyJobs.Start(job, src, dst, log);
+        log.Log("info", srcLabel, "服务器直传", $"{req.Items.Length} 项 -> {dstLabel}:{targetDir}", "已启动");
+        return Results.Ok(new { jobId = job.Id, total = job.Total });
+    }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+});
+
+// 直传进度：每项状态（pending/running/done/failed）+ 总体 state
+app.MapGet("/api/server-copy/{jobId}", (string jobId) =>
+{
+    var job = ServerCopyJobs.Get(jobId);
+    if (job is null) return Results.NotFound(new { error = "任务不存在或已过期" });
+    return Results.Ok(new
+    {
+        id = job.Id,
+        total = job.Total,
+        done = job.Done,
+        state = job.State,
+        error = job.Error,
+        source = job.SourceLabel,
+        target = job.TargetLabel,
+        targetDir = job.TargetDir,
+        items = job.ItemStates
+    });
+});
+
+// ----------------------------------------------------------------------------
 // 交互终端（带 pty 的 SSH shell）：可运行 nano/vim/top 及需要读输入的脚本。
 // 输出经 SSE 流式推送，输入通过 POST 写回 stdin。
 // ----------------------------------------------------------------------------
@@ -956,6 +1018,21 @@ public static partial class WebHost
     // 单引号转义，用于安全地把路径拼进 sh 命令
     internal static string Shq(string s) => "'" + s.Replace("'", "'\\''") + "'";
 
+    // scp 把 user@host: 之后的路径交给远端 shell 解析：对非安全字符逐个反斜杠转义（空格/引号/$ 等），
+    // 拼接成 user@host:path 后整体再 Shq 一层供源机本地 shell 展开，两层处理保证特殊字符路径也能工作。
+    internal static string EscapeScpRemote(string path)
+    {
+        var sb = new StringBuilder(path.Length + 8);
+        foreach (var ch in path)
+        {
+            if (char.IsLetterOrDigit(ch) || ch is '/' or '.' or '-' or '_' or '~')
+                sb.Append(ch);
+            else
+                sb.Append('\\').Append(ch);
+        }
+        return sb.ToString();
+    }
+
     // ----------------------------------------------------------------------------
     // 鉴权辅助（HxSimpleWebAuth）
     // ----------------------------------------------------------------------------
@@ -1115,7 +1192,15 @@ public static partial class WebHost
             string home = "/";
             try { home = sftp.WorkingDirectory; } catch { /* ignore */ }
 
-            var session = new SshSession(ssh, sftp, home);
+            var session = new SshSession(ssh, sftp, home)
+            {
+                Host = req.Host,
+                Port = port,
+                Username = req.Username,
+                Password = req.Password,
+                PrivateKey = req.PrivateKey,
+                Passphrase = req.Passphrase,
+            };
             // SSH 层异常（对端主动断开 / 网络中断 / 心跳超时）时标记会话失活并关闭 shell，
             // 让正在读 shell 输出的终端 WebSocket 能尽快结束、前端显示「连接已断开」提示。
             ssh.ErrorOccurred += (_, _) =>
@@ -1192,6 +1277,8 @@ public record PathRequest(string ConnectionId, string Path, string Name);
 public record EnsureDirsRequest(string ConnectionId, string Path, string[]? Dirs);
 public record RenameRequest(string ConnectionId, string Path, string Name, string NewPath);
 public record CommandRequest(string ConnectionId, string Command);
+public record ServerCopyRequest(string SourceConnId, string TargetConnId, string[]? Items, string TargetDir);
+public record ServerCopyItemState(string Path, string State, string? Message);
 public record FileContentRequest(string ConnectionId, string Path, string Content);
 public record CwdRequest(string ConnectionId, string Path);
 public record TerminalOpenRequest(string ConnectionId, int? Cols, int? Rows);
@@ -1220,6 +1307,14 @@ public sealed class SshSession : IDisposable
 
     /// <summary>当前工作目录：命令包装 + 文件列表联动共用的会话级状态。</summary>
     public string Cwd { get; set; }
+
+    // ---- 连接元数据（服务器间直传 / 日志标签用；凭据仅在内存，与 ConnectionsStore 一致）----
+    public string Host { get; set; } = "";
+    public int Port { get; set; } = 22;
+    public string Username { get; set; } = "";
+    public string? Password { get; set; }
+    public string? PrivateKey { get; set; }
+    public string? Passphrase { get; set; }
 
     // ---- 交互终端（ShellStream + pty）----
     public object ShellLock { get; } = new();
@@ -1399,6 +1494,222 @@ public sealed class ConnectionManager
             }
         }
         catch (OperationCanceledException) { /* 退出 */ }
+    }
+}
+
+/// <summary>
+/// 服务器间直传任务：在源服务器上执行 scp 把选中项复制到目标服务器，数据全程在两端服务器之间
+/// 流动（A -> B），本机只下发指令、轮询每项状态，不做任何字节中转。
+/// </summary>
+public sealed class ServerCopyJob
+{
+    public string Id { get; } = Guid.NewGuid().ToString("N");
+    public string SourceLabel { get; }
+    public string TargetLabel { get; }
+    public string[] Items { get; }
+    public string TargetDir { get; }
+    public int Total => Items.Length;
+    public int Done { get; private set; }
+    public string State { get; private set; } = "running"; // running | done | failed
+    public string? Error { get; private set; }
+    public List<ServerCopyItemState> ItemStates { get; } = new();
+    public DateTime CreatedAt { get; } = DateTime.Now;
+    public DateTime? FinishedAt { get; private set; }
+
+    public ServerCopyJob(string sourceLabel, string targetLabel, string[] items, string targetDir)
+    {
+        SourceLabel = sourceLabel;
+        TargetLabel = targetLabel;
+        Items = items;
+        TargetDir = targetDir;
+        foreach (var p in items) ItemStates.Add(new ServerCopyItemState(p, "pending", null));
+    }
+
+    public void MarkRunning(int index) => ItemStates[index] = ItemStates[index] with { State = "running" };
+
+    public void MarkDone(int index)
+    {
+        ItemStates[index] = ItemStates[index] with { State = "done" };
+        Done++;
+    }
+
+    public void FinishOk()
+    {
+        State = "done";
+        FinishedAt = DateTime.Now;
+    }
+
+    public void FinishFailed(int index, string message)
+    {
+        ItemStates[index] = ItemStates[index] with { State = "failed", Message = message };
+        State = "failed";
+        Error = message;
+        FinishedAt = DateTime.Now;
+    }
+
+    public void FailEarly(string message)
+    {
+        State = "failed";
+        Error = message;
+        FinishedAt = DateTime.Now;
+    }
+}
+
+/// <summary>
+/// 服务器间直传作业的注册表 + 后台执行。
+/// 认证策略（目标机）：
+///   密码认证 → 源机装 sshpass 时用 sshpass 喂密码；未装时先试免密 scp（两端已配密钥时直接可用），
+///             失败时错误信息引导安装 sshpass 或配置密钥互信；
+///   私钥认证 → 把私钥内容（base64 编码经 shell 写盘）临时放到源机 /tmp，scp -i 使用，结束即删；
+///             带口令的私钥无法非交互使用，直接给出明确错误。
+/// </summary>
+public static class ServerCopyJobs
+{
+    private static readonly ConcurrentDictionary<string, ServerCopyJob> Jobs = new();
+
+    public static ServerCopyJob Add(ServerCopyJob job)
+    {
+        Jobs[job.Id] = job;
+        Purge();
+        return job;
+    }
+
+    public static ServerCopyJob? Get(string id)
+        => string.IsNullOrWhiteSpace(id) ? null : Jobs.GetValueOrDefault(id);
+
+    // 完成超过 1 小时的作业清理掉，避免长期占用内存
+    private static void Purge()
+    {
+        var cutoff = DateTime.Now.AddHours(-1);
+        foreach (var kvp in Jobs)
+        {
+            if (kvp.Value.State != "running" && kvp.Value.FinishedAt is DateTime t && t < cutoff)
+                Jobs.TryRemove(kvp.Key, out _);
+        }
+    }
+
+    public static void Start(ServerCopyJob job, SshSession src, SshSession dst, OperationLogger log)
+        => _ = Task.Run(() => RunAsync(job, src, dst, log));
+
+    private static async Task RunAsync(ServerCopyJob job, SshSession src, SshSession dst, OperationLogger log)
+    {
+        string? keyFile = null;
+        try
+        {
+            var auth = ResolveAuth(job, src, dst, ref keyFile);
+            if (auth is null) return; // ResolveAuth 失败时已 FailEarly
+
+            var baseOpts = "-r -P " + dst.Port +
+                           " -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" +
+                           " -o ConnectTimeout=15 -o NumberOfPasswordPrompts=1";
+            // 目标目录补尾斜杠表示「复制到目录内」（scp 靠尾斜杠区分覆盖 vs 放进目录）；
+            // 远端路径交给目标机 shell 解析，先逐个反斜杠转义，再整体 Shq 供源机本地 shell 展开。
+            var remoteSpec = WebHost.Shq($"{dst.Username}@{dst.Host}:{WebHost.EscapeScpRemote(job.TargetDir.TrimEnd('/') + "/")}");
+
+            for (var i = 0; i < job.Items.Length; i++)
+            {
+                src.Touch(); // 长时间传输期间避免会话被空闲回收
+                var item = job.Items[i];
+                job.MarkRunning(i);
+                log.Log("info", job.SourceLabel, "服务器直传", $"{item} -> {job.TargetLabel}:{job.TargetDir}", "进行中");
+
+                var cmdLine = auth switch
+                {
+                    "key" => $"scp {baseOpts} -i {WebHost.Shq(keyFile!)} {WebHost.Shq(item)} {remoteSpec}",
+                    "password-sshpass" => $"sshpass -p {WebHost.Shq(dst.Password!)} scp {baseOpts} {WebHost.Shq(item)} {remoteSpec}",
+                    _ => $"scp {baseOpts} {WebHost.Shq(item)} {remoteSpec}", // 密码但无 sshpass：先试两端是否已配免密
+                };
+
+                using var cmd = src.Ssh.CreateCommand(cmdLine);
+                cmd.CommandTimeout = TimeSpan.FromHours(2);
+                cmd.Execute();
+                var output = ((cmd.Result ?? "") + (cmd.Error ?? "")).Trim();
+                if (cmd.ExitStatus == 0)
+                {
+                    job.MarkDone(i);
+                    log.Log("info", job.SourceLabel, "服务器直传", $"{item} -> {job.TargetLabel}:{job.TargetDir}", "完成");
+                    continue;
+                }
+
+                var msg = ClassifyError(output, auth, dst);
+                log.Log("error", job.SourceLabel, "服务器直传", $"{item} -> {job.TargetLabel}:{job.TargetDir}", msg);
+                job.FinishFailed(i, msg);
+                return;
+            }
+            job.FinishOk();
+            log.Log("info", job.SourceLabel, "服务器直传", $"{job.Total} 项 -> {job.TargetLabel}:{job.TargetDir}", "全部完成");
+        }
+        catch (Exception ex)
+        {
+            job.FailEarly("传输异常：" + ex.Message);
+            log.Log("error", job.SourceLabel, "服务器直传", job.TargetDir, ex.Message);
+        }
+        finally
+        {
+            // 清理临时私钥文件
+            if (keyFile != null)
+            {
+                try { using var rm = src.Ssh.CreateCommand($"rm -f {WebHost.Shq(keyFile)}"); rm.Execute(); } catch { /* 忽略 */ }
+            }
+        }
+    }
+
+    // 返回 auth："key" | "password-sshpass" | "password-direct"；失败返回 null（已 FailEarly 并记录错误）
+    private static string? ResolveAuth(ServerCopyJob job, SshSession src, SshSession dst, ref string? keyFile)
+    {
+        if (!string.IsNullOrEmpty(dst.Password))
+        {
+            try
+            {
+                using var chk = src.Ssh.CreateCommand("command -v sshpass >/dev/null 2>&1 && echo yes || echo no");
+                chk.CommandTimeout = TimeSpan.FromSeconds(15);
+                chk.Execute();
+                return chk.Result.Trim().Equals("yes", StringComparison.OrdinalIgnoreCase)
+                    ? "password-sshpass"
+                    : "password-direct";
+            }
+            catch { return "password-direct"; } // 探测失败按无 sshpass 处理
+        }
+
+        if (!string.IsNullOrEmpty(dst.PrivateKey))
+        {
+            if (!string.IsNullOrEmpty(dst.Passphrase))
+            {
+                job.FailEarly("目标连接使用带口令的私钥，暂不支持服务器间直传。请改用密码认证，或先去除私钥口令。");
+                return null;
+            }
+            keyFile = $"/tmp/hxsfm_key_{Guid.NewGuid():N}";
+            // 私钥内容 base64 编码后经 shell 写盘：私钥里的特殊字符经 base64 后只剩 [A-Za-z0-9+/=]，天然安全
+            var b64 = Convert.ToBase64String(Encoding.UTF8.GetBytes(dst.PrivateKey));
+            using var wr = src.Ssh.CreateCommand($"echo {WebHost.Shq(b64)} | base64 -d > {WebHost.Shq(keyFile)} && chmod 600 {WebHost.Shq(keyFile)}");
+            wr.CommandTimeout = TimeSpan.FromSeconds(30);
+            wr.Execute();
+            if (wr.ExitStatus != 0)
+            {
+                job.FailEarly("无法把目标私钥写入源服务器临时文件：" + ((wr.Error ?? "") + (wr.Result ?? "")).Trim());
+                return null;
+            }
+            return "key";
+        }
+
+        job.FailEarly("目标连接缺少凭据（无密码且无私钥），无法从源服务器发起传输。");
+        return null;
+    }
+
+    private static string ClassifyError(string output, string auth, SshSession dst)
+    {
+        var o = output;
+        if (Regex.IsMatch(o, @"permission denied|denied, please try|authentication failed|no supported authentication|password.*required|keyboard-interactive", RegexOptions.IgnoreCase))
+        {
+            if (auth == "password-direct")
+                return "源服务器无法免密登录目标机，且未安装 sshpass。请在源服务器安装 sshpass（apt install sshpass / yum install sshpass），或预先配置两台服务器间的 SSH 密钥互信。原始输出：" + o;
+            return $"目标机认证失败：请确认目标连接 {dst.Username}@{dst.Host}:{dst.Port} 的凭据正确。原始输出：" + o;
+        }
+        if (o.Contains("command not found", StringComparison.OrdinalIgnoreCase) || o.Contains("no such file or directory", StringComparison.OrdinalIgnoreCase))
+            return "源服务器缺少 scp/sshpass 或路径不存在：" + o;
+        if (o.Contains("timed out", StringComparison.OrdinalIgnoreCase) || o.Contains("connection refused", StringComparison.OrdinalIgnoreCase))
+            return $"源服务器无法连通目标 {dst.Host}:{dst.Port}（网络隔离或防火墙拦截）：" + o;
+        return "复制失败：" + (string.IsNullOrWhiteSpace(o) ? "未知错误（请查看操作日志）" : o);
     }
 }
 
