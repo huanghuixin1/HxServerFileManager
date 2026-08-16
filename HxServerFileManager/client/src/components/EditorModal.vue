@@ -25,7 +25,8 @@ let lastPaint = 0
 
 function paintPartial() {
   if (!pendingParts.length) return
-  content.value = pendingParts.join('')
+  // 累加已显示内容，避免加载过程中只显示最近一批 chunk。
+  content.value += pendingParts.join('')
   pendingParts = []
   lastPaint = performance.now()
 }

@@ -517,17 +517,18 @@ app.MapGet("/api/file-content", async (string connId, string path, HttpContext c
     try
     {
         var s = mgr.Get(connId);
-        var attr = s.Sftp.GetAttributes(path);
-        if (attr.IsDirectory) return Results.BadRequest(new { error = "目标是目录，不是文件" });
-        if (attr.Size > FileHelpers.MaxEditBytes) return Results.BadRequest(new { error = "文件过大，暂不支持在线编辑（>10MB）" });
-
+        // OpenRead 内部已经会取得文件属性；不要先 GetAttributes 再 OpenRead，
+        // 否则高延迟服务器会在首字节前白白多付一次 SFTP 往返。
         using var stream = s.Sftp.OpenRead(path);
-        // 先读开头 64KB 做二进制嗅探：真实二进制（可执行/图片/压缩包）头部必有 NUL 字节，
-        // 前缀嗅探即可拦下绝大多数；通过后才开始流式下发（NUL 只出现在 64KB 之后的极端
+        var fileLength = stream.Length;
+        if (fileLength > FileHelpers.MaxEditBytes) return Results.BadRequest(new { error = "文件过大，暂不支持在线编辑（>10MB）" });
+
+        // 先读开头 8KB 做二进制嗅探：真实二进制（可执行/图片/压缩包）头部通常有 NUL 字节，
+        // 前缀嗅探即可拦下绝大多数；通过后才开始流式下发（NUL 只出现在 8KB 之后的极端
         // 文本文件会以替换字符显示，可接受）。
-        var sniffLen = (int)Math.Min(64 * 1024, stream.Length);
+        var sniffLen = (int)Math.Min(8 * 1024, fileLength);
         var sniff = new byte[sniffLen];
-        var sniffRead = sniffLen > 0 ? await stream.ReadAsync(sniff) : 0;
+        var sniffRead = sniffLen > 0 ? await stream.ReadAsync(sniff, ctx.RequestAborted) : 0;
         if (sniff.AsSpan(0, sniffRead).IndexOf((byte)0) >= 0)
             return Results.BadRequest(new { error = "该文件疑似二进制，无法在浏览器中编辑" });
 
@@ -535,12 +536,12 @@ app.MapGet("/api/file-content", async (string connId, string path, HttpContext c
         // 直接写响应体流式返回原始字节（与 SSE 处理器同一模式；Content-Length 让前端能算进度）。
         // 注意：一旦开始写响应体就不能再返回 JSON 错误，中途异常只能让连接中断。
         ctx.Response.ContentType = "application/octet-stream";
-        ctx.Response.ContentLength = attr.Size;
-        if (sniffRead > 0) await ctx.Response.Body.WriteAsync(sniff.AsMemory(0, sniffRead));
+        ctx.Response.ContentLength = fileLength;
+        if (sniffRead > 0) await ctx.Response.Body.WriteAsync(sniff.AsMemory(0, sniffRead), ctx.RequestAborted);
         var buf = new byte[64 * 1024];
         int n;
-        while ((n = await stream.ReadAsync(buf)) > 0)
-            await ctx.Response.Body.WriteAsync(buf.AsMemory(0, n));
+        while ((n = await stream.ReadAsync(buf, ctx.RequestAborted)) > 0)
+            await ctx.Response.Body.WriteAsync(buf.AsMemory(0, n), ctx.RequestAborted);
         return Results.Empty;
     }
     catch (Exception ex)
