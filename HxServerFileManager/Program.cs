@@ -508,7 +508,11 @@ app.MapGet("/api/download", async (string connId, string path, ConnectionManager
 });
 
 // 读取文本文件内容（用于在线编辑；二进制/超大文件会被拒绝）
-app.MapGet("/api/file-content", async (string connId, string path, ConnectionManager mgr, OperationLogger log) =>
+// 直接以原始字节流返回（不再 JSON 包裹）：System.Text.Json 默认把所有非 ASCII（中文等）转义成
+// \uXXXX，大文本会膨胀 3-6 倍，且服务端转义 + 浏览器 JSON.parse 都极耗 CPU —— 这是双击打开
+// 明显慢于终端 cat 的主因。改为流式下发：前端边收边显示（像 cat 一样渐进出现），首字节只等
+// 一个 SFTP 读块。
+app.MapGet("/api/file-content", async (string connId, string path, HttpContext ctx, ConnectionManager mgr, OperationLogger log) =>
 {
     try
     {
@@ -518,17 +522,35 @@ app.MapGet("/api/file-content", async (string connId, string path, ConnectionMan
         if (attr.Size > FileHelpers.MaxEditBytes) return Results.BadRequest(new { error = "文件过大，暂不支持在线编辑（>10MB）" });
 
         using var stream = s.Sftp.OpenRead(path);
-        using var ms = new MemoryStream();
-        await stream.CopyToAsync(ms);
-        var bytes = ms.ToArray();
-        if (bytes.AsSpan().IndexOf((byte)0) >= 0)
+        // 先读开头 64KB 做二进制嗅探：真实二进制（可执行/图片/压缩包）头部必有 NUL 字节，
+        // 前缀嗅探即可拦下绝大多数；通过后才开始流式下发（NUL 只出现在 64KB 之后的极端
+        // 文本文件会以替换字符显示，可接受）。
+        var sniffLen = (int)Math.Min(64 * 1024, stream.Length);
+        var sniff = new byte[sniffLen];
+        var sniffRead = sniffLen > 0 ? await stream.ReadAsync(sniff) : 0;
+        if (sniff.AsSpan(0, sniffRead).IndexOf((byte)0) >= 0)
             return Results.BadRequest(new { error = "该文件疑似二进制，无法在浏览器中编辑" });
 
-        var content = Encoding.UTF8.GetString(bytes);
         log.Log("info", connId, "读取文件", path);
-        return Results.Ok(new { path, content, size = bytes.Length, encoding = "utf-8" });
+        // 直接写响应体流式返回原始字节（与 SSE 处理器同一模式；Content-Length 让前端能算进度）。
+        // 注意：一旦开始写响应体就不能再返回 JSON 错误，中途异常只能让连接中断。
+        ctx.Response.ContentType = "application/octet-stream";
+        ctx.Response.ContentLength = attr.Size;
+        if (sniffRead > 0) await ctx.Response.Body.WriteAsync(sniff.AsMemory(0, sniffRead));
+        var buf = new byte[64 * 1024];
+        int n;
+        while ((n = await stream.ReadAsync(buf)) > 0)
+            await ctx.Response.Body.WriteAsync(buf.AsMemory(0, n));
+        return Results.Empty;
     }
-    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+    catch (Exception ex)
+    {
+        // 响应未开始时才能正常返回 JSON 错误（GetAttributes/OpenRead/嗅探阶段）；
+        // 流中途失败时响应已开始，返回结果只会再抛错，直接让连接中断即可
+        if (!ctx.Response.HasStarted)
+            return Results.BadRequest(new { error = ex.Message });
+        throw;
+    }
 });
 
 // 保存文本文件内容（覆盖写回远端）

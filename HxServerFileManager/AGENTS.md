@@ -41,6 +41,7 @@
 - `connections.json` 明文存密码/私钥，仅限本地/内网
 
 ## 进度记录
+- 2026-08-16：双击打开文件提速 —— 根因：`/api/file-content` 用 JSON 返回，System.Text.Json 默认把所有非 ASCII（中文等）转义成 `\uXXXX`，大文本膨胀 3-6 倍且服务端转义 + 浏览器 JSON.parse 都极耗 CPU，且整文件读进内存后才返回（首字节迟迟不到；终端 cat 走已开 PTY 的 SSE 推流，首字节 ~1 RTT）。修复：① 改为**原始字节流返回**（`Results.Stream` + 传 fileLength 带 Content-Length），不再 JSON 包裹；② 二进制检查改为**开头 64KB NUL 嗅探**（真实二进制头部必有 NUL），通过后流式下发；③ 前端 `api.getFileContent` 改 fetch 流式读取（`onProgress({loaded,total,percent,chunk})` 回调），EditorModal 边收边显示 + 顶部进度条（chunk 攒在 pendingParts，~120ms 节流刷一次，结束后以完整内容为准）
 - 2026-08-16：上传上限配置化 —— 单文件上传上限从仅环境变量改为「env 变量 → configs/env.json 的 maxUploadMb → 默认 1GB」三级，0/负数 = 不限制（Kestrel 不设 MaxRequestBodySize、/api/health 返回 maxUploadBytes=0，前端跳过预校验）；桌面壳启动时强制设 HXSFM_MAX_UPLOAD_MB=0 忽略大小限制
 - 2026-08-16：上传进度修复 + 停止上传 —— ① 进度面板之前看不见的根因：`z-index:40` 低于列表 loading 遮罩的 `z-index:2000`，被盖住；改为 3000。② `api.uploadFile` 增加 `signal` 参数（AbortController → xhr.abort），面板加「停止上传」按钮，取消时提示「已取消上传」不报错。改 CSS 注意：Element Plus 遮罩 z-index 2000，自绘浮层要高于它
 - 2026-08-16：上传进度 —— `api.uploadFile` 改用 XMLHttpRequest（fetch 无上传进度事件），新增 `onProgress(0-100)` 回调，401/错误语义与 fetch 版一致；FileManager 上传时列表上方浮出进度面板（`当前文件名 + i/n + el-progress 进度条 + 百分比`），多文件逐个上传逐帧更新

@@ -8,6 +8,7 @@
 
 ## 已完成
 - ✅ 后端三增强：连接信息持久化到 `Data/connections.json`、文本文件 `GET/PUT /api/file-content` 在线编辑、`GET /api/logs/stream` SSE 实时日志。编译+启动已验证。
+- ✅ 双击打开提速：`GET /api/file-content` 改为**原始字节流返回**（不再 JSON 包裹，避免 System.Text.Json 对非 ASCII 的 `\uXXXX` 转义膨胀 + 浏览器 JSON.parse 开销），二进制检查改为开头 64KB NUL 嗅探，前端 fetch 流式读取边收边显示（编辑器带进度条，接近终端 cat 的渐进体验）。
 - ✅ 前端已全部改为 Element Plus：`main.js` 注册 EP + 全部图标；6 组件 + `App.vue` 使用 `el-form/el-table/el-dialog/el-breadcrumb/el-button/el-tag` 等。
 - ✅ `package.json` 已声明 `element-plus ^2.14.4` + `@element-plus/icons-vue ^2.3.2`。
 - ✅ 后端已加 `MapFallbackToFile("index.html")`。

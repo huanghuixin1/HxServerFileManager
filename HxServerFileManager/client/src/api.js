@@ -191,8 +191,53 @@ export const api = {
       xhr.send(form)
     }),
 
-  getFileContent: (connId, path) =>
-    request(`/api/file-content?connId=${encodeURIComponent(connId)}&path=${encodeURIComponent(path)}`),
+  // 读取文本文件内容（在线编辑）。后端已改为原始字节流返回（不经 JSON，避免非 ASCII 转义膨胀），
+  // 这里用 fetch 流式读取；onProgress({ loaded, total, percent, chunk }) 可选回调，
+  // chunk 为每块的文本增量，编辑器据此边收边显示（cat 式渐进体验）。
+  getFileContent: (connId, path, onProgress) =>
+    fetch(
+      `/api/file-content?connId=${encodeURIComponent(connId)}&path=${encodeURIComponent(path)}`,
+      { headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {} }
+    )
+      .then(async (res) => {
+        if (res.status === 401 && getToken()) {
+          onUnauthorized()
+          throw new Error('登录已过期，请重新登录')
+        }
+        if (!res.ok) {
+          let msg = `请求失败 (${res.status})`
+          try { const b = await res.json(); if (b && b.error) msg = b.error } catch (_) {}
+          throw new Error(normalizeError(msg))
+        }
+        const total = Number(res.headers.get('content-length')) || 0
+        const reader = res.body?.getReader()
+        const decoder = new TextDecoder()
+        const parts = []
+        let loaded = 0
+        try {
+          if (reader) {
+            for (;;) {
+              const { done, value } = await reader.read()
+              if (done) break
+              loaded += value.byteLength
+              const chunk = decoder.decode(value, { stream: true })
+              parts.push(chunk)
+              if (onProgress) {
+                onProgress({ loaded, total, percent: total ? Math.round((loaded / total) * 100) : 0, chunk })
+              }
+            }
+          }
+        } catch (e) {
+          // 中途断开（远端 SSH 掉线等）：正常报错，已读部分不保证完整
+          throw new Error(normalizeError(`读取中断：${(e && e.message) || e}`))
+        }
+        parts.push(decoder.decode())
+        return { content: parts.join(''), size: loaded }
+      })
+      .catch((e) => {
+        // 网络层失败（fetch 本身抛错）统一转友好文案
+        throw new Error(normalizeError((e && e.message) || e))
+      }),
 
   saveFileContent: (connId, path, content) =>
     request('/api/file-content', {
