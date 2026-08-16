@@ -8,7 +8,9 @@
 #   nohup ./start-linux.sh &    # 后台运行（此时用 kill <pid> / SIGTERM 停止）
 #
 # 可选环境变量（也可写入同目录 .env，脚本自动加载）：
-#   PORT                监听端口，默认 5101
+#   PORT                监听端口，默认 15511
+#   HXSFM_MAX_UPLOAD_MB  单文件上传上限（MB），默认 1024（1GB），0 = 不限制；
+#                        也可写入 configs/env.json 的 maxUploadMb（环境变量优先）
 #   HXSFM_WEB_PASSWORD  网页访问密码（不设则仅本机回环可访问）
 #   HXSFM_DATA_KEY      连接数据加密主密钥（不设则用 Data/secret.key）
 #   HXSFM_CONTENT_ROOT  ContentRoot（默认取可执行文件所在目录）
@@ -49,7 +51,7 @@ BIN="$(find_binary)" || {
   exit 1
 }
 
-PORT="${PORT:-${1:-5101}}"
+PORT="${PORT:-${1:-15511}}"
 export PORT
 
 echo "▶ HxServerFileManager 启动（端口 $PORT）"

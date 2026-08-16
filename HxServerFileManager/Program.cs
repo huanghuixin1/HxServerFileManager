@@ -83,11 +83,23 @@ public static partial class WebHost
 
         // 显式配置 Kestrel（端口可由环境变量 PORT 覆盖，默认 15511）
         var listenPort = int.TryParse(Environment.GetEnvironmentVariable("PORT"), out var p) ? p : 15511;
+        // 单文件上传上限（MB）：0 或负数 = 不限制。
+        // 优先级：环境变量 HXSFM_MAX_UPLOAD_MB（可覆盖）→ configs/env.json 的 maxUploadMb（模板见 env.json.example）
+        //         → 默认 1024（1GB）。桌面壳（HxServerFileManager.Desktop）启动时强制设 0（忽略大小限制）。
+        // 前端通过 /api/health 的 maxUploadBytes 读取做预校验（0 = 不限制）
+        var maxUploadMb = 1024;
+        var envUploadMb = Environment.GetEnvironmentVariable("HXSFM_MAX_UPLOAD_MB");
+        if (!string.IsNullOrEmpty(envUploadMb) && int.TryParse(envUploadMb, out var envMb))
+            maxUploadMb = envMb;
+        else if (LoadConfigMaxUploadMb(builder.Environment.ContentRootPath) is int cfgMb)
+            maxUploadMb = cfgMb;
+        if (maxUploadMb < 0) maxUploadMb = 0;
         builder.WebHost.UseKestrel(kestrel =>
         {
             kestrel.ListenAnyIP(listenPort);
-            // 允许较大文件上传（默认 200MB）
-            kestrel.Limits.MaxRequestBodySize = 200 * 1024 * 1024;
+            // 允许较大文件上传（默认 1GB；HXSFM_MAX_UPLOAD_MB 或 env.json 的 maxUploadMb 可配置；
+            // 0 = 不限制，桌面壳即为该模式）
+            kestrel.Limits.MaxRequestBodySize = maxUploadMb > 0 ? maxUploadMb * 1024 * 1024L : null;
         });
 
         // 单例：会话表 / 操作日志 / 连接存储
@@ -823,8 +835,12 @@ app.MapGet("/api/logs/stream", async (HttpContext ctx, OperationLogger log) =>
     catch (OperationCanceledException) { /* 客户端断开 / 服务停机 */ }
 });
 
-// 健康检查
-app.MapGet("/api/health", () => Results.Ok(new { status = "ok" }));
+// 健康检查（顺带返回单文件上传上限，前端据此预校验；maxUploadBytes = 0 表示不限制）
+app.MapGet("/api/health", () => Results.Ok(new
+{
+    status = "ok",
+    maxUploadBytes = maxUploadMb > 0 ? maxUploadMb * 1024 * 1024L : 0,
+}));
 
 // ---- 用户偏好设置：常用目录收藏 + 终端宏（Data/settings.json）----
 app.MapGet("/api/settings/favorites", (SettingsStore store) =>
@@ -888,6 +904,28 @@ public static partial class WebHost
     // ----------------------------------------------------------------------------
     // 鉴权辅助（HxSimpleWebAuth）
     // ----------------------------------------------------------------------------
+
+    /// <summary>
+    /// 读取 configs/env.json 中的 maxUploadMb（模板见 configs/env.json.example）。
+    /// 0 或负数 = 不限制（Kestrel 不设请求体上限、health 返回 0）；
+    /// 文件不存在 / 未配置 / 解析失败返回 null（此时回退到环境变量/默认值）。
+    /// </summary>
+    internal static int? LoadConfigMaxUploadMb(string contentRoot)
+    {
+        var configPath = Path.Combine(contentRoot, "configs", "env.json");
+        if (!File.Exists(configPath)) return null;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(configPath));
+            if (doc.RootElement.TryGetProperty("maxUploadMb", out var p) && p.TryGetInt32(out var mb))
+                return mb;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[HxServerFileManager] 读取 configs/env.json 失败：{ex.Message}");
+        }
+        return null;
+    }
 
     /// <summary>
     /// 读取 configs/env.json 中的 authPwd（模板见 configs/env.json.example）。

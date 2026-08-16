@@ -47,6 +47,7 @@
 - SSE（/api/logs/stream、/api/terminal/stream）与 `<a download>` 带不了请求头：前端把 token 放 `?token=` 查询参数，后端中间件统一转成 Authorization 头再校验。
 - 前端：登录页 LoginView.vue（密码+记住我+剩余次数提示）；api.js 统一带 Bearer 头、401 触发回登录页；token 存 sessionStorage/localStorage（hxsfm_auth_token）；认证通过后才恢复会话/路径；退出登录吊销 token + 断开所有 SSH 会话。
 - 实测（curl + 浏览器）：无 token 401、错密码提示剩余次数、正确登录拿 token、SSE/download 带 ?token= 通过、登出后 token 失效、刷新记住登录、退出回登录页全部通过。
+- 上传上限：`configs/env.json` 的 `maxUploadMb`（默认 1GB，`0`=不限制），环境变量 `HXSFM_MAX_UPLOAD_MB` 可覆盖（优先）；桌面壳（Desktop）启动时强制设为 0，忽略大小限制。`/api/health` 返回 `maxUploadBytes`（0=不限制），前端据此预校验。
 
 ## 文件列表：操作下拉 + 行多选
 - 「上传/新建目录/删除」收进「操作」下拉（el-dropdown：新建目录/上传/删除，删除为**批量删除**——未选中时禁用、显示「删除（N）」数量，确认后逐个删除并刷新），工具栏只剩 同步路径/上级/刷新/操作。

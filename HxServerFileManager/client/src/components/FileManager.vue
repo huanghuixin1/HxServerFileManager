@@ -148,7 +148,25 @@ const renameValue = ref('')
 const renaming = ref(null)
 
 const uploading = ref(false)
+const deleting = ref(false)
 const fileInput = ref(null)
+// 上传进度：当前文件 i/n、文件名、百分比；uploadAbort 用于「停止上传」
+const uploadIndex = ref(0)
+const uploadTotal = ref(0)
+const uploadName = ref('')
+const uploadProgress = ref(0)
+const uploadAbort = ref(null)
+// 单文件上传上限（字节）：默认 1GB，挂载时从 /api/health 读取后端实际配置
+// （HXSFM_MAX_UPLOAD_MB / env.json maxUploadMb；health 返回 0 表示不限制 → Infinity）
+const uploadLimitBytes = ref(1024 * 1024 * 1024)
+
+// 列表加载中状态：目录刷新 / 删除 / 上传共用遮罩，附文字区分（上传详情见 upload-panel）
+const tableLoading = computed(() => loading.value || deleting.value || uploading.value)
+const loadingText = computed(() => {
+  if (uploading.value) return ''
+  if (deleting.value) return '删除中…'
+  return ''
+})
 
 // ---- 行右键菜单（替代操作列）----
 const menuVisible = ref(false)
@@ -253,6 +271,7 @@ async function batchDelete() {
     return // 用户取消
   }
   error.value = ''
+  deleting.value = true
   try {
     for (const item of sel) {
       await api.remove(props.connId, parentDir(item.fullPath), item.name)
@@ -264,6 +283,8 @@ async function batchDelete() {
     await load()
   } catch (e) {
     error.value = e.message
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -308,6 +329,15 @@ async function load(dir) {
 onMounted(() => {
   load()
   ensureLoaded()
+  // 读取后端实际上传上限（失败则保持默认 1GB，服务端仍会兜底 413）；
+  // maxUploadBytes <= 0 表示后端不限制（桌面壳忽略大小上限），前端同样不拦截
+  api
+    .health()
+    .then((h) => {
+      if (!h || h.maxUploadBytes == null) return
+      uploadLimitBytes.value = h.maxUploadBytes > 0 ? h.maxUploadBytes : Infinity
+    })
+    .catch(() => {})
 })
 watch(() => props.connId, () => load(props.initialDir))
 
@@ -353,12 +383,15 @@ async function remove(item) {
     return // 用户取消
   }
   error.value = ''
+  deleting.value = true
   try {
     await api.remove(props.connId, cwd.value, item.name)
     ElMessage.success(`已删除 ${item.name}`)
     await load()
   } catch (e) {
     error.value = e.message
+  } finally {
+    deleting.value = false
   }
 }
 
@@ -397,20 +430,50 @@ function triggerUpload() {
 async function onFileSelected(e) {
   const files = e.target.files
   if (!files || files.length === 0) return
+
+  // 预校验：单个文件超上限直接拦截，避免传一半才 413；后端不限制（Infinity）时跳过
+  const limited = Number.isFinite(uploadLimitBytes.value)
+  const tooBig = limited ? [...files].filter((f) => f.size > uploadLimitBytes.value) : []
+  if (tooBig.length) {
+    const limitMb = Math.round(uploadLimitBytes.value / 1024 / 1024)
+    ElMessage.error(
+      `以下文件超过单文件 ${limitMb}MB 上限，未开始上传：${tooBig.map((f) => f.name).join('、')}`
+    )
+    fileInput.value.value = ''
+    return
+  }
+
   uploading.value = true
   error.value = ''
+  uploadTotal.value = files.length
+  uploadAbort.value = new AbortController()
   try {
-    for (const f of files) {
-      await api.uploadFile(props.connId, cwd.value, f)
+    for (let i = 0; i < files.length; i++) {
+      const f = files[i]
+      uploadIndex.value = i + 1
+      uploadName.value = f.name
+      uploadProgress.value = 0
+      await api.uploadFile(props.connId, cwd.value, f, (p) => {
+        uploadProgress.value = p
+      }, uploadAbort.value.signal)
     }
     ElMessage.success(`成功上传 ${files.length} 个文件`)
     await load()
   } catch (e) {
-    error.value = e.message
+    if (uploadAbort.value?.signal.aborted) {
+      ElMessage.info('已取消上传')
+    } else {
+      error.value = e.message
+    }
   } finally {
     uploading.value = false
+    uploadAbort.value = null
     fileInput.value.value = ''
   }
+}
+
+function stopUpload() {
+  uploadAbort.value?.abort()
 }
 
 async function createDir() {
@@ -549,7 +612,8 @@ function fmtDate(s) {
       ref="tableRef"
       :data="items"
       class="fm-table"
-      v-loading="loading"
+      v-loading="tableLoading"
+      :element-loading-text="loadingText"
       row-key="fullPath"
       empty-text="空目录"
       :row-class-name="rowClassName"
@@ -558,6 +622,10 @@ function fmtDate(s) {
       @row-contextmenu="onRowContextMenu"
       @selection-change="onSelectionChange"
     >
+      <template #empty>
+        <div v-if="uploading" class="fm-empty">正在上传…</div>
+        <span v-else>空目录</span>
+      </template>
       <el-table-column type="selection" width="1" class-name="sel-col" />
       <el-table-column label="名称" min-width="240">
         <template #default="{ row }">
@@ -574,6 +642,19 @@ function fmtDate(s) {
         <template #default="{ row }">{{ fmtDate(row.lastWriteTimeUtc) }}</template>
       </el-table-column>
     </el-table>
+
+    <!-- 上传进度面板：当前文件 i/n + 文件名 + 进度条 + 百分比 + 停止上传 -->
+    <div v-if="uploading" class="upload-panel">
+      <div class="up-line">
+        <span class="up-name" :title="uploadName">{{ uploadName }}</span>
+        <span class="up-count">{{ uploadIndex }}/{{ uploadTotal }}</span>
+      </div>
+      <el-progress :percentage="uploadProgress" :stroke-width="8" :show-text="false" />
+      <div class="up-foot">
+        <span class="up-pct">{{ uploadProgress }}%</span>
+        <el-button size="small" type="danger" plain @click="stopUpload">停止上传</el-button>
+      </div>
+    </div>
 
     <!-- 行右键菜单：编辑/下载/重命名/删除 -->
     <div
@@ -694,6 +775,7 @@ function fmtDate(s) {
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  position: relative; /* 上传进度面板定位基准 */
   /* 屏蔽浏览器原生文本选中（行选择/拖拽时不出高亮） */
   user-select: none;
   -webkit-user-select: none;
@@ -771,6 +853,53 @@ function fmtDate(s) {
 .fm-table {
   flex: 1;
   min-height: 0;
+}
+
+/* 上传进度面板：浮在列表上方（z-index 需高于 el-loading-mask 的 2000，否则被遮罩盖住） */
+.upload-panel {
+  position: absolute;
+  top: 110px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(340px, 85%);
+  z-index: 3000;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 14px;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.16);
+}
+.up-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.up-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  color: #2a3542;
+}
+.up-count {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: #8a97a5;
+}
+.up-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.up-pct {
+  font-size: 12px;
+  color: #2d6cdf;
 }
 .fname {
   display: inline-flex;

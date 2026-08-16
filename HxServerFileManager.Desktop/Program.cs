@@ -15,6 +15,10 @@ using Photino.NET;
 var port = FindFreePort();
 Environment.SetEnvironmentVariable("PORT", port.ToString());
 
+// 桌面壳忽略上传大小限制：0 = 不限制。即使 configs/env.json 配了 maxUploadMb 也不生效，
+// 本地窗口直连 localhost，没必要卡单文件大小（WebHost.Build 读取时本环境变量优先）
+Environment.SetEnvironmentVariable("HXSFM_MAX_UPLOAD_MB", "0");
+
 var app = WebHost.Build(args);
 
 // 后台启动 Web 服务（不阻塞，Photino 窗口需要自己的 STA 线程消息循环）

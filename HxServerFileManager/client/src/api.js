@@ -147,26 +147,49 @@ export const api = {
   downloadUrl: (connId, path) =>
     `/api/download?connId=${encodeURIComponent(connId)}&path=${encodeURIComponent(path)}&token=${encodeURIComponent(getToken())}`,
 
-  uploadFile: async (connId, path, file) => {
-    const form = new FormData()
-    form.append('connId', connId)
-    form.append('path', path)
-    form.append('file', file)
-    const headers = {}
-    const token = getToken()
-    if (token) headers['Authorization'] = `Bearer ${token}`
-    const res = await fetch('/api/upload', { method: 'POST', body: form, headers })
-    if (res.status === 401 && token) {
-      onUnauthorized()
-      throw new Error('登录已过期，请重新登录')
-    }
-    if (!res.ok) {
-      let msg = `上传失败 (${res.status})`
-      try { const b = await res.json(); if (b && b.error) msg = b.error } catch (_) {}
-      throw new Error(normalizeError(msg))
-    }
-    return await res.json()
-  },
+  // 上传：用 XMLHttpRequest 以支持上传进度回调（fetch 无 upload 进度事件）。
+  // onProgress(percent 0-100) 可选；signal 传 AbortController.signal 可取消（xhr.abort）。
+  // 401/错误语义与 request() 保持一致。
+  uploadFile: (connId, path, file, onProgress, signal) =>
+    new Promise((resolve, reject) => {
+      const form = new FormData()
+      form.append('connId', connId)
+      form.append('path', path)
+      form.append('file', file)
+      const xhr = new XMLHttpRequest()
+      xhr.open('POST', '/api/upload')
+      const token = getToken()
+      if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`)
+      if (signal) {
+        if (signal.aborted) {
+          reject(new Error('上传已取消'))
+          return
+        }
+        signal.addEventListener('abort', () => xhr.abort(), { once: true })
+      }
+      if (onProgress) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) onProgress(Math.round((e.loaded / e.total) * 100))
+        }
+      }
+      xhr.onabort = () => reject(new Error('上传已取消'))
+      xhr.onload = () => {
+        if (xhr.status === 401 && token) {
+          onUnauthorized()
+          reject(new Error('登录已过期，请重新登录'))
+          return
+        }
+        if (xhr.status < 200 || xhr.status >= 300) {
+          let msg = `上传失败 (${xhr.status})`
+          try { const b = JSON.parse(xhr.responseText); if (b && b.error) msg = b.error } catch (_) {}
+          reject(new Error(normalizeError(msg)))
+          return
+        }
+        try { resolve(JSON.parse(xhr.responseText)) } catch (_) { resolve(null) }
+      }
+      xhr.onerror = () => reject(new Error(normalizeError('网络错误，上传失败')))
+      xhr.send(form)
+    }),
 
   getFileContent: (connId, path) =>
     request(`/api/file-content?connId=${encodeURIComponent(connId)}&path=${encodeURIComponent(path)}`),

@@ -63,10 +63,21 @@
     构建/发布输出清理：Data 目录是运行时在 ContentRoot 下按需生成的（连接/密钥/设置），
     不应随构建产物分发 —— 构建和发布后把输出目录里的 Data 内容清掉（含历史遗留文件）。
     首次运行时应用会自行重建空的 Data。
+    Debug 构建跳过：调试时直接跑 bin/Debug 里的 exe，Data 作为本地调试数据保留（否则每次
+    调试都要重新添加连接）；Release 构建与所有 publish 仍清理（发布产物绝不带 Data）。
+    注意不能靠 $(PublishDir) 判空区分 build/publish —— 普通 build 时它也有默认值
+    （bin\...\publish\），所以拆成两个 target：Build 钩子带条件，Publish 钩子无条件。
   -->
-  <Target Name="CleanOutputData" AfterTargets="Build;Publish">
+  <Target Name="CleanOutputData" AfterTargets="Build" Condition="'$(Configuration)' != 'Debug'">
     <ItemGroup>
       <!-- 同时清掉历史版本曾复制进输出的 logo.ico 散文件（当前 logo 已改为内嵌资源，不再拷贝） -->
+      <OutputData Include="$(OutDir)Data\**\*;$(OutDir)logo.ico" />
+    </ItemGroup>
+    <Delete Files="@(OutputData)" ContinueOnError="true" />
+    <RemoveDir Directories="$(OutDir)Data" ContinueOnError="true" />
+  </Target>
+  <Target Name="CleanOutputDataPublish" AfterTargets="Publish">
+    <ItemGroup>
       <OutputData Include="$(OutDir)Data\**\*;$(PublishDir)Data\**\*;$(OutDir)logo.ico;$(PublishDir)logo.ico" />
     </ItemGroup>
     <Delete Files="@(OutputData)" ContinueOnError="true" />
