@@ -7,6 +7,7 @@
 - 前端：Vue3 + Vite 工程（`client/`），构建产物输出到 `../wwwroot`。
 
 ## 已完成
+- ✅ server 启动脚本随发布带入 + 后台运行：`build.sh server` 发布 Linux 服务端时自动把 `start-linux.sh` 拷进产物目录（此前不在）+ 对主程序 chmod +x（Windows 产物默认无执行位）；`start-linux.sh` 重写：**默认后台启动**（nohup + hxsfm.log + hxsfm.pid，1s 存活探测），`-f` 前台，`stop`/`restart`/`status`/`-h`，支持端口参数、`.env`、`PORT` 等环境变量；脚本侧 `find_binary` 会先补执行位再启动（Windows 打 tar 传 Linux 丢执行位的兜底）。真机（Alpine）实测后台/状态/停止/重启/前台全流程通过；Alpine 需 musl 版发布（`-r linux-musl-x64`）且容器要装 libstdc++/libgcc，属环境依赖非脚本问题。
 - ✅ 连接列表「重连」→「连接」+ 立即开 tab：右侧已保存连接列表的按钮改为「连接」，点击走 App.vue `openSaved` 立即开占位 tab（与顶栏「已保存连接」下拉一致）。
 - ✅ 删除非空文件夹修复：`/api/delete` 原来对目录走 SFTP `DeleteDirectory`（只删空目录，有内容直接抛异常），且 `sftp.DeleteFile` 对符号链接会跟随并删掉链接目标（危险）。现一律走远端 `rm -rf --`：文件/空目录/非空目录/链接通吃，链接只删链接本身；加根目录/`..` 穿越守卫。
 - ✅ 命令历史 + 版本号：**历史 SSH 命令查看/双击执行** —— Terminal 实际执行过的命令（快捷命令回车 + 交互终端按回车）记入 `Data/settings.json`（`CommandHistoryItem`：connKey/command/cwd/exitStatus/createdAt，按连接隔离，同一命令重复执行只留最新一条，每连接上限 200 条），端点 `GET/POST/DELETE /api/settings/history`；前端 `useSettings.history` 全局状态 + Terminal「命令历史」按钮弹窗（时间/命令/目录/状态，**双击一行或点「执行」再次执行**——交互模式直接发到终端并回车、快捷命令模式填入输入框立即跑），可「清空本连接历史」（确认后 DELETE）。交互终端记录靠 `sendInput` 按回车切分输入缓冲（控制字符/转义序列/方向键清缓冲，避免拼出脏行）。**版本号**：两项目 csproj 加 `<Version>1.0.0</Version>`；HX 启动时打印 `版本 1.0.0`、`/api/health` 返回 `version` 字段（`WebHost.AppVersion()` 读 InformationalVersion 去 `+哈希` 后缀）；桌面壳窗口标题 `HxServerFileManager v1.0.0`（同样读 `WebHost.AppVersion()`，与 HX 一致）。

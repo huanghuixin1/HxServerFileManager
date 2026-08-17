@@ -8,7 +8,7 @@
 #
 # 用法：
 #   ./build.sh [选项] [target...]
-#   不带任何参数双击运行时，会弹出菜单，输入 A/B/C/D… 选择要编译的目标。
+#   不带任何参数双击运行时，会弹出菜单，输入数字选择要编译的目标。
 #
 # target（缺省：交互终端弹菜单选择；非交互环境 = all，即桌面三平台）：
 #   win-x64      Windows 10/11 x64（目标机需 WebView2 Runtime，Win10/11 基本自带）
@@ -35,6 +35,8 @@
 # 产物布局：
 #   dist/<rid>/            桌面壳（直接双击运行，或拷贝整目录到目标机）
 #   dist/<rid>.zip|.tar.gz 打包产物
+#   dist/HxServerFileManager.app                  macOS 应用包
+#   dist/HxServerFileManager-macos-<rid>.zip      macOS 应用压缩包
 #   dist/server/<rid>/     后端服务端
 # ============================================================================
 set -euo pipefail
@@ -82,24 +84,26 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
     echo "══════════════════════════════════════════════════"
     echo " HxServerFileManager 构建目标选择"
     echo "══════════════════════════════════════════════════"
-    echo "  A) Windows 桌面壳    (win-x64)"
-    echo "  B) Linux 桌面壳      (linux-x64)"
-    echo "  C) macOS 桌面壳      (osx-arm64)"
-    echo "  D) Linux 服务端      (server / linux-x64)"
-    echo "  E) 全部桌面三平台    (win-x64 + linux-x64 + osx-arm64)"
-    echo "  F) 全部 + 服务端     (桌面三平台 + server)"
-    echo "  Q) 退出"
+    echo "  1) Windows 桌面壳             (win-x64)"
+    echo "  2) Linux 桌面壳               (linux-x64)"
+    echo "  3) macOS Apple Silicon .app    (mac-app / osx-arm64，推荐)"
+    echo "  4) macOS ARM 普通发布目录      (osx-arm64)"
+    echo "  5) Linux 服务端                (server / linux-x64)"
+    echo "  6) 全部桌面三平台              (Windows + Linux + macOS .app)"
+    echo "  7) 全部桌面三平台 + 服务端"
+    echo "  0) 退出"
     echo "----------------------------------------------"
     while true; do
-      read -r -p "请选择 (A/B/C/D/E/F/Q): " choice
-      case "${choice,,}" in
-        a) TARGETS=(win-x64); break;;
-        b) TARGETS=(linux-x64); break;;
-        c) TARGETS=(osx-arm64); break;;
-        d) TARGETS=(server); break;;
-        e) TARGETS=(win-x64 linux-x64 osx-arm64); break;;
-        f) TARGETS=(win-x64 linux-x64 osx-arm64 server); break;;
-        q) echo "已退出"; exit 0;;
+      read -r -p "请选择 (0-7): " choice
+      case "$choice" in
+        1) TARGETS=(win-x64); break;;
+        2) TARGETS=(linux-x64); break;;
+        3) TARGETS=(mac-app); break;;
+        4) TARGETS=(osx-arm64); break;;
+        5) TARGETS=(server); break;;
+        6) TARGETS=(win-x64 linux-x64 mac-app); break;;
+        7) TARGETS=(win-x64 linux-x64 mac-app server); break;;
+        0) echo "已退出"; exit 0;;
         *) echo "无效输入，请重新选择。";;
       esac
     done
@@ -257,6 +261,17 @@ build_server() {
   dotnet publish "$SERVER_PROJECT" -c Release -r "$SERVER_RID" \
     "${sc_flag[@]}" \
     -o "$outdir"
+  local bin="$outdir/HxServerFileManager"
+  [[ -f "$bin" ]] && chmod +x "$bin"   # Windows 构建产物默认无执行位，补上便于直接部署到 Linux
+
+  # Linux 服务端：自动带上启动脚本（后台启动/停止/重启/状态），并补执行位。
+  # Windows 服务端不适用 bash 脚本，跳过。
+  if [[ "$SERVER_RID" == linux-* ]]; then
+    cp "start-linux.sh" "$outdir/start-linux.sh"
+    chmod +x "$outdir/start-linux.sh"
+    echo "  ✔ 已带入：$outdir/start-linux.sh（后台启动 ./start-linux.sh，详见脚本头部说明）"
+  fi
+
   # 如需带 env.json 部署，可在此拷贝 configs/env.json（env.json 默认不随构建复制，仅 example）
 }
 
