@@ -6,11 +6,10 @@ import { api, isDesktop, desktopSaveTextFile } from '../api.js'
 const props = defineProps({
   reloadToken: { type: Number, default: 0 },
 })
-const emit = defineEmits(['reconnect', 'edit'])
+const emit = defineEmits(['open', 'edit'])
 
 const items = ref([])
 const error = ref('')
-const busyId = ref(null)
 const fileRef = ref(null)
 const importing = ref(false)
 
@@ -108,26 +107,10 @@ async function onFileChanged(e) {
   }
 }
 
-async function doReconnect(item) {
-  error.value = ''
-  busyId.value = item.id
-  try {
-    const res = await api.reconnect(item.id)
-    emit('reconnect', {
-      connectionId: res.connectionId,
-      profileId: res.profileId, // 本地化保存会话时引用后端 profile
-      host: res.host,
-      username: res.username,
-      port: item.port,
-      authType: item.authType,
-      name: res.name || item.name,
-    })
-    await load() // 刷新最近连接排序
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    busyId.value = null
-  }
+// 点击「连接」：把整条已保存连接交给 App，由 App 立即开一个「正在连接…」占位 tab
+// 再后台重连（与顶栏「已保存连接」下拉的 openSaved 同一套流程，行为完全一致）
+function doConnect(item) {
+  emit('open', item)
 }
 
 async function doDelete(item) {
@@ -203,13 +186,8 @@ async function doDelete(item) {
           </div>
         </div>
         <div class="btns">
-          <el-button
-            type="primary"
-            size="small"
-            :loading="busyId === it.id"
-            @click="doReconnect(it)"
-          >
-            {{ busyId === it.id ? '重连中…' : '重连' }}
+          <el-button type="primary" size="small" @click="doConnect(it)">
+            连接
           </el-button>
           <el-button size="small" @click="emit('edit', it)">编辑</el-button>
           <el-button type="danger" size="small" plain @click="doDelete(it)">

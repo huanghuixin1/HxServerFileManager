@@ -715,9 +715,10 @@ async function pollServerCopy() {
       <!-- 无任何连接：内联连接表单 + 已保存连接 -->
       <section v-if="connections.length === 0" class="connect-area">
         <ConnectPanel @connected="handleConnected" />
+        <!-- 连接列表：点「连接」立即开占位 tab（与顶栏「已保存连接」下拉同一套 openSaved 流程） -->
         <SavedConnections
           :reload-token="savedReload"
-          @reconnect="handleConnected"
+          @open="openSaved"
           @edit="openEdit"
         />
       </section>
