@@ -59,7 +59,7 @@ var uiThread = new Thread(() =>
 {
     var window = new PhotinoWindow()
         // 标题带版本号：版本从主项目程序集读取（WebHost.AppVersion），与 HX 独立运行的版本一致
-        .SetTitle("HxServerFileManager v" + WebHost.AppVersion())
+        .SetTitle("彗星ssh v" + WebHost.AppVersion())
         .SetUseOsDefaultSize(false)
         .SetSize(1280, 800)
         .Center()
