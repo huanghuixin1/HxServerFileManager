@@ -8,8 +8,11 @@ import { api } from '../api.js'
 import { useSettings } from '../useSettings.js'
 
 // 终端宏（后端 Data/settings.json）：命名命令片段，点击即发送/填入。按连接（connKey）隔离
-const { macros, ensureLoaded, newId, saveMacros } = useSettings()
+// 命令历史：本连接执行过的命令（快捷命令回车 / 交互终端按回车），双击可再次执行，同样按 connKey 隔离
+const { macros, history, ensureLoaded, newId, saveMacros, addHistory, clearHistory } = useSettings()
 const connMacros = computed(() => macros.value.filter((m) => m.connKey === props.connKey))
+const connHistory = computed(() => history.value.filter((h) => h.connKey === props.connKey).slice().reverse())
+const historyVisible = ref(false)
 const macroMgrVisible = ref(false)
 const macroEditVisible = ref(false)
 const macroEditing = ref(null) // null = 新增
@@ -121,21 +124,83 @@ async function run() {
   push('cmd', '$ ' + cmd)
   command.value = ''
   busy.value = true
+  let exit = -1
   try {
     const res = await api.runCommand(props.connId, cmd)
     if (res.output) push('out', res.output)
     if (res.error) push('err', res.error)
     push('meta', `exit=${res.exitStatus}`)
+    exit = res.exitStatus
     if (res.cwd) emit('update:cwd', res.cwd)
   } catch (e) {
     push('err', e.message)
   } finally {
+    // 记录到命令历史（失败的命令也记，exit=-1 表示执行异常）
+    addHistory(props.connKey, cmd, props.cwd || '/', exit)
     busy.value = false
     restoreFocus()
     await nextTick()
     const box = document.getElementById('termOut')
     if (box) box.scrollTop = box.scrollHeight
   }
+}
+
+// ---- 命令历史：交互终端按回车切分记录用户输入的命令行 ----
+// 只缓冲用户敲入的内容（onData = 键盘输入，不含服务端回显），控制字符/转义序列一律丢弃；
+// 回车时把当前行记入历史。方向键/Alt 组合等会移动光标，缓冲不可靠，直接清空。
+let inputLineBuf = ''
+function sendInput(data) {
+  if (data === '\r' || data === '\n') {
+    const line = inputLineBuf.replace(/[\u0000-\u001f\u007f]/g, '').trim()
+    inputLineBuf = ''
+    if (line) addHistory(props.connKey, line, props.cwd || '/', -1) // 交互终端不知道退出码
+  } else if (data === '\x7f' || data === '\b') {
+    inputLineBuf = inputLineBuf.slice(0, -1)
+  } else if (data === '\x03') {
+    inputLineBuf = '' // Ctrl+C：中断当前输入行
+  } else if (data.startsWith('\x1b')) {
+    inputLineBuf = '' // 方向键/功能键：光标已移动，无法可靠拼行
+  } else {
+    inputLineBuf += data
+  }
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'input', data }))
+  }
+}
+
+// 历史弹窗：双击某一行再次执行（交互模式直接发到终端并回车；快捷命令模式填入输入框立即执行）
+function execHistory(h) {
+  if (!h || !h.command) return
+  if (mode.value === 'interactive') {
+    inputLineBuf = '' // 丢弃可能残留的半行输入，避免拼进历史命令
+    sendInput(h.command + '\r')
+    xterm?.focus()
+  } else {
+    command.value = h.command
+    run()
+  }
+}
+
+function fmtTime(iso) {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return String(iso)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+async function doClearHistory() {
+  try {
+    await ElMessageBox.confirm('确定清空本连接的全部命令历史？', '清空命令历史', {
+      type: 'warning',
+      confirmButtonText: '清空',
+      cancelButtonText: '取消',
+    })
+  } catch (_) {
+    return
+  }
+  clearHistory(props.connKey)
+  ElMessage.success('已清空')
 }
 
 // 命令执行后恢复输入框焦点（busy 不再禁用输入框，焦点不会被浏览器夺走）
@@ -310,12 +375,6 @@ async function openInteractive() {
   }
 }
 
-function sendInput(data) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify({ type: 'input', data }))
-  }
-}
-
 // ---- 剪贴板：选中即复制 + 右键粘贴（带回车执行确认）----
 // 复制到剪贴板：优先 Clipboard API（页面聚焦时无需授权），失败退回隐藏 textarea + execCommand
 async function copyToClipboard(text) {
@@ -480,6 +539,9 @@ onUnmounted(() => {
         </span>
       </template>
       <span v-else class="macro-hint">这个连接还没有宏，点击「宏设置」添加常用命令（如清日志 / 查看内存）</span>
+      <el-button size="small" text @click="historyVisible = true" title="查看本连接执行过的命令，双击可再次执行">
+        <el-icon :size="14" style="margin-right: 3px"><Clock /></el-icon>命令历史
+      </el-button>
       <el-button size="small" text type="primary" style="margin-left: auto" @click="openMacroManager">
         <el-icon :size="14" style="margin-right: 3px"><Setting /></el-icon>宏设置
       </el-button>
@@ -572,6 +634,54 @@ onUnmounted(() => {
       <template #footer>
         <el-button @click="macroEditVisible = false">取消</el-button>
         <el-button type="primary" @click="saveMacroForm">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 命令历史：双击一行再次执行（历史按连接隔离，存后端 Data/settings.json） -->
+    <el-dialog
+      v-model="historyVisible"
+      title="命令历史"
+      width="680px"
+      :close-on-click-modal="false"
+    >
+      <p class="paste-tip">记录本连接执行过的命令，<b>双击一行</b>（或点「执行」）可再次执行。</p>
+      <el-table
+        :data="connHistory"
+        empty-text="这个连接还没有命令历史"
+        max-height="360"
+        @row-dblclick="execHistory"
+      >
+        <el-table-column label="时间" width="150">
+          <template #default="{ row }">{{ fmtTime(row.createdAt) }}</template>
+        </el-table-column>
+        <el-table-column label="命令" min-width="240">
+          <template #default="{ row }">
+            <span class="hist-cmd" :title="row.command">{{ row.command }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="目录" min-width="120">
+          <template #default="{ row }">
+            <span class="hist-cwd" :title="row.cwd || ''">{{ row.cwd || '-' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="状态" width="80">
+          <template #default="{ row }">
+            <el-tag v-if="row.exitStatus === 0" size="small" type="success">成功</el-tag>
+            <el-tag v-else-if="row.exitStatus > 0" size="small" type="danger">失败</el-tag>
+            <el-tag v-else size="small" type="info">未知</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="80" align="right">
+          <template #default="{ row }">
+            <el-button size="small" text type="primary" @click.stop="execHistory(row)">执行</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <template #footer>
+        <el-button @click="historyVisible = false">关闭</el-button>
+        <el-button type="danger" plain :disabled="connHistory.length === 0" @click="doClearHistory">
+          清空本连接历史
+        </el-button>
       </template>
     </el-dialog>
 
@@ -714,6 +824,27 @@ onUnmounted(() => {
   color: #6b7785;
   font-family: ui-monospace, monospace;
   font-size: 12.5px;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.hist-cmd {
+  color: #2d6cdf;
+  font-family: ui-monospace, monospace;
+  font-size: 12.5px;
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
+}
+.hist-cwd {
+  color: #8a97a5;
+  font-size: 12px;
   display: inline-block;
   max-width: 100%;
   overflow: hidden;

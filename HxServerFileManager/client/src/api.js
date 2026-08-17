@@ -305,6 +305,13 @@ export const api = {
   putMacros: (macros) =>
     request('/api/settings/macros', { method: 'PUT', body: JSON.stringify(macros) }),
 
+  // ---- 命令历史：Terminal 执行过的命令（双击再次执行）----
+  getHistory: () => request('/api/settings/history'),
+  addHistory: (item) =>
+    request('/api/settings/history', { method: 'POST', body: JSON.stringify(item) }),
+  clearHistory: (connKey) =>
+    request(`/api/settings/history?connKey=${encodeURIComponent(connKey || '')}`, { method: 'DELETE' }),
+
   // 当前连接对应服务器的系统状态（一次 SSH 采集）
   systemStatus: (connId) =>
     request(`/api/system-status?connId=${encodeURIComponent(connId)}`),

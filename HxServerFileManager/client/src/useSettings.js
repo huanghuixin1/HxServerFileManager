@@ -1,21 +1,28 @@
 import { ref } from 'vue'
 import { api } from './api.js'
 
-// 全局单例偏好设置：FileManager（收藏目录）与 Terminal（宏）共享同一份数据，
+// 全局单例偏好设置：FileManager（收藏目录）、Terminal（宏 + 命令历史）共享同一份数据，
 // 模块级状态 + 幂等的 ensureLoaded，任意组件挂载时调用一次即可。改动后调用对应 save*。
 const favorites = ref([]) // FavoriteDir[]：{id, connectionId, name, path, createdAt, updatedAt}
 const macros = ref([]) // TerminalMacro[]：{id, name, command, createdAt, updatedAt}
+// CommandHistoryItem[]：{connKey, command, cwd, exitStatus, createdAt}，按 connKey 隔离
+const history = ref([])
+
+// 每个连接最多保留的命令历史条数（与后端 SettingsStore.AppendHistory 的 200 一致）
+const HISTORY_LIMIT = 200
 
 let loadedOnce = false
 
 async function ensureLoaded() {
   if (loadedOnce) return
-  const [fav, mac] = await Promise.all([
+  const [fav, mac, hist] = await Promise.all([
     api.getFavorites().catch(() => ({ favorites: [] })),
     api.getMacros().catch(() => ({ macros: [] })),
+    api.getHistory().catch(() => ({ history: [] })),
   ])
   favorites.value = fav.favorites || []
   macros.value = mac.macros || []
+  history.value = hist.history || []
   loadedOnce = true
 }
 
@@ -24,12 +31,45 @@ function newId() {
   return 'id-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
 }
 
+// 记录一条已执行的命令（快捷命令回车 / 交互终端按回车执行）。
+// 本地先行更新（UI 即时可见），再 POST 到后端持久化；失败静默（下次 GET 会以服务端为准修正）。
+function addHistory(connKey, command, cwd, exitStatus) {
+  const cmd = (command || '').trim()
+  if (!connKey || !cmd) return
+  const item = {
+    connKey,
+    command: cmd,
+    cwd: cwd || '',
+    exitStatus: exitStatus ?? -1,
+    createdAt: new Date().toISOString(),
+  }
+  // 同一连接同一命令只留最新一条（时间戳刷新置顶，类似 shell history 的重复执行）
+  const others = history.value.filter((h) => !(h.connKey === connKey && h.command === cmd))
+  history.value = [...others, item]
+  // 每连接上限：超过丢最旧
+  const perKey = history.value.filter((h) => h.connKey === connKey)
+  if (perKey.length > HISTORY_LIMIT) {
+    const drop = new Set(perKey.slice(0, perKey.length - HISTORY_LIMIT))
+    history.value = history.value.filter((h) => !(h.connKey === connKey && drop.has(h)))
+  }
+  api.addHistory(item).catch(() => {})
+}
+
+// 清空某连接的命令历史（本地立即清，DELETE 后端失败时下次加载会带回旧数据）
+function clearHistory(connKey) {
+  history.value = history.value.filter((h) => h.connKey !== connKey)
+  api.clearHistory(connKey).catch(() => {})
+}
+
 export function useSettings() {
   return {
     favorites,
     macros,
+    history,
     ensureLoaded,
     newId,
+    addHistory,
+    clearHistory,
     saveFavorites: async () => {
       await api.putFavorites(favorites.value)
     },

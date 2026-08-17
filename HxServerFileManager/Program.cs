@@ -10,6 +10,7 @@ using Renci.SshNet.Common;
 using Renci.SshNet.Sftp;
 using System.Collections.Concurrent;
 using System.Net.WebSockets;
+using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -1031,6 +1032,7 @@ app.MapGet("/api/logs/stream", async (HttpContext ctx, OperationLogger log) =>
 app.MapGet("/api/health", () => Results.Ok(new
 {
     status = "ok",
+    version = AppVersion(),
     maxUploadBytes = maxUploadMb > 0 ? maxUploadMb * 1024 * 1024L : 0,
     desktop = Environment.GetEnvironmentVariable("HXSFM_DESKTOP") == "1",
 }));
@@ -1052,6 +1054,30 @@ app.MapPut("/api/settings/macros", (List<TerminalMacro> macros, SettingsStore st
 {
     store.ReplaceMacros(macros);
     return Results.Ok(new { macros = store.ListMacros() });
+});
+
+// ---- 命令历史：Terminal 执行过的命令，双击可再次执行 ----
+app.MapGet("/api/settings/history", (SettingsStore store) =>
+    Results.Ok(new { history = store.ListHistory() }));
+
+app.MapPost("/api/settings/history", (AddHistoryRequest req, SettingsStore store) =>
+{
+    if (string.IsNullOrWhiteSpace(req.ConnKey) || string.IsNullOrWhiteSpace(req.Command))
+        return Results.BadRequest(new { error = "缺少连接标识或命令" });
+    store.AppendHistory(new CommandHistoryItem(
+        req.ConnKey,
+        req.Command.Trim(),
+        req.Cwd ?? "",
+        req.ExitStatus,
+        DateTime.Now));
+    return Results.Ok(new { ok = true });
+});
+
+// 清空指定连接的命令历史（connKey 为空则清空全部）
+app.MapDelete("/api/settings/history", (string? connKey, SettingsStore store) =>
+{
+    store.ClearHistory(connKey);
+    return Results.Ok(new { ok = true });
 });
 
 // ---- 服务器状态：系统版本 / 开机时间 / CPU / 内存 / 磁盘 / 网络 ----
@@ -1152,9 +1178,21 @@ app.MapGet("/api/net-stream", async (string connId, HttpContext ctx, ConnectionM
     return Results.Empty;
 });
 
+Console.WriteLine($"[HxServerFileManager] 版本 {AppVersion()}");
 Console.WriteLine($"[HxServerFileManager] Kestrel 已启动，监听 http://0.0.0.0:{listenPort}");
 Console.WriteLine("[HxServerFileManager] 按 Ctrl+C 停止服务");
         return app;
+    }
+
+    // 应用版本号：读取程序集 InformationalVersion（csproj 的 <Version>），
+    // 去掉可能附加的 +git哈希 后缀只留纯版本号。桌面壳标题也读这里，保证两边一致。
+    public static string AppVersion()
+    {
+        var asm = typeof(WebHost).Assembly;
+        var info = asm.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (string.IsNullOrEmpty(info)) info = asm.GetName().Version?.ToString() ?? "0.0.0";
+        var plus = info.IndexOf('+');
+        return plus >= 0 ? info.Substring(0, plus) : info;
     }
 }
 
@@ -1467,12 +1505,16 @@ public record FileEntry(string Name, string FullPath, bool IsDirectory, long Siz
 
 public record LogEntry(DateTime Time, string Level, string Connection, string Action, string Detail, string? Result);
 
-// ---- 用户偏好设置：常用目录（收藏）+ 终端宏 ----
+// ---- 用户偏好设置：常用目录（收藏）+ 终端宏 + 命令历史 ----
 // ConnKey = 连接稳定标识（前端：已保存连接用 profileId，未保存用 username@host:port）。
-// connectionId 每次重连都会变，不能当持久键；ConnKey 保证收藏/宏跨重连仍归属同一台服务器。
+// connectionId 每次重连都会变，不能当持久键；ConnKey 保证收藏/宏/历史跨重连仍归属同一台服务器。
 public record FavoriteDir(string Id, string ConnectionId, string ConnKey, string Name, string Path, DateTime CreatedAt, DateTime UpdatedAt);
 public record TerminalMacro(string Id, string ConnKey, string Name, string Command, DateTime CreatedAt, DateTime UpdatedAt);
-public record UserSettings(List<FavoriteDir> Favorites, List<TerminalMacro> Macros);
+// 命令历史：Terminal 里实际执行过的命令（快捷命令一次一条；交互终端按回车切分），双击可再次执行。
+// Cwd = 命令执行时所在目录（快捷命令模式有值；交互终端未知时为 null/空）。
+public record CommandHistoryItem(string ConnKey, string Command, string Cwd, int ExitStatus, DateTime CreatedAt);
+public record AddHistoryRequest(string? ConnKey, string? Command, string? Cwd, int ExitStatus);
+public record UserSettings(List<FavoriteDir> Favorites, List<TerminalMacro> Macros, List<CommandHistoryItem> History);
 
 /// <summary>
 /// 一个到 Linux 服务器的 SSH/SFTP 会话。
@@ -2145,12 +2187,17 @@ public sealed class SettingsStore
         _settings = Load();
     }
 
-    private static UserSettings Empty() => new(new List<FavoriteDir>(), new List<TerminalMacro>());
+    private static UserSettings Empty() => new(new List<FavoriteDir>(), new List<TerminalMacro>(), new List<CommandHistoryItem>());
 
     private UserSettings Load()
     {
         if (!File.Exists(_file)) return Empty();
-        try { return JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(_file)) ?? Empty(); }
+        try
+        {
+            var s = JsonSerializer.Deserialize<UserSettings>(File.ReadAllText(_file)) ?? Empty();
+            // 旧版本 settings.json 没有 History 字段（反序列化为 null），统一规整为空列表
+            return s with { Favorites = s.Favorites ?? new(), Macros = s.Macros ?? new(), History = s.History ?? new() };
+        }
         catch { return Empty(); } // 文件损坏视为无设置，不阻断启动
     }
 
@@ -2185,6 +2232,47 @@ public sealed class SettingsStore
         lock (_gate)
         {
             _settings = _settings with { Macros = macros ?? new List<TerminalMacro>() };
+            Save();
+        }
+    }
+
+    public IReadOnlyList<CommandHistoryItem> ListHistory()
+    {
+        lock (_gate) return (_settings.History ?? new List<CommandHistoryItem>()).ToList();
+    }
+
+    // 追加一条命令历史：同一连接同一命令只保留最新一条（重复执行时时间戳刷新置顶，类似 shell 的 history）；
+    // 每个连接最多保留最近 200 条，超出丢最旧。
+    public void AppendHistory(CommandHistoryItem item)
+    {
+        lock (_gate)
+        {
+            var list = _settings.History ?? new List<CommandHistoryItem>();
+            list = list
+                .Where(h => h.ConnKey != item.ConnKey || h.Command != item.Command)
+                .Append(item)
+                .ToList();
+            var perKey = list.Where(h => h.ConnKey == item.ConnKey).ToList();
+            if (perKey.Count > 200)
+            {
+                var drop = perKey.Take(perKey.Count - 200).ToHashSet();
+                list = list.Where(h => !(h.ConnKey == item.ConnKey && drop.Contains(h))).ToList();
+            }
+            _settings = _settings with { History = list };
+            Save();
+        }
+    }
+
+    // 清空命令历史；connKey 为空时清空全部（前端按连接逐个清）。
+    public void ClearHistory(string? connKey)
+    {
+        lock (_gate)
+        {
+            var list = _settings.History ?? new List<CommandHistoryItem>();
+            list = string.IsNullOrEmpty(connKey)
+                ? new List<CommandHistoryItem>()
+                : list.Where(h => h.ConnKey != connKey).ToList();
+            _settings = _settings with { History = list };
             Save();
         }
     }
