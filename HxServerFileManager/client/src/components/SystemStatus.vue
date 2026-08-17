@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
-import { api } from '../api.js'
+import { api, openNetStream } from '../api.js'
 
 const props = defineProps({
   connId: String,
@@ -13,7 +13,9 @@ const detailVisible = ref(false) // 「详情」弹窗
 const auto = ref(true)            // 迷你状态栏自动刷新
 const updatedAt = ref(null)
 let timer = null
-let prevNetSnap = null // 上一次的网络采样，用于计算实时上行/下行速率
+// 实时上下行：后端 SSE（/api/net-stream）每秒推一帧 { nets, totalRxBps, totalTxBps, warmup }
+const live = ref(null)
+let netEs = null
 
 // ---- 格式化辅助 ----
 function formatBytes(n) {
@@ -100,6 +102,7 @@ function barWidth(p) {
 }
 
 // ---- 采集 ----
+// 系统版本 / 开机 / CPU / 内存 / 磁盘走 10s 轮询；网络速率不在这里算，交给 SSE 实时流。
 // silent=true：后台自动刷新（10s 轮询），失败不弹 toast——会话断开时
 // 避免每 10 秒弹一次 "Client not connected." 刷屏，断开状态由 App 的会话健康横幅提示
 async function load(silent = false) {
@@ -108,24 +111,6 @@ async function load(silent = false) {
   try {
     status.value = await api.systemStatus(props.connId)
     updatedAt.value = new Date()
-    // 网络速率：基于两次采样的字节差 / 时间差（bytes/s）
-    const nets = status.value?.nets || []
-    const now = Date.now()
-    if (prevNetSnap && now - prevNetSnap.ts > 800) {
-      const dt = (now - prevNetSnap.ts) / 1000
-      for (const n of nets) {
-        const p = prevNetSnap.nets.find((x) => x.name === n.name)
-        n.rxRateBps = (p && n.rxBytes >= p.rx && n.txBytes >= p.tx)
-          ? Math.max(0, (n.rxBytes - p.rx) / dt)
-          : 0
-        n.txRateBps = (p && n.rxBytes >= p.rx && n.txBytes >= p.tx)
-          ? Math.max(0, (n.txBytes - p.tx) / dt)
-          : 0
-      }
-    } else {
-      for (const n of nets) { /* 首次无差值，速率记 0 */ n.rxRateBps = 0; n.txRateBps = 0 }
-    }
-    prevNetSnap = { ts: now, nets: nets.map((n) => ({ name: n.name, rx: n.rxBytes, tx: n.txBytes })) }
   } catch (e) {
     if (!silent) ElMessage.error(e.message || '获取服务器状态失败')
   } finally {
@@ -146,14 +131,31 @@ function stopAuto() {
   }
 }
 
+// ---- 实时上下行（1 秒一帧，MobaXterm 风格）----
+function startNetStream() {
+  stopNetStream()
+  if (!props.connId) return
+  netEs = openNetStream(props.connId, (msg) => { live.value = msg }, 1)
+}
+
+function stopNetStream() {
+  if (netEs) {
+    netEs.close()
+    netEs = null
+  }
+  live.value = null
+}
+
 watch(
   () => props.connId,
   (id) => {
     if (id) {
       load()
       startAuto()
+      startNetStream()
     } else {
       stopAuto()
+      stopNetStream()
       status.value = null
     }
   },
@@ -167,7 +169,10 @@ watch(detailVisible, (open) => {
   if (open) load()
 })
 
-onUnmounted(stopAuto)
+onUnmounted(() => {
+  stopAuto()
+  stopNetStream()
+})
 
 // ---- mini 条展示值 ----
 const shortOs = computed(() => {
@@ -200,15 +205,32 @@ const mainDisks = computed(() => {
   return [...list].sort((a, b) => (a.mount === '/' ? -1 : b.mount === '/' ? 1 : 0)).slice(0, 3)
 })
 
+// ---- 网络：实时流优先，退回轮询 ----
+const liveMap = computed(() => {
+  const m = {}
+  for (const n of live.value?.nets || []) m[n.name] = n
+  return m
+})
+
 const netSummary = computed(() => {
+  const l = live.value
+  if (l && !l.warmup) return `↓ ${formatRate(l.totalRxBps)} ↑ ${formatRate(l.totalTxBps)}`
+  if (l) return '采样中…' // 已连上实时流，等第二帧才有速率
   const nets = status.value?.nets || []
-  const up = nets.filter((n) => n.state === 'up').length
   if (!nets.length) return ''
   const down = nets.reduce((s, n) => s + (n.rxRateBps || 0), 0)
   const up_ = nets.reduce((s, n) => s + (n.txRateBps || 0), 0)
-  // 首次采样无速率差，仅显示接口数
-  if (!down && !up_) return `${up}/${nets.length} 网卡`
+  if (!down && !up_) return `${nets.filter((n) => n.state === 'up').length}/${nets.length} 网卡`
   return `↓ ${formatRate(down)} ↑ ${formatRate(up_)}`
+})
+
+// 详情弹窗网卡表：连接状态（operstate）来自 10s 轮询，速率/累计字节优先用实时流的值；
+// 轮询没采到网卡时用实时流的列表兜底（状态列显示「未知」）
+const viewNets = computed(() => {
+  const polled = status.value?.nets || []
+  const lm = liveMap.value
+  if (!polled.length) return (live.value?.nets || []).map((n) => ({ ...n }))
+  return polled.map((n) => (lm[n.name] ? { ...n, ...lm[n.name], state: n.state } : n))
 })
 
 function formatRate(bps) {
@@ -269,7 +291,7 @@ function formatRate(bps) {
       </span>
     </div>
 
-    <div v-if="netSummary" class="ss-item" title="网络上下行速率（10 秒窗口平均）" @click="detailVisible = true">
+    <div v-if="netSummary" class="ss-item" title="网络实时上下行（1 秒采样）" @click="detailVisible = true">
       <span class="lbl">网络</span>
       <span class="val mono">{{ netSummary }}</span>
     </div>
@@ -387,8 +409,9 @@ function formatRate(bps) {
           <div class="ss-block">
             <div class="ss-card-label">
               <el-icon><Connection /></el-icon>网络状态
+              <span class="ss-live">{{ live ? (live.warmup ? '实时采样中…' : `实时 · ${live.intervalSec}s`) : '实时流未连接（速率为 10s 均值）' }}</span>
             </div>
-            <el-table :data="status.nets" empty-text="未采集到网卡信息（容器内可能无 /proc/net/dev）" size="small" max-height="200">
+            <el-table :data="viewNets" empty-text="未采集到网卡信息（容器内可能无 /proc/net/dev）" size="small" max-height="200">
               <el-table-column prop="name" label="网卡" width="140" />
               <el-table-column label="状态" width="100">
                 <template #default="{ row }">
@@ -581,6 +604,11 @@ function formatRate(bps) {
   color: #2d6cdf;
 }
 .net-total {
+  color: #a0abba;
+  font-size: 11.5px;
+}
+.ss-live {
+  margin-left: auto;
   color: #a0abba;
   font-size: 11.5px;
 }

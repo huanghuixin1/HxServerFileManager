@@ -1072,6 +1072,86 @@ app.MapGet("/api/system-status", (string connId, ConnectionManager mgr) =>
     catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 });
 
+// ---- 实时网络上下行（SSE，MobaXterm 风格）----
+// 一条常驻 exec 通道里每 interval 秒 `cat /proc/net/dev`，后端按相邻两次快照算瞬时速率推给前端。
+// 不每秒新开 SSH 通道（会争用会话 + 每次都要重新握手），也不依赖远端 awk / /sys。
+var netJson = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+app.MapGet("/api/net-stream", async (string connId, HttpContext ctx, ConnectionManager mgr, int? interval) =>
+{
+    SshSession s;
+    try { s = mgr.Get(connId); }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+    var sec = Math.Clamp(interval ?? 1, 1, 10);
+
+    ctx.Response.Headers.Append("Content-Type", "text/event-stream");
+    ctx.Response.Headers.Append("Cache-Control", "no-cache");
+    ctx.Response.Headers.Append("Connection", "keep-alive");
+    ctx.Response.Headers.Append("X-Accel-Buffering", "no");
+
+    // 客户端断开或服务停机（shutdownCts）都会取消本循环，否则停机会被这个长连接拖住
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, shutdownCts.Token);
+
+    using var cmd = s.Ssh.CreateCommand(SystemStatusHelpers.NetStreamScript(sec));
+    cmd.CommandTimeout = Timeout.InfiniteTimeSpan;
+    cmd.BeginExecute();
+
+    // PipeStream 的 Read 是阻塞的、取消令牌管不着，所以放后台线程逐行读进有界 Channel；
+    // 退出时 using cmd 释放通道 → 阻塞的 Read 返回 → 读取线程自然结束（远端 while 循环随通道关闭终止）
+    var lines = Channel.CreateBounded<string>(
+        new BoundedChannelOptions(4096) { FullMode = BoundedChannelFullMode.DropOldest });
+    _ = Task.Run(() =>
+    {
+        try
+        {
+            using var sr = new StreamReader(cmd.OutputStream, Encoding.UTF8);
+            string? line;
+            while ((line = sr.ReadLine()) != null) lines.Writer.TryWrite(line);
+        }
+        catch { /* 通道释放 / SSH 断开 */ }
+        finally { lines.Writer.TryComplete(); }
+    });
+
+    var block = new List<string>();
+    List<NetStatus>? prev = null;
+    DateTime prevTs = default;
+    try
+    {
+        await foreach (var line in lines.Reader.ReadAllAsync(cts.Token))
+        {
+            if (!line.StartsWith(SystemStatusHelpers.NetTickMarker, StringComparison.Ordinal))
+            {
+                if (block.Count < 512) block.Add(line);
+                continue;
+            }
+
+            var now = DateTime.UtcNow;
+            var cur = SystemStatusHelpers.ParseNetDev(block);
+            block.Clear();
+            var dt = prevTs == default ? 0 : (now - prevTs).TotalSeconds;
+            prevTs = now;
+            var nets = SystemStatusHelpers.WithRates(cur, prev, dt);
+            prev = nets;
+            s.Touch(); // 看状态期间不算空闲，防 30 分钟空闲回收把会话掐掉
+
+            var payload = new
+            {
+                intervalSec = sec,
+                warmup = dt <= 0, // 首帧只有累计字节、没有速率
+                nets,
+                totalRxBps = nets.Sum(n => n.RxRateBps),
+                totalTxBps = nets.Sum(n => n.TxRateBps),
+            };
+            await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(payload, netJson)}\n\n", cts.Token);
+            await ctx.Response.Body.FlushAsync(cts.Token);
+        }
+    }
+    catch (OperationCanceledException) { /* 客户端断开 / 服务停机 */ }
+    catch (Exception) { /* 会话断开等：静默收尾，前端 EventSource 会自己重连 */ }
+    // 响应已开始，不能返回 Results.Ok()（重复设状态码会抛）；Empty 不触碰状态码
+    return Results.Empty;
+});
+
 Console.WriteLine($"[HxServerFileManager] Kestrel 已启动，监听 http://0.0.0.0:{listenPort}");
 Console.WriteLine("[HxServerFileManager] 按 Ctrl+C 停止服务");
         return app;
@@ -2134,7 +2214,17 @@ public record SystemStatus(
 /// </summary>
 public static class SystemStatusHelpers
 {
-    public const string Script = """
+    /// <summary>
+    /// 远程采集脚本。**必须用 <see cref="Sh"/> 归一化换行后再发给远端**：本文件是 CRLF，
+    /// 逐字发出去时每行结尾都带 \r，远端 bash 把 `2>&amp;1\r` 里的 `&amp;1\r` 当文件名 →
+    /// "ambiguous redirect"，整条命令不执行（历史 bug：NET 段因此永远为空）。
+    /// </summary>
+    public static readonly string Script = Sh(ScriptRaw);
+
+    /// <summary>把脚本里的 CRLF 换成 LF（远端是 sh，\r 会被当命令的一部分）。</summary>
+    public static string Sh(string script) => script.Replace("\r\n", "\n");
+
+    private const string ScriptRaw = """
         echo "===META==="
         hostname 2>&1 || echo "unknown"
         date +%s 2>&1 || echo "0"
@@ -2322,5 +2412,47 @@ public static class SystemStatusHelpers
             }
         }
         _netSnap[connId] = new NetSnapshot(now, cur);
+    }
+
+    // ---- 实时上下行（MobaXterm 风格）：一条常驻 exec 通道里循环 cat /proc/net/dev ----
+    // 不用 awk / 不读 /sys（最小化容器里都可能缺），字段解析全在 C# 侧做，兼容性最好。
+    public const string NetTickMarker = "===TICK===";
+
+    public static string NetStreamScript(int intervalSec) => Sh(
+        "while :; do cat /proc/net/dev 2>/dev/null || exit 1; echo \"" + NetTickMarker + "\"; " +
+        "sleep " + intervalSec + "; done\n");
+
+    /// <summary>解析 /proc/net/dev 的一次快照（`name: rx … tx …`，rx=第1列、tx=第9列，跳过 lo 和两行表头）。</summary>
+    public static List<NetStatus> ParseNetDev(IEnumerable<string> block)
+    {
+        var list = new List<NetStatus>();
+        foreach (var raw in block)
+        {
+            var line = raw.Trim().TrimEnd('\r');
+            var colon = line.IndexOf(':');
+            if (colon <= 0) continue;
+            var name = line.Substring(0, colon).Trim();
+            if (name.Length == 0 || name == "lo" || name.Contains(' ') || name.Contains('|')) continue;
+            var f = line.Substring(colon + 1).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (f.Length < 9) continue;
+            if (!long.TryParse(f[0], out var rx) || !long.TryParse(f[8], out var tx)) continue;
+            list.Add(new NetStatus(name, "unknown", rx, tx));
+        }
+        return list;
+    }
+
+    /// <summary>用相邻两次快照算每张网卡的瞬时速率（B/s）。计数器回绕/重置时按 0 处理。</summary>
+    public static List<NetStatus> WithRates(List<NetStatus> cur, List<NetStatus>? prev, double dt)
+    {
+        if (prev is null || dt <= 0) return cur;
+        for (int i = 0; i < cur.Count; i++)
+        {
+            var p = prev.FirstOrDefault(x => x.Name == cur[i].Name);
+            if (p is null) continue;
+            var rx = cur[i].RxBytes >= p.RxBytes ? (cur[i].RxBytes - p.RxBytes) / dt : 0;
+            var tx = cur[i].TxBytes >= p.TxBytes ? (cur[i].TxBytes - p.TxBytes) / dt : 0;
+            cur[i] = cur[i] with { RxRateBps = rx, TxRateBps = tx };
+        }
+        return cur;
     }
 }

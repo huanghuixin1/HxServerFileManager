@@ -325,6 +325,21 @@ export function openLogStream(onMessage) {
   return es
 }
 
+// SSE 实时网络上下行（后端常驻一条 SSH 通道每 intervalSec 秒采一次 /proc/net/dev 并算速率）
+export function openNetStream(connId, onMessage, intervalSec = 1) {
+  const token = getToken()
+  const qs = new URLSearchParams({ connId, interval: String(intervalSec) })
+  if (token) qs.set('token', token)
+  const es = new EventSource(`/api/net-stream?${qs.toString()}`)
+  es.onmessage = (e) => {
+    try {
+      onMessage(JSON.parse(e.data))
+    } catch (_) { /* ignore */ }
+  }
+  es.onerror = () => { /* 会话断开等：EventSource 自己重连 */ }
+  return es
+}
+
 // ---- 桌面壳（Photino）消息桥 ----
 // JS→C#：window.external.sendMessage(JSON)；C#→JS：window.external.receiveMessage = fn（Photino 注入）。
 // 仅存在于桌面壳（WebView2）；普通浏览器里 window.external 没有 sendMessage，静默跳过。
