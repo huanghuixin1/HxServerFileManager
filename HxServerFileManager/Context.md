@@ -7,6 +7,7 @@
 - 前端：Vue3 + Vite 工程（`client/`），构建产物输出到 `../wwwroot`。
 
 ## 已完成
+- ✅ 删除非空文件夹修复：`/api/delete` 原来对目录走 SFTP `DeleteDirectory`（只删空目录，有内容直接抛异常），且 `sftp.DeleteFile` 对符号链接会跟随并删掉链接目标（危险）。现一律走远端 `rm -rf --`：文件/空目录/非空目录/链接通吃，链接只删链接本身；加根目录/`..` 穿越守卫。
 - ✅ 命令历史 + 版本号：**历史 SSH 命令查看/双击执行** —— Terminal 实际执行过的命令（快捷命令回车 + 交互终端按回车）记入 `Data/settings.json`（`CommandHistoryItem`：connKey/command/cwd/exitStatus/createdAt，按连接隔离，同一命令重复执行只留最新一条，每连接上限 200 条），端点 `GET/POST/DELETE /api/settings/history`；前端 `useSettings.history` 全局状态 + Terminal「命令历史」按钮弹窗（时间/命令/目录/状态，**双击一行或点「执行」再次执行**——交互模式直接发到终端并回车、快捷命令模式填入输入框立即跑），可「清空本连接历史」（确认后 DELETE）。交互终端记录靠 `sendInput` 按回车切分输入缓冲（控制字符/转义序列/方向键清缓冲，避免拼出脏行）。**版本号**：两项目 csproj 加 `<Version>1.0.0</Version>`；HX 启动时打印 `版本 1.0.0`、`/api/health` 返回 `version` 字段（`WebHost.AppVersion()` 读 InformationalVersion 去 `+哈希` 后缀）；桌面壳窗口标题 `HxServerFileManager v1.0.0`（同样读 `WebHost.AppVersion()`，与 HX 一致）。
 - ✅ 网络状态修复 + 实时上下行：网卡列表一直为空的根因是**源码里的 CRLF 泄漏进远端 shell**（NET 段 awk 末行 `2>&1` 变成 `2>&1\r` → bash `ambiguous redirect`，命令根本没执行），修复为发送前统一 `Sh()` 归一化换行。新增 SSE `GET /api/net-stream?connId=&interval=1`：常驻一条 SSH exec 通道每秒 `cat /proc/net/dev`，后端按相邻两帧算 B/s 推给前端；迷你状态栏显示 `↓/↑` 实时速率，详情表网卡速率/累计字节走实时流、连接状态仍来自 10s 轮询。
 - ✅ 磁盘视图排除 docker/containerd 容器挂载：`/api/system-status` 的 df awk 过滤 `/var/lib/docker/`、`/var/lib/containerd/` 前缀挂载点（overlay2/<hash>、containers/<id>/shm、snapshot 等每容器一条的噪音），`/var/lib/docker` 根挂载保留；前端 SystemStatus 详情表格（`viewDisks`）与迷你条（`mainDisks`）同样过滤。

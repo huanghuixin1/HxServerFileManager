@@ -473,16 +473,29 @@ app.MapPost("/api/rename", (RenameRequest req, ConnectionManager mgr, OperationL
 });
 
 // 删除（文件或目录）
+// 一律走远端 rm -rf：SFTP 的 DeleteDirectory 只删空目录，目录里有文件直接抛异常；
+// 且实测（busybox sftp-server）sftp.DeleteFile 对符号链接会跟随并删除链接目标（删 link 目标一起没，
+// GetAttributes 对文件链接也返回目标属性导致链接检测不可靠）——rm 则文件/空目录/非空目录/链接通吃，
+// 链接只删链接本身、绝不追进目标，最安全。-- 结束选项解析防名称以 - 开头。
 app.MapPost("/api/delete", (PathRequest req, ConnectionManager mgr, OperationLogger log) =>
 {
     try
     {
         var s = mgr.Get(req.ConnectionId);
+        // 防路径穿越/误删根目录：name 来自文件列表（绝不含 ..），API 直接调用时也要拦
+        if (string.IsNullOrWhiteSpace(req.Name) || req.Name.Contains(".."))
+            return Results.BadRequest(new { error = "非法的删除路径" });
         var full = CombinePath(req.Path, req.Name);
-        if (s.Sftp.Exists(full) && s.Sftp.GetAttributes(full).IsDirectory)
-            s.Sftp.DeleteDirectory(full);
-        else
-            s.Sftp.DeleteFile(full);
+        if (full == "/")
+            return Results.BadRequest(new { error = "不允许删除根目录" });
+
+        if (s.Sftp.Exists(full))
+        {
+            using var cmd = s.Ssh.CreateCommand($"rm -rf -- {Shq(full)}");
+            cmd.Execute();
+            if (cmd.ExitStatus != 0)
+                return Results.BadRequest(new { error = string.IsNullOrWhiteSpace(cmd.Error) ? $"删除失败（exit={cmd.ExitStatus}）" : cmd.Error.Trim() });
+        }
         log.Log("info", req.ConnectionId, "删除", full);
         return Results.Ok(new { deleted = full });
     }
