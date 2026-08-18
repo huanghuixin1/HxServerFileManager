@@ -7,6 +7,7 @@
 - 前端：Vue3 + Vite 工程（`client/`），构建产物输出到 `../wwwroot`。
 
 ## 已完成
+- ✅ macOS Intel（amd64）编译支持：build.sh 交互菜单新增「macOS Intel .app」选项，「全部桌面」扩为四平台（Windows + Linux + macOS ARM + Intel）；`.app` 产物改带架构后缀 `dist/HxServerFileManager-<rid>.app`（双架构共存不覆盖），新增 CLI 目标 `mac-app-osx-arm64`/`mac-app-osx-x64`；实测 Windows 构建机产出 Mach-O x86_64 的 `HxServerFileManager-osx-x64.app`。
 - ✅ server 启动脚本随发布带入 + 后台运行：`build.sh server` 发布 Linux 服务端时自动把 `start-linux.sh` 拷进产物目录（此前不在）+ 对主程序 chmod +x（Windows 产物默认无执行位）；`start-linux.sh` 重写：**默认后台启动**（nohup + hxsfm.log + hxsfm.pid，1s 存活探测），`-f` 前台，`stop`/`restart`/`status`/`-h`，支持端口参数、`.env`、`PORT` 等环境变量；脚本侧 `find_binary` 会先补执行位再启动（Windows 打 tar 传 Linux 丢执行位的兜底）。真机（Alpine）实测后台/状态/停止/重启/前台全流程通过；Alpine 需 musl 版发布（`-r linux-musl-x64`）且容器要装 libstdc++/libgcc，属环境依赖非脚本问题。
 - ✅ 连接列表「重连」→「连接」+ 立即开 tab：右侧已保存连接列表的按钮改为「连接」，点击走 App.vue `openSaved` 立即开占位 tab（与顶栏「已保存连接」下拉一致）。
 - ✅ 删除非空文件夹修复：`/api/delete` 原来对目录走 SFTP `DeleteDirectory`（只删空目录，有内容直接抛异常），且 `sftp.DeleteFile` 对符号链接会跟随并删掉链接目标（危险）。现一律走远端 `rm -rf --`：文件/空目录/非空目录/链接通吃，链接只删链接本身；加根目录/`..` 穿越守卫。

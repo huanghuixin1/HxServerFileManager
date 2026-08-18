@@ -16,10 +16,12 @@
 #   linux-arm64  树莓派 / ARM 服务器（同上依赖）
 #   osx-x64      macOS Intel（.NET 需 macOS 12+）
 #   osx-arm64    macOS Apple Silicon（.NET 需 macOS 11+）
-#   mac-app      macOS 打包成双击可开的 .app 包（RID 默认 osx-arm64，可写 ./build.sh mac-app osx-x64）
+#   mac-app      macOS 打包成双击可开的 .app 包（RID 默认 osx-arm64，可写 ./build.sh mac-app osx-x64
+#                或 ./build.sh mac-app-osx-x64 指定 Intel；产物 dist/HxServerFileManager-<rid>.app，
+#                ARM/Intel 双架构可共存、互不覆盖）
 #                注意：Windows 上只能组包，签名需拿到 Mac 上执行 codesign（见脚本尾部提示）
 #   server       后端服务端（默认 RID=linux-x64，可用 -r 覆盖；也可发布到 Windows）
-#   all          构建上面全部桌面目标（不包含 server 与 mac-app）
+#   all          构建全部桌面目标（win-x64 + linux-x64 + osx-arm64 普通目录，不含 server 与 mac-app）
 #
 # 选项：
 #   -r RID     server 目标的 RID（默认 linux-x64）
@@ -35,7 +37,7 @@
 # 产物布局：
 #   dist/<rid>/            桌面壳（直接双击运行，或拷贝整目录到目标机）
 #   dist/<rid>.zip|.tar.gz 打包产物
-#   dist/HxServerFileManager.app                  macOS 应用包
+#   dist/HxServerFileManager-<rid>.app            macOS 应用包（osx-arm64 / osx-x64）
 #   dist/HxServerFileManager-macos-<rid>.zip      macOS 应用压缩包
 #   dist/server/<rid>/     后端服务端
 # ============================================================================
@@ -54,7 +56,7 @@ PACK=1
 TARGETS=()
 
 usage() {
-  sed -n '2,38p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,44p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 die() { echo "错误：$*" >&2; exit 1; }
@@ -65,6 +67,8 @@ while [[ $# -gt 0 ]]; do
       TARGETS+=("$1") ;;
     server)  TARGETS+=(server) ;;
     mac-app) TARGETS+=(mac-app) ;;
+    mac-app-osx-arm64|mac-app-osx-x64)
+      TARGETS+=("$1") ;;
     all)     TARGETS=(win-x64 linux-x64 osx-arm64) ;;
     -r|--rid)    SERVER_RID="$2"; shift ;;
     -s|--self-contained) SELF_CONTAINED=1 ;;
@@ -87,10 +91,10 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
     echo "  1) Windows 桌面壳             (win-x64)"
     echo "  2) Linux 桌面壳               (linux-x64)"
     echo "  3) macOS Apple Silicon .app    (mac-app / osx-arm64，推荐)"
-    echo "  4) macOS ARM 普通发布目录      (osx-arm64)"
+    echo "  4) macOS Intel .app            (mac-app / osx-x64)"
     echo "  5) Linux 服务端                (server / linux-x64)"
-    echo "  6) 全部桌面三平台              (Windows + Linux + macOS .app)"
-    echo "  7) 全部桌面三平台 + 服务端"
+    echo "  6) 全部桌面四平台              (Windows + Linux + macOS ARM + Intel .app)"
+    echo "  7) 全部桌面四平台 + 服务端"
     echo "  0) 退出"
     echo "----------------------------------------------"
     while true; do
@@ -99,10 +103,10 @@ if [[ ${#TARGETS[@]} -eq 0 ]]; then
         1) TARGETS=(win-x64); break;;
         2) TARGETS=(linux-x64); break;;
         3) TARGETS=(mac-app); break;;
-        4) TARGETS=(osx-arm64); break;;
+        4) TARGETS=(mac-app osx-x64); break;;
         5) TARGETS=(server); break;;
-        6) TARGETS=(win-x64 linux-x64 mac-app); break;;
-        7) TARGETS=(win-x64 linux-x64 mac-app server); break;;
+        6) TARGETS=(win-x64 linux-x64 mac-app-osx-arm64 mac-app-osx-x64); break;;
+        7) TARGETS=(win-x64 linux-x64 mac-app-osx-arm64 mac-app-osx-x64 server); break;;
         0) echo "已退出"; exit 0;;
         *) echo "无效输入，请重新选择。";;
       esac
@@ -137,14 +141,22 @@ publish_desktop() {
   local outdir="$OUT/$rid"
   echo
   echo "══════════════════════════════════════════════════"
-  echo "▶ 发布桌面壳：$rid  ($SC_NOTE)"
+  if [[ "$rid" == osx-* ]]; then
+    echo "▶ 发布桌面壳：$rid  (自包含（目标机免装 .NET）)"
+  else
+    echo "▶ 发布桌面壳：$rid  ($SC_NOTE)"
+  fi
   echo "══════════════════════════════════════════════════"
   # 先清空再发布：dotnet publish 重复发布到同一目录（DeleteExistingFiles）会把
   # 已存在但不在当前发布列表的文件清掉，也可能因中途失败留下不完整产物（缺原生库等）。
   # 干净目录发布保证产物完整、无残留（mac-app 用 staging 目录也是同一原因）。
   rm -rf "$outdir"
+  # mac 目标固定自包含发布：目标 Mac 免装 .NET 运行时，不受 -s 开关影响。
+  # （框架依赖的 mac 包在没有装 .NET 的机器上双击会报"这台 Mac 不支持此应用程序"，毫无意义）
+  local sc=("${sc_flag[@]}")
+  [[ "$rid" == osx-* ]] && sc=("--self-contained" "true")
   dotnet publish "$DESKTOP_PROJECT" -c Release -r "$rid" \
-    "${sc_flag[@]}" \
+    "${sc[@]}" \
     -p:PublishSingleFile="$SINGLE_FILE" \
     -p:IncludeNativeLibrariesForSelfExtract=false \
     -o "$outdir"
@@ -292,19 +304,20 @@ pack() {
 # wwwroot/Data 等由 ContentRoot 解析逻辑定位（Program.cs 优先取可执行文件所在目录），
 # 双击启动（cwd=/）也能找到前端页面。签名与去隔离标记必须在 Mac 上执行（见 build_mac_app 尾部提示）。
 build_mac_app() {
-  local rid="$MAC_RID"
-  local app="$OUT/HxServerFileManager.app"
+  local rid="${1:-$MAC_RID}"
+  local app="$OUT/HxServerFileManager-$rid.app"
   local bin_dir="$app/Contents/MacOS"
   # 先发到全新 staging 目录再拷贝组装：dotnet publish 重复发布同一目录时（DeleteExistingFiles）
   # 会把 configs/Photino.Native.dylib 等"已存在但不在当前发布列表"的文件清掉，仅 staging 可避免。
   local stage="$OUT/.mac-stage-$rid"
   echo
   echo "══════════════════════════════════════════════════"
-  echo "▶ 打包 macOS .app：$rid  ($SC_NOTE)"
+  echo "▶ 打包 macOS .app：$rid  (自包含（目标机免装 .NET）)"
   echo "══════════════════════════════════════════════════"
   rm -rf "$stage"
+  # mac 目标固定自包含发布（免装 .NET 运行时），不受 -s 开关影响
   dotnet publish "$DESKTOP_PROJECT" -c Release -r "$rid" \
-    "${sc_flag[@]}" \
+    --self-contained true \
     -p:PublishSingleFile="$SINGLE_FILE" \
     -p:IncludeNativeLibrariesForSelfExtract=false \
     -o "$stage"
@@ -352,30 +365,32 @@ PLIST
   # 把图标放这里则补上 CFBundleIconFile 键；仓库暂无 .icns，先用通用图标。
   # 打包成 zip（在 Windows 上压缩会丢执行位/权限，解压后按下方提示 chmod + codesign）
   echo "▶ 打包 $app"
+  local appname="HxServerFileManager-$rid.app"
   if [[ "$PACK" == 1 ]]; then
     if command -v zip >/dev/null 2>&1; then
-      ( cd "$OUT" && zip -qr "HxServerFileManager-macos-$rid.zip" HxServerFileManager.app )
+      ( cd "$OUT" && zip -qr "HxServerFileManager-macos-$rid.zip" "$appname" )
     elif tar --version 2>/dev/null | grep -qi bsdtar; then
-      ( cd "$OUT" && tar -a -cf "HxServerFileManager-macos-$rid.zip" HxServerFileManager.app )
+      ( cd "$OUT" && tar -a -cf "HxServerFileManager-macos-$rid.zip" "$appname" )
     else
-      ( cd "$OUT" && tar -czf "HxServerFileManager-macos-$rid.tar.gz" HxServerFileManager.app )
+      ( cd "$OUT" && tar -czf "HxServerFileManager-macos-$rid.tar.gz" "$appname" )
     fi
   fi
 
   echo
   echo "⚠️   到 Mac 上执行（Apple Silicon 上未签名 arm64 程序会被内核直接杀掉，必须签）：
   cd $OUT
-  chmod +x HxServerFileManager.app/Contents/MacOS/HxServerFileManager.Desktop
-  codesign --force --deep -s - HxServerFileManager.app
+  chmod +x $app/Contents/MacOS/HxServerFileManager.Desktop
+  codesign --force --deep -s - $app
   # 若是从网络下载得到的，还需去掉隔离标记：
-  xattr -dr com.apple.quarantine HxServerFileManager.app
-  # 然后双击 HxServerFileManager.app 即可（或 open HxServerFileManager.app）
+  xattr -dr com.apple.quarantine $app
+  # 然后双击 $app 即可（或 open $app）
   # 可选：正式分发用真证书替换 -s - ；把图标 .icns 放进 Contents/Resources 并在 Info.plist 加 CFBundleIconFile"
 }
 
 for t in "${TARGETS[@]}"; do
   if [[ "$t" == "server" ]]; then build_server
-  elif [[ "$t" == "mac-app" ]]; then build_mac_app
+  elif [[ "$t" == "mac-app" ]]; then build_mac_app "$MAC_RID"
+  elif [[ "$t" == mac-app-osx-* ]]; then build_mac_app "${t#mac-app-}"
   else publish_desktop "$t"
   fi
 done
@@ -389,5 +404,6 @@ echo "各平台注意："
 echo "  Windows (win-x64) : 目标机需 WebView2 Runtime（Win10/11 通常已装）"
 echo "  Linux (linux-*)   : sudo apt install libwebkit2gtk-4.1-0 libgtk-3-0 libglib2.0-0"
 echo "                      （若窗口空白，先试 WEBKIT_DISABLE_COMPOSITING_MODE=1 ./HxServerFileManager.Desktop）"
-echo "  macOS (osx-* / mac-app) : 目标机需 macOS + .NET 10 运行时（-s 自包含则免装）；"
-echo "                          .app 需在 Mac 上 codesign --force --deep -s - 后双击（Apple Silicon 必须）"
+echo "  macOS (osx-* / mac-app) : 自包含发布，目标机无需安装 .NET；但架构必须匹配——Apple Silicon 用 osx-arm64，Intel 用 osx-x64，"
+echo "                          架构不对双击会报「这台 Mac 不支持此应用程序」。"
+echo "                          .app（dist/HxServerFileManager-<rid>.app）需在 Mac 上 codesign --force --deep -s - 后双击（Apple Silicon 必须）"

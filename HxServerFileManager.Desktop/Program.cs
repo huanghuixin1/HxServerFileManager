@@ -2,6 +2,7 @@ using System.Formats.Tar;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
 using Photino.NET;
 
 // 桌面壳：后台启动 Kestrel Web 服务，前台弹 Photino WebView 窗口指向 localhost。
@@ -10,9 +11,11 @@ using Photino.NET;
 // 三个坑（都是实测踩出来的，不要回退）：
 // 1) 入口方法不能是 async —— Photino 的消息循环必须同步运行，
 //    top-level statement 里出现 await 就会生成 async Task Main，窗口白屏。
-// 2) Photino 窗口必须开在 STA 线程 —— .NET 主线程默认 MTA，
-//    WebView2 在 MTA 线程上初始化直接失败（0x80010106 RPC_E_CHANGED_MODE），
-//    且 Photino 静默吞掉该错误，表现为窗口白屏、无任何 WebView2 子进程。
+// 2) 窗口创建线程分平台：Windows 必须 STA 线程（WebView2 在 MTA 线程上初始化直接失败
+//    0x80010106 RPC_E_CHANGED_MODE，且主线程默认 MTA、启动后不可改公寓状态）；
+//    macOS 必须在主线程（AppKit 在主线程外建 NSWindow 直接抛
+//    "NSWindow drag regions should only be invalidated on the Main Thread!"）；
+//    Linux（GTK/WebKitGTK）同 macOS，也用主线程。
 // 3) Photino.NET 必须用 4.x —— 3.0.14 在 Windows 上建出的窗口失效（只剩标题栏）。
 
 // 随机选一个可用端口，避免与独立运行的实例冲突
@@ -54,8 +57,10 @@ var logoPath = TryExtractLogoPng();
 if (OperatingSystem.IsLinux())
     InstallLinuxIcon(logoPath);
 
-// 在 STA 线程上创建并运行 Photino 窗口（见上方坑 2；WaitForClose 阻塞该线程跑消息循环）
-var uiThread = new Thread(() =>
+// 创建并运行 Photino 窗口（WaitForClose 阻塞当前线程跑消息循环）。
+// 线程策略：Windows 新开 STA 线程（WebView2 要求，主线程默认 MTA 且不可改）；
+// macOS / Linux 必须在主线程上直接调用（AppKit / GTK 只允许主线程建窗口，见上方坑 2）。
+static void ShowWindow(WebApplication app, string url, string? logoPath)
 {
     var window = new PhotinoWindow()
         // 标题带版本号：版本从主项目程序集读取（WebHost.AppVersion），与 HX 独立运行的版本一致
@@ -285,11 +290,21 @@ var uiThread = new Thread(() =>
     }
 
     window.WaitForClose();
-});
+}
+
 if (OperatingSystem.IsWindows())
+{
+    // WebView2 只能在 STA 线程创建（主线程默认 MTA、启动后不可改公寓状态），新开线程并设 STA
+    var uiThread = new Thread(() => ShowWindow(app, url, logoPath));
     uiThread.SetApartmentState(ApartmentState.STA); // Windows 上 WebView2 只能在 STA 线程创建
-uiThread.Start();
-uiThread.Join();
+    uiThread.Start();
+    uiThread.Join();
+}
+else
+{
+    // macOS / Linux：AppKit / GTK 只允许主线程操作 UI，必须在进程主线程上直接创建窗口
+    ShowWindow(app, url, logoPath);
+}
 
 // 窗口关闭后停掉 Kestrel 再退出
 app.StopAsync().GetAwaiter().GetResult();
