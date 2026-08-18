@@ -178,8 +178,8 @@ onMounted(() => {
   checkSession()
 })
 
-// ---- SSH 连接断开检测 + 按 R 重连 ----
-// 定期轮询后端会话健康接口，发现某活跃连接断开时显示提示条，支持按 R 键重连、Esc 关闭。
+// ---- SSH 连接断开检测 ----
+// 定期轮询后端会话健康接口，发现某活跃连接断开时把标签标记为断开（文字变红），按 R 只重连当前标签。
 const broken = ref([])             // 已断开、等待处理的连接（元素为 connections 里的对象）
 const reconnectBusy = ref(false)
 let healthTimer = null
@@ -189,7 +189,14 @@ function displayName(c) {
   return c.name || `${c.username}@${c.host}:${c.port}`
 }
 
-// 轮询会话健康：仅在「之前正常 -> 现在断开」时新增提示，避免重复弹
+// 该连接是否处于断开待重连状态（标签栏文字变红）
+// 注意：必须按 uid 匹配——broken 里存的是 connections 的对象引用，重连时
+// connectionId 会被原地改掉（见 doReconnect），按 connectionId 匹配会残留红色
+function isBroken(c) {
+  return broken.value.some((b) => b.uid === c.uid)
+}
+
+// 轮询会话健康：仅在「之前正常 -> 现在断开」时新增标记，避免重复
 async function checkSessionHealth() {
   if (!authed.value || connections.value.length === 0) return
   let alive = new Set()
@@ -201,14 +208,14 @@ async function checkSessionHealth() {
   }
   for (const c of connections.value) {
     if (c.pending) continue // 连接中：尚未建立，跳过健康检查
-    if (!alive.has(c.connectionId) && !broken.value.some((b) => b.connectionId === c.connectionId)) {
+    if (!alive.has(c.connectionId) && !broken.value.some((b) => b.uid === c.uid)) {
       broken.value.push(c)
     }
   }
-  // broken 中已恢复（重新出现在存活列表/连接已移除）的清除
-  broken.value = broken.value.filter(
-    (b) => !b.pending && connections.value.some((c) => c.connectionId === b.connectionId) && !alive.has(b.connectionId)
-  )
+  // 只清掉「连接已关闭/移除」的遗留条目。不能因后端 sessionsHealth 显示 alive 就清除：
+  // 前端 WS 已断但后端 SSH 会话还挂着时，会话健康查出来仍是 connected，
+  // 一清红色就没了（用户实测：过一会儿/开新 tab 变灰）
+  broken.value = broken.value.filter((b) => connections.value.some((c) => c.uid === b.uid))
 }
 
 // 重连一个断开连接（走已保存的 profileId；无 profile 的只能提示手动重连）
@@ -219,6 +226,7 @@ async function doReconnect(conn) {
     return
   }
   reconnectBusy.value = true
+  const uid = conn.uid // uid 重连前后不变，broken 里存的是对象引用，按 uid 才能精确清除
   const oldId = conn.connectionId
   const oldCwd = cwdMap[oldId] || conn.homeDirectory || '/'
   try {
@@ -227,7 +235,7 @@ async function doReconnect(conn) {
     const tab = connections.value.find((c) => c.connectionId === oldId)
     if (!tab) {
       // tab 已被用户关闭：按新会话直接新增
-      broken.value = broken.value.filter((b) => b.connectionId !== oldId)
+      broken.value = broken.value.filter((b) => b.uid !== uid)
       handleConnected({ ...res, port: conn.port, authType: conn.authType }, oldCwd)
       ElMessage.success(`${displayName(conn)} 已重连`)
     } else {
@@ -245,16 +253,16 @@ async function doReconnect(conn) {
         delete termRefs[oldId]
       }
       if (activeId.value === oldId) activeId.value = newId
-      broken.value = broken.value.filter((b) => b.connectionId !== oldId)
+      broken.value = broken.value.filter((b) => b.uid !== uid)
       // 同一 xterm 实例上按新 connId 重建 WebSocket（Terminal.reconnect 关旧 ws 后重开）
       termRefs[newId]?.reconnect?.()
       ElMessage.success(`${displayName(tab)} 已重连`)
     }
   } catch (e) {
     // 重连失败：**不删 tab**，连接对象原样保留（含旧 connectionId），
-    // 并把连接重新放回 broken，横幅继续提示可按 R 再试
-    broken.value = broken.value.filter((b) => b.connectionId !== oldId)
-    if (connections.value.some((c) => c.connectionId === oldId) && !broken.value.some((b) => b.connectionId === oldId))
+    // 并把连接重新放回 broken，标签保持红色可按 R 再试
+    broken.value = broken.value.filter((b) => b.uid !== uid)
+    if (connections.value.some((c) => c.uid === uid) && !broken.value.some((b) => b.uid === uid))
       broken.value.push(conn)
     ElMessage.error(`重连 ${displayName(conn)} 失败：${e.message}`)
   } finally {
@@ -262,23 +270,23 @@ async function doReconnect(conn) {
   }
 }
 
-// 终端 WebSocket 关闭（SSH 断开/网络异常）：加入 broken 提示，等用户按 R 重连
+// 终端 WebSocket 关闭（SSH 断开/网络异常）：标记该连接断开（标签变红），按 R 可重连当前标签
 function onTermDisconnected(conn) {
   if (!conn) return
-  if (!connections.value.some((c) => c.connectionId === conn.connectionId)) return
-  if (broken.value.some((b) => b.connectionId === conn.connectionId)) return
+  if (!connections.value.some((c) => c.uid === conn.uid)) return
+  if (broken.value.some((b) => b.uid === conn.uid)) return
   broken.value.push(conn)
 }
 
-// 键盘：有断开连接时 R 重连第一个、Esc 关闭提示
+// 键盘：R 只重连当前激活的标签（若它已断开）；不再全量重连
 function onGlobalKeydown(e) {
-  if (broken.value.length === 0) return
   const k = e.key.toLowerCase()
   if (k === 'r' && !e.ctrlKey && !e.metaKey && !e.altKey) {
-    e.preventDefault()
-    doReconnect(broken.value[0])
-  } else if (k === 'escape') {
-    broken.value = []
+    const cur = connections.value.find((c) => c.connectionId === activeId.value)
+    if (cur && broken.value.some((b) => b.uid === cur.uid)) {
+      e.preventDefault()
+      doReconnect(cur)
+    }
   }
 }
 
@@ -359,8 +367,12 @@ function handleConnected(payload, restoreCwd) {
   const conn = toConn(payload)
   // 同一 connectionId 去重（如重连同一台）
   const idx = connections.value.findIndex((c) => c.connectionId === conn.connectionId)
-  if (idx >= 0) connections.value.splice(idx, 1, conn)
-  else connections.value.push(conn)
+  if (idx >= 0) {
+    connections.value.splice(idx, 1, conn)
+    // 新对象替换了 connections 里的引用，broken 里存的是旧引用（uid 相同），
+    // 必须按 uid 清掉，否则该连接仍会被 isBroken 判红
+    broken.value = broken.value.filter((b) => b.uid !== conn.uid)
+  } else connections.value.push(conn)
   activeId.value = conn.connectionId
   connectVisible.value = false
   editor.value = { open: false, connId: null, path: null }
@@ -374,8 +386,10 @@ async function disconnectConn(connId) {
     await api.disconnect(connId)
   } catch (_) { /* 忽略：会话可能已被后端回收 */ }
   // 断开时 Terminal 的 ws close 会在 tab 移除前触发 onTermDisconnected，
-  // 这里把该连接从 broken 中一并清掉，避免手动关闭后仍弹「连接已断开」
-  broken.value = broken.value.filter((b) => b.connectionId !== connId)
+  // 这里把该连接从 broken 中一并清掉，避免手动关闭后仍显示红色断开标记
+  const uid = connections.value.find((c) => c.connectionId === connId)?.uid
+  if (uid) broken.value = broken.value.filter((b) => b.uid !== uid)
+  else broken.value = broken.value.filter((b) => b.connectionId !== connId)
   const idx = connections.value.findIndex((c) => c.connectionId === connId)
   if (idx >= 0) connections.value.splice(idx, 1)
   delete cwdMap[connId]
@@ -689,7 +703,7 @@ async function pollServerCopy() {
         v-for="c in connections"
         :key="c.connectionId"
         class="sess-tab"
-        :class="{ active: activeId === c.connectionId }"
+        :class="{ active: activeId === c.connectionId, broken: isBroken(c) }"
         role="tab"
         :aria-selected="activeId === c.connectionId"
         @click="activeId = c.connectionId"
@@ -775,21 +789,6 @@ async function pollServerCopy() {
     </main>
 
     <LogPanel v-if="logEnabled" />
-
-    <!-- SSH 连接断开提示：按 R 重连，Esc 关闭 -->
-    <transition name="slide-down">
-      <div v-if="broken.length" class="broken-banner">
-        <el-icon class="warn"><WarningFilled /></el-icon>
-        <span class="txt">
-          连接已断开：<b>{{ broken.map(displayName).join('、') }}</b> — 按 <b class="key">R</b> 重连，
-          <b class="key">Esc</b> 关闭
-        </span>
-        <el-button size="small" type="warning" :loading="reconnectBusy" @click="doReconnect(broken[0])">
-          重连
-        </el-button>
-        <el-icon class="close" title="关闭" @click="broken = []"><Close /></el-icon>
-      </div>
-    </transition>
 
     <!-- 服务器状态：底部迷你状态栏（常驻）+ 点“详情”弹窗（连接中不显示） -->
     <SystemStatus v-if="activeConn && !activeConn.pending" :conn-id="activeId" />
@@ -1038,6 +1037,12 @@ async function pollServerCopy() {
 .t-dot.on {
   background: #2ecc71;
 }
+.sess-tab.broken .t-label {
+  color: #e5484d;
+}
+.sess-tab.broken .t-dot {
+  background: #e5484d;
+}
 .t-close {
   font-size: 13px;
   border-radius: 50%;
@@ -1149,65 +1154,6 @@ async function pollServerCopy() {
   .workspace.term-max > .term {
     flex: 1 0 100%;
   }
-}
-/* SSH 连接断开提示条 */
-.broken-banner {
-  position: fixed;
-  top: 12px;
-  left: 50%;
-  transform: translateX(-50%);
-  z-index: 2001;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 10px 14px;
-  background: #fffbe6;
-  border: 1px solid #ffe58f;
-  border-radius: 10px;
-  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.12);
-  color: #7a5c00;
-  font-size: 13.5px;
-  max-width: 90vw;
-}
-.broken-banner .warn {
-  color: #faad14;
-  font-size: 18px;
-}
-.broken-banner .txt {
-  flex: 1;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.broken-banner b.key {
-  display: inline-block;
-  min-width: 18px;
-  text-align: center;
-  padding: 0 5px;
-  margin: 0 2px;
-  border: 1px solid #d9c36a;
-  border-bottom-width: 2px;
-  border-radius: 4px;
-  background: #fff;
-  color: #7a5c00;
-  font-size: 12px;
-}
-.broken-banner .close {
-  cursor: pointer;
-  color: #b9a34d;
-  font-size: 15px;
-}
-.broken-banner .close:hover {
-  color: #7a5c00;
-}
-.slide-down-enter-active,
-.slide-down-leave-active {
-  transition: all 0.25s ease;
-}
-.slide-down-enter-from,
-.slide-down-leave-to {
-  opacity: 0;
-  transform: translateX(-50%) translateY(-12px);
 }
 
 /* ---- 服务器间直传对话框 ---- */

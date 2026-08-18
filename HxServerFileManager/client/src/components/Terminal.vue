@@ -360,7 +360,7 @@ async function openInteractive() {
           }
         } catch (_) { /* ignore */ }
       }
-      // 连接异常/关闭：在终端里写一条醒目提示，并通知 App 显示重连横幅
+      // 连接异常/关闭：在终端里写一条醒目提示，并通知 App 把标签标记为断开（红色）
       ws.onclose = () => {
         if (manualClose) { manualClose = false; return } // 主动关闭不提示
         if (xterm) writeDisconnectedBanner()
@@ -455,7 +455,7 @@ function writeDisconnectedBanner() {
   const line = '\r\n'
   xterm.writeln(line + '\x1b[1;5;31m┌────────────────────────────────────────┐\x1b[0m')
   xterm.writeln('\x1b[1;5;31m│   ⚠ SSH 连接已断开                       │\x1b[0m')
-  xterm.writeln('\x1b[1;5;31m│   按 R 键重连，或在底部横幅点「重连」   │\x1b[0m')
+  xterm.writeln('\x1b[1;5;31m│   按 R 键重连当前标签                    │\x1b[0m')
   xterm.writeln('\x1b[1;5;31m└────────────────────────────────────────┘\x1b[0m' + line)
 }
 
