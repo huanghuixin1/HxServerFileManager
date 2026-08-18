@@ -86,15 +86,13 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
                 req = JsonSerializer.Deserialize<DesktopRequest>(message, DesktopBridge.JsonOpts);
                 if (req?.Op == "saveFile")
                 {
-                    // 用 Win32 GetSaveFileName 而非 Photino 的 ShowSaveFile：Photino 4.0.22 native Create()
-                    // 会用 SHCreateItemFromParsingName 的返回值覆盖 CoCreateInstance 的成功 HRESULT，保存目标
-                    // 文件不存在、解析必失败（0x80070002）→ 对话框不弹直接返回 null（已实测复现）。
-                    // Win32 版还能预填默认文件名，不再需要用户手动输入。
-                    var path = Win32Dialogs.SaveFile(
+                    // 用跨平台对话框（Windows=Win32 GetSaveFileName 可预填默认文件名、绕开 Photino
+                    // 4.0.16 在 Windows 上的 HRESULT 覆盖 bug；macOS/Linux=Photino 原生对话框）。
+                    var path = Dialogs.SaveFileDialog(
+                        window,
                         "导出连接",
                         req.DefaultName ?? "hxsfm-connections.json",
-                        "JSON 文件 (*.json)\0*.json\0所有文件 (*.*)\0*.*\0",
-                        "json");
+                        [("JSON 文件 (*.json)", ["*.json"]), ("所有文件 (*.*)", ["*.*"])]);
                     if (path != null)
                     {
                         // 后缀校验：用户没输入 .json 结尾时补上，保证导出文件扩展名一致
@@ -111,7 +109,7 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
                 else if (req?.Op == "downloadMany")
                 {
                     // 批量下载（多选文件/文件夹）：选一个本地文件夹，远端 tar 流解包到该目录（保留目录结构）
-                    var folder = Win32Dialogs.PickFolder("选择下载保存文件夹");
+                    var folder = Dialogs.PickFolderDialog(window, "选择下载保存文件夹");
                     if (folder == null)
                     {
                         DesktopBridge.SendResponse(window, new { op = "downloadManyResult", id = req.Id, ok = false, canceled = true });
@@ -217,11 +215,11 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
                 {
                     // 弹原生「另存为」对话框选保存位置，默认文件名 = 远端文件名（用户要求）
                     var srcExt = Path.GetExtension(req.DefaultName ?? "");
-                    var path = Win32Dialogs.SaveFile(
+                    var path = Dialogs.SaveFileDialog(
+                        window,
                         "下载文件",
                         req.DefaultName ?? "download",
-                        "所有文件 (*.*)\0*.*\0",
-                        string.IsNullOrEmpty(srcExt) ? null : srcExt.TrimStart('.'));
+                        [("所有文件 (*.*)", ["*.*"])]);
                     if (path == null)
                     {
                         DesktopBridge.SendResponse(window, new { op = "downloadFileResult", ok = false, canceled = true });
@@ -454,12 +452,39 @@ static class AppState
     }
 }
 
-// ---- Win32 原生「另存为」对话框 ----
-// 用 GetSaveFileName 替代 Photino 的 ShowSaveFile：Photino 4.0.22 的 native Create() 会用
-// SHCreateItemFromParsingName 的返回值覆盖 CoCreateInstance 的成功 HRESULT（保存目标文件不存在、
-// 解析必失败 0x80070002）→ 对话框不弹直接返回 null（已实测复现）。Win32 版支持预填默认文件名。
-static class Win32Dialogs
+// ---- 跨平台「另存为/选文件夹」对话框 ----
+// Windows 用 Win32 GetSaveFileName（能预填默认文件名、绕开 Photino 4.0.16 在 Windows 上
+// SHCreateItemFromParsingName 覆盖 HRESULT 导致保存对话框不弹的 bug，见下）；
+// macOS/Linux 用 Photino 原生对话框（AppKit NSSavePanel / GTK FileChooser）——
+// 不能走 Win32 P/Invoke（comdlg32.dll / shell32.dll 不存在，一调就 DllNotFoundException）。
+static class Dialogs
 {
+    // 跨平台「另存为」：Windows 用 Win32 GetSaveFileName（Photino 4.0.22 在 Windows 上
+    // native Create() 会用 SHCreateItemFromParsingName 的返回值覆盖 CoCreateInstance 的成功 HRESULT，
+    // 保存目标文件不存在解析必失败 0x80070002 → 对话框不弹直接返回 null，已实测复现；
+    // Win32 版还能预填默认文件名）；macOS/Linux 用 Photino 原生对话框（AppKit/GTK 实现，不走 comdlg32）。
+    // 返回用户选择的完整路径；取消返回 null。
+    public static string? SaveFileDialog(PhotinoWindow window, string title, string defaultName, (string desc, string[] exts)[] filters)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            // 转成 OPENFILENAME 的 \0 分隔过滤器串：desc\0ext1;ext2\0...\0
+            var winFilter = string.Concat(filters.Select(f => $"{f.desc}\0{string.Join(';', f.exts)}\0")) + "\0";
+            return SaveFile(title, defaultName, winFilter, null);
+        }
+        var picked = window.ShowSaveFile(title, defaultName, filters);
+        return string.IsNullOrEmpty(picked) ? null : picked;
+    }
+
+    // 跨平台「选文件夹」：Windows 用 SHBrowseForFolder；macOS/Linux 用 Photino 原生对话框。
+    public static string? PickFolderDialog(PhotinoWindow window, string title)
+    {
+        if (OperatingSystem.IsWindows())
+            return PickFolder(title);
+        var dirs = window.ShowOpenFolder(title, Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), multiSelect: false);
+        return dirs is { Length: > 0 } ? dirs[0] : null;
+    }
+
     [DllImport("comdlg32.dll", CharSet = CharSet.Auto, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetSaveFileName(ref OPENFILENAME ofn);

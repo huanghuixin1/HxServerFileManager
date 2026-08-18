@@ -333,6 +333,36 @@ build_mac_app() {
   local bin="$bin_dir/HxServerFileManager.Desktop"
   [[ -f "$bin" ]] && chmod +x "$bin"
   rm -rf "$stage"
+
+  # macOS .app 图标：Contents/Resources/logo.icns + Info.plist 的 CFBundleIconFile。
+  # .app 文件在 Finder/Dock 里显示的图标来自 icns（运行时 SetIconFile 只影响窗口/Dock 运行中图标）。
+  # macOS 上用 iconutil（sips+iconutil 最标准）；Windows 组包没有 iconutil，用 make-icns.ps1（System.Drawing 缩放打包）。
+  mkdir -p "$app/Contents/Resources"
+  if [[ -f "logo.png" ]]; then
+    if command -v iconutil >/dev/null 2>&1 && command -v sips >/dev/null 2>&1; then
+      local iconset="$OUT/.logo-$rid.iconset"
+      rm -rf "$iconset"
+      mkdir -p "$iconset"
+      for s in 16 32 64 128 256 512 1024; do
+        sips -z "$s" "$s" logo.png --out "$iconset/icon_${s}x${s}.png" >/dev/null 2>&1 || true
+      done
+      iconutil -c icns "$iconset" -o "$app/Contents/Resources/logo.icns" && echo "  ✔ 图标：iconutil → Resources/logo.icns"
+      rm -rf "$iconset"
+    elif command -v powershell >/dev/null 2>&1 || command -v pwsh >/dev/null 2>&1; then
+      local ps="$OUT/.make-icns-$rid.ps1"
+      cp "make-icns.ps1" "$ps"
+      if command -v powershell >/dev/null 2>&1; then
+        powershell -NoProfile -ExecutionPolicy Bypass -File "$ps" logo.png "$app/Contents/Resources/logo.icns" \
+          && echo "  ✔ 图标：make-icns.ps1 → Resources/logo.icns"
+      else
+        pwsh -NoProfile -ExecutionPolicy Bypass -File "$ps" logo.png "$app/Contents/Resources/logo.icns" \
+          && echo "  ✔ 图标：make-icns.ps1 → Resources/logo.icns"
+      fi
+      rm -f "$ps"
+    else
+      echo "  ⚠ 未找到 iconutil/powershell，跳过 .app 图标生成（可用通用图标）"
+    fi
+  fi
   cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -348,6 +378,8 @@ build_mac_app() {
   <string>HxServerFileManager.Desktop</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>logo</string>
   <key>CFBundleShortVersionString</key>
   <string>1.0.0</string>
   <key>CFBundleVersion</key>
@@ -362,7 +394,6 @@ build_mac_app() {
 </plist>
 PLIST
 
-  # 把图标放这里则补上 CFBundleIconFile 键；仓库暂无 .icns，先用通用图标。
   # 打包成 zip（在 Windows 上压缩会丢执行位/权限，解压后按下方提示 chmod + codesign）
   echo "▶ 打包 $app"
   local appname="HxServerFileManager-$rid.app"
@@ -376,13 +407,47 @@ PLIST
     fi
   fi
 
+  # 生成一键修复脚本：Windows 打的压缩包会丢 Unix 执行位（NTFS 无 +x），macOS 双击 .app
+  # 时 LaunchServices 检查到二进制无执行权限直接报「无法打开」。脚本补执行位 + 去隔离标记
+  # + ad-hoc 签名（Apple Silicon 未签名 arm64 会被内核杀掉），并直接 open 启动。
+  cat > "$OUT/fix-mac-$rid.sh" <<FIXSH
+#!/usr/bin/env bash
+# HxServerFileManager macOS 启动修复脚本（每次从 Windows 打包传输后，在 Mac 上执行一次）
+# 用法：bash fix-mac-$rid.sh     （脚本与 .app 同目录）
+# 脚本与架构无关：任一架构的 fix 脚本都能修复同目录下的 arm64 / x64 .app（自动匹配）。
+set -euo pipefail
+APP_DIR="\$(cd "\$(dirname "\${BASH_SOURCE[0]}")" && pwd)"
+FOUND=0
+for app_cand in "\$APP_DIR"/HxServerFileManager-*.app; do
+  [[ -d "\$app_cand" ]] || continue
+  FOUND=1
+  echo "◉ 目标应用：\$app_cand"
+  echo "▶ 补执行位…"
+  chmod -R +x "\$app_cand"
+  echo "▶ 去隔离标记…"
+  xattr -dr com.apple.quarantine "\$app_cand" 2>/dev/null || true
+  echo "▶ ad-hoc 签名（Apple Silicon 必需）…"
+  codesign --force --deep -s - "\$app_cand"
+  echo "✔ 修复完成"
+done
+[[ "\$FOUND" == 1 ]] || { echo "错误：未找到 HxServerFileManager-*.app（脚本需与 .app 同目录）" >&2; exit 1; }
+if [[ "\$FOUND" == 1 ]]; then
+  echo "▶ 启动全部修复的应用…"
+  for app_cand in "\$APP_DIR"/HxServerFileManager-*.app; do
+    [[ -d "\$app_cand" ]] && open "\$app_cand" || true
+  done
+fi
+FIXSH
+  echo "  ✔ 已生成：$OUT/fix-mac-$rid.sh（拷到 Mac 后 bash fix-mac-$rid.sh 一键修复并启动）"
+
   echo
   echo "⚠️   到 Mac 上执行（Apple Silicon 上未签名 arm64 程序会被内核直接杀掉，必须签）：
   cd $OUT
-  chmod +x $app/Contents/MacOS/HxServerFileManager.Desktop
-  codesign --force --deep -s - $app
-  # 若是从网络下载得到的，还需去掉隔离标记：
-  xattr -dr com.apple.quarantine $app
+  bash fix-mac-$rid.sh
+  # 或手动三步：
+  #   chmod -R +x $app
+  #   xattr -dr com.apple.quarantine $app
+  #   codesign --force --deep -s - $app
   # 然后双击 $app 即可（或 open $app）
   # 可选：正式分发用真证书替换 -s - ；把图标 .icns 放进 Contents/Resources 并在 Info.plist 加 CFBundleIconFile"
 }
