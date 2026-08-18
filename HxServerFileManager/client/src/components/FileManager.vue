@@ -1,7 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, isDesktop, desktopDownloadFile, desktopDownloadMany } from '../api.js'
+import { api, getToken, isDesktop, desktopDownloadFile, desktopDownloadMany, desktopUploadDropped, onDesktopEvent } from '../api.js'
 import { useSettings } from '../useSettings.js'
 
 // 常用目录收藏（后端 Data/settings.json）：按连接隔离，跳转/添加/管理
@@ -133,6 +133,7 @@ const props = defineProps({
   externalPath: { type: String, default: null }, // 终端推送的目录（syncCwd 开启时跟随）
   hasOtherConns: { type: Boolean, default: false }, // 是否存在其他活跃连接（决定「发送到连接」是否可用）
   refreshToken: { type: Number, default: 0 }, // App 在服务器间直传完成后 +1，触发本列表重新加载
+  active: { type: Boolean, default: true }, // 是否为当前激活标签（Linux 桌面拖放消息只让激活标签响应）
 })
 const emit = defineEmits(['open-file', 'navigate', 'update:sync-cwd', 'send-to-connection'])
 
@@ -237,6 +238,14 @@ function menuDelete() {
 
 onMounted(() => document.addEventListener('click', closeMenu))
 onUnmounted(() => document.removeEventListener('click', closeMenu))
+
+// Linux 桌面壳拖放事件订阅的取消函数（onMounted 注册，onUnmounted 注销）
+let unsubDragState = null
+let unsubDrop = null
+onUnmounted(() => {
+  unsubDragState?.()
+  unsubDrop?.()
+})
 
 // ---- 行单选/多选（Shift 范围选，Ctrl/Cmd 加减选，类似 Windows/Mac 文件管理器）----
 const tableRef = ref(null)
@@ -369,6 +378,18 @@ onMounted(() => {
       uploadLimitBytes.value = h.maxUploadBytes > 0 ? h.maxUploadBytes : Infinity
     })
     .catch(() => {})
+  // Linux 桌面壳拖放（C# 消息桥）：只响应当前激活标签，隐藏标签的 FileManager 忽略
+  unsubDragState = onDesktopEvent('desktopDragState', (msg) => {
+    if (!props.active) return
+    desktopDragActive = !!msg.active
+    dragOver.value = desktopDragActive || domDragDepth > 0
+  })
+  unsubDrop = onDesktopEvent('desktopDrop', (msg) => {
+    if (!props.active) return
+    desktopDragActive = false
+    dragOver.value = false
+    if (msg?.paths?.length) runDesktopDropUpload(msg.paths)
+  })
 })
 watch(() => props.connId, () => load(props.initialDir))
 
@@ -644,21 +665,24 @@ async function collectEntries(entry, basePath, dirs, items) {
   }
 }
 
-// ---- 拖拽上传：文件/文件夹/混搭一次拖入（浏览器唯一能同时选文件和文件夹的方式）----
+// ---- 拖拽上传提示层 ----
+// Windows/浏览器：DOM drag 事件驱动；Linux（WebKitGTK 外部文件拖放有 bug，DOM 事件不触发）：
+// 由桌面壳 GTK 层接管拖放，经消息桥发 desktopDragState/desktopDrop 驱动（只响应当前激活标签）。
 const dragOver = ref(false)
-let dragDepth = 0
+let domDragDepth = 0 // DOM 拖入/拖出深度计数（子元素 enter/leave 成对出现）
+let desktopDragActive = false // 桌面壳（Linux GTK）拖拽中
 
 function onDragEnter() {
-  dragDepth++
-  dragOver.value = true
+  domDragDepth++
+  dragOver.value = desktopDragActive || domDragDepth > 0
 }
 function onDragLeave() {
-  dragDepth = Math.max(0, dragDepth - 1)
-  if (dragDepth === 0) dragOver.value = false
+  domDragDepth = Math.max(0, domDragDepth - 1)
+  if (domDragDepth === 0) dragOver.value = desktopDragActive
 }
 
 async function onDrop(e) {
-  dragDepth = 0
+  domDragDepth = 0
   dragOver.value = false
   if (uploading.value) {
     ElMessage.warning('已有上传任务进行中，请先完成或停止')
@@ -666,10 +690,17 @@ async function onDrop(e) {
   }
   const dirs = []
   const items = []
-  const entries = [...(e.dataTransfer?.items || [])]
-    .filter((it) => it.kind === 'file')
-    .map((it) => it.webkitGetAsEntry())
-    .filter(Boolean)
+  // webkitGetAsEntry 在部分 WebKit（含 WebKitGTK）缺失，直接调用会抛异常吞掉整个 onDrop，
+  // 这里容错：取不到时退回下面的 dataTransfer.files 兜底（文件夹会丢失，仅浏览器端）
+  let entries = []
+  try {
+    entries = [...(e.dataTransfer?.items || [])]
+      .filter((it) => it.kind === 'file')
+      .map((it) => it.webkitGetAsEntry?.() || null)
+      .filter(Boolean)
+  } catch (_) {
+    entries = []
+  }
   if (entries.length) {
     for (const entry of entries) {
       if (entry.isFile) {
@@ -691,8 +722,55 @@ async function onDrop(e) {
   await runUploads(dirs, items)
 }
 
+// ---- Linux 桌面壳拖拽上传 ----
+// C# 的 GTK 层拿到本地路径列表后经 desktopDrop 消息回传（JS 无法读任意本地路径），
+// 这里把连接信息回传，由壳进程代读代传（复用 /api/ensure-dirs + /api/upload），进度面板与手动上传共用
+async function runDesktopDropUpload(paths) {
+  if (uploading.value) {
+    ElMessage.warning('已有上传任务进行中，请先完成或停止')
+    return
+  }
+  uploading.value = true
+  error.value = ''
+  uploadIndex.value = 0
+  uploadTotal.value = paths.length
+  uploadName.value = '正在扫描文件…'
+  uploadProgress.value = 0
+  try {
+    const { promise, cancel } = desktopUploadDropped(
+      location.origin,
+      props.connId,
+      cwd.value,
+      paths,
+      getToken(),
+      (msg) => {
+        uploadIndex.value = msg.index
+        uploadTotal.value = msg.total
+        uploadName.value = msg.name
+        uploadProgress.value = msg.percent ?? 0
+      }
+    )
+    droppedUploadCancel = cancel
+    const res = await promise
+    if (res) {
+      ElMessage.success(`成功上传 ${res.count} 个文件`)
+      await load()
+    } else {
+      ElMessage.info('已取消上传')
+    }
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    uploading.value = false
+    droppedUploadCancel = null
+  }
+}
+
+let droppedUploadCancel = null // Linux 桌面拖拽上传的取消函数（「停止上传」按钮）
 function stopUpload() {
   uploadAbort.value?.abort()
+  droppedUploadCancel?.()
+  droppedUploadCancel = null
 }
 
 async function createDir() {

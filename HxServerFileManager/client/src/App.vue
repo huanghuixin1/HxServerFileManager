@@ -778,6 +778,7 @@ async function pollServerCopy() {
               :external-path="syncCwd ? cwdMap[c.connectionId] : null"
               :has-other-conns="hasOtherConns"
               :refresh-token="refreshTokens[c.connectionId] || 0"
+              :active="activeId === c.connectionId"
               @open-file="(p) => openEditor(c.connectionId, p)"
               @navigate="(p) => onNavigate(c.connectionId, p)"
               @update:sync-cwd="(v) => (syncCwd = v)"

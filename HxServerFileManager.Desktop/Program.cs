@@ -1,4 +1,5 @@
 using System.Formats.Tar;
+using System.Net.Http.Headers;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
@@ -79,7 +80,7 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
         // 这里处理 op=saveFile（导出连接时弹原生「另存为」对话框选路径并写文件），结果经 SendWebMessage 回给前端
         .RegisterWebMessageReceivedHandler((sender, message) =>
         {
-            var window = (PhotinoWindow)sender;
+            var window = (PhotinoWindow)sender!; // 消息桥回调的 sender 必为 PhotinoWindow
             DesktopRequest? req = null;
             try
             {
@@ -263,6 +264,125 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
                         });
                     }
                 }
+                else if (req?.Op == "uploadDropped")
+                {
+                    // Linux 拖拽上传：前端收到 desktopDrop（本地文件/文件夹路径列表）后回传连接信息，
+                    // 这里在后台把本地文件经本地 Kestrel /api/ensure-dirs + /api/upload 传到远端。
+                    // 浏览器 JS 无法读取任意本地路径，由壳进程代读代传，前端只显示进度面板。
+                    var paths = req.Paths ?? [];
+                    var connId = req.ConnId;
+                    var dir = req.Dir;
+                    var token = req.Token;
+                    var baseUrl = string.IsNullOrEmpty(req.BaseUrl) ? url.TrimEnd('/') : req.BaseUrl.TrimEnd('/');
+                    var id = req.Id;
+                    if (string.IsNullOrEmpty(connId) || paths.Length == 0)
+                    {
+                        DropLog.Log($"uploadDropped: missing connId={connId} paths={paths.Length}");
+                        DesktopBridge.SendResponse(window, new { op = "uploadDroppedResult", id, ok = false, error = "缺少连接或拖入的内容" });
+                    }
+                    else
+                    {
+                        // 校验后固化非空值（Task.Run lambda 不继承外层流分析，直接引用可空变量会出 CS8604 警告）
+                        var conn = connId;
+                        var baseDir = dir ?? "/";
+                        var authToken = token ?? "";
+                        DropLog.Log($"uploadDropped: conn={conn} dir={baseDir} paths={paths.Length}");
+                        // 独立取消源：用户点「停止上传」只取消本次任务；窗口关闭仍由 ShutdownToken 统一取消
+                        var cts = CancellationTokenSource.CreateLinkedTokenSource(AppState.ShutdownToken);
+                        if (!string.IsNullOrEmpty(id)) ActiveUploads.Map[id] = cts;
+                        _ = Task.Run(async () =>
+                        {
+                            try
+                            {
+                                // 收集本地目录树：dirs=相对目录（父级在前、含空目录）、files=(绝对路径, 相对目录)
+                                var dirs = new List<string>();
+                                var files = new List<(string Abs, string RelDir)>();
+                                foreach (var p in paths)
+                                {
+                                    try
+                                    {
+                                        if (File.Exists(p)) files.Add((p, ""));
+                                        else if (Directory.Exists(p))
+                                            CollectLocalTree(Path.GetFullPath(p), Path.GetFileName(p.TrimEnd('/', '\\')), dirs, files);
+                                    }
+                                    catch { /* 单个路径不可读则跳过 */ }
+                                }
+                                if (files.Count == 0 && dirs.Count == 0)
+                                {
+                                    DropLog.Log("uploadDropped: nothing readable collected");
+                                    DesktopBridge.SendResponse(window, new { op = "uploadDroppedResult", id, ok = false, error = "拖入的内容不是可读的文件/文件夹" });
+                                    return;
+                                }
+                                DropLog.Log($"uploadDropped: dirs={dirs.Count} files={files.Count}");
+                                using var client = new HttpClient { Timeout = Timeout.InfiniteTimeSpan };
+                                // 1) 先批量建目录（父级在前，含空目录；已存在则后端跳过）
+                                if (dirs.Count > 0)
+                                {
+                                    var body = JsonSerializer.Serialize(new { connectionId = conn, path = baseDir, dirs }, DesktopBridge.JsonOpts);
+                                    using var reqMsg = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/api/ensure-dirs")
+                                    {
+                                        Content = new StringContent(body, Encoding.UTF8, "application/json"),
+                                    };
+                                    if (!string.IsNullOrEmpty(authToken)) reqMsg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+                                    using var resp = await client.SendAsync(reqMsg, cts.Token);
+                                    resp.EnsureSuccessStatusCode();
+                                }
+                                // 2) 逐文件上传（目标目录 = 前端 cwd + 相对目录）
+                                var total = files.Count;
+                                var done = 0;
+                                foreach (var (abs, rel) in files)
+                                {
+                                    done++;
+                                    var relName = string.IsNullOrEmpty(rel) ? Path.GetFileName(abs) : rel + "/" + Path.GetFileName(abs);
+                                    DesktopBridge.SendResponse(window, new
+                                    {
+                                        op = "uploadDroppedProgress",
+                                        id,
+                                        index = done,
+                                        total,
+                                        name = relName,
+                                        percent = total > 0 ? (int)Math.Round(done * 100.0 / total) : 100,
+                                    });
+                                    var targetDir = string.IsNullOrEmpty(rel) ? baseDir : (baseDir == "/" ? "/" + rel : baseDir.TrimEnd('/') + "/" + rel);
+                                    await using var fs = File.OpenRead(abs);
+                                    using var form = new MultipartFormDataContent();
+                                    form.Add(new StringContent(conn), "connId");
+                                    form.Add(new StringContent(targetDir), "path");
+                                    var fileContent = new StreamContent(fs);
+                                    fileContent.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+                                    form.Add(fileContent, "file", Path.GetFileName(abs));
+                                    using var reqMsg = new HttpRequestMessage(HttpMethod.Post, $"{baseUrl}/api/upload") { Content = form };
+                                    if (!string.IsNullOrEmpty(authToken)) reqMsg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", authToken);
+                                    using var resp = await client.SendAsync(reqMsg, cts.Token);
+                                    resp.EnsureSuccessStatusCode();
+                                }
+                                DropLog.Log($"uploadDropped: done {total} files");
+                                DesktopBridge.SendResponse(window, new { op = "uploadDroppedResult", id, ok = true, count = total });
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                if (AppState.WindowClosing) return; // 窗口关闭/应用退出：不发消息（窗口可能已销毁）
+                                DropLog.Log("uploadDropped: canceled");
+                                DesktopBridge.SendResponse(window, new { op = "uploadDroppedResult", id, ok = false, canceled = true });
+                            }
+                            catch (Exception ex)
+                            {
+                                DropLog.Log($"uploadDropped error: {ex.Message}");
+                                DesktopBridge.SendResponse(window, new { op = "uploadDroppedResult", id, ok = false, error = ex.Message });
+                            }
+                            finally
+                            {
+                                if (!string.IsNullOrEmpty(id)) ActiveUploads.Map.TryRemove(id, out _);
+                            }
+                        });
+                    }
+                }
+                else if (req?.Op == "uploadDroppedCancel")
+                {
+                    // 用户点「停止上传」：取消对应在途任务（取消 HttpClient 请求 → 本次上传中断）
+                    if (!string.IsNullOrEmpty(req.Id) && ActiveUploads.Map.TryGetValue(req.Id, out var cts))
+                        cts.Cancel();
+                }
             }
             catch (Exception ex)
             {
@@ -272,6 +392,7 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
                     "saveFile" => "saveFileResult",
                     "downloadFile" => "downloadFileResult",
                     "downloadMany" => "downloadManyResult",
+                    "uploadDropped" => "uploadDroppedResult",
                     _ => "saveFileResult",
                 };
                 DesktopBridge.SendResponse(window, new { op, ok = false, error = ex.Message });
@@ -286,6 +407,11 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
         try { window.SetIconFile(logoPath); }
         catch { /* 图标加载失败不影响使用 */ }
     }
+
+    // Linux：接管 GTK 拖放（WebKitGTK 外部文件拖放有 bug，DOM 事件不触发，见 GtkDrop 注释）。
+    // webview 在 WaitForClose → Photino_ctor 里才建好，这里用 idle 等主循环跑起来再挂信号。
+    if (OperatingSystem.IsLinux())
+        GtkDrop.ScheduleInstall(window);
 
     window.WaitForClose();
 }
@@ -389,6 +515,17 @@ static void InstallLinuxIcon(string? iconPath)
     catch { /* 自装图标失败不影响使用 */ }
 }
 
+// 递归收集本地目录树：dirs=相对路径目录（父级在前，含空目录）、files=(绝对路径, 相对目录)
+// rel 为相对当前目录的子路径（'' = 直接放当前目录），与前端 collectEntries 语义一致
+static void CollectLocalTree(string abs, string rel, List<string> dirs, List<(string Abs, string RelDir)> files)
+{
+    dirs.Add(rel);
+    foreach (var d in Directory.EnumerateDirectories(abs))
+        CollectLocalTree(d, rel + "/" + Path.GetFileName(d), dirs, files);
+    foreach (var f in Directory.EnumerateFiles(abs))
+        files.Add((f, rel));
+}
+
 // 清理批量下载中途取消/失败时已解包的部分文件：倒序删除（子项先删，目录空了才删）。
 // 只删本次任务创建的内容，不动用户目录里原本就有的文件；best-effort，失败静默跳过。
 static void CleanupPartial(List<string> created)
@@ -416,6 +553,280 @@ static void CleanupPartial(List<string> created)
 static class ActiveDownloads
 {
     public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CancellationTokenSource> Map = new();
+}
+
+// ---- 在途拖拽上传注册表：uploadDropped 登记取消源，uploadDroppedCancel 取消对应任务 ----
+static class ActiveUploads
+{
+    public static readonly System.Collections.Concurrent.ConcurrentDictionary<string, CancellationTokenSource> Map = new();
+}
+
+// ---- 拖放诊断日志（排查 Linux 拖拽问题时看临时目录 drop-debug.log；日志失败绝不影响主流程）----
+static class DropLog
+{
+    private static readonly object Lock = new();
+    public static void Log(string msg)
+    {
+        try
+        {
+            var dir = Path.Combine(Path.GetTempPath(), "HxServerFileManager");
+            Directory.CreateDirectory(dir);
+            lock (Lock)
+                File.AppendAllText(Path.Combine(dir, "drop-debug.log"), $"{DateTime.Now:HH:mm:ss.fff} {msg}\r\n");
+        }
+        catch { }
+    }
+}
+
+// ---- Linux GTK3 拖放接管（绕开 WebKitGTK 外部文件拖放 bug）----
+// WebKitGTK 对「从系统文件管理器拖文件进页面」的 HTML5 drag/drop 事件支持存在多个未修复 bug
+// （webkit bug 204281 / 198915 / 320301；Photino.Native issue #152），实测 Linux 上 dragenter/drop
+// 根本不触发。这里直接 P/Invoke GTK3 在 webview 上接管拖放：
+// 用 g_signal_connect（普通优先级，先于 WebKit 内部的 connect_after）注册 drag-motion/drag-drop，
+// 命中 text/uri-list 时 return TRUE 抢占处理（GTK 的 true_handled 累积器会停止后续 handler，
+// WebKit 的 after-handler 不再运行，其内部 DropTarget 因从未收到 drag-motion 也不会再介入），
+// 取回本地文件路径后经消息桥发 {op:'desktopDrop', paths}，前端再回传连接信息完成上传。
+static class GtkDrop
+{
+    public static PhotinoWindow? Window; // 唯一窗口，拖放信号回调里用它回传消息
+
+    const int GDK_ACTION_COPY = 2;
+
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate bool GtkDragMotionFn(IntPtr widget, IntPtr context, int x, int y, uint time, IntPtr userData);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate void GtkDragLeaveFn(IntPtr widget, IntPtr context, uint time, IntPtr userData);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate bool GtkDragDropFn(IntPtr widget, IntPtr context, int x, int y, uint time, IntPtr userData);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate void GtkDragDataReceivedFn(IntPtr widget, IntPtr context, int x, int y, IntPtr data, uint info, uint time, IntPtr userData);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    delegate bool GSourceFn(IntPtr userData);
+
+    // 委托必须保持引用防 GC（否则信号触发时回调地址已失效直接崩）
+    static readonly GtkDragMotionFn MotionFn = OnDragMotion;
+    static readonly GtkDragLeaveFn LeaveFn = OnDragLeave;
+    static readonly GtkDragDropFn DropFn = OnDragDrop;
+    static readonly GtkDragDataReceivedFn DataReceivedFn = OnDragDataReceived;
+    static readonly GSourceFn InstallIdleFn = OnInstallIdle;
+
+    static readonly IntPtr UriListAtom = gdk_atom_intern_static_string("text/uri-list");
+
+    static bool _dragActive; // 是否正在接管一个文件拖拽
+    static IntPtr _dragContext; // 当前接管拖拽的 GdkDragContext（换 context 才重新取数）
+    static bool _awaitingDropData; // drop 阶段在等数据（motion 阶段没取到、drop 时再取一次的兜底）
+    static readonly List<string> _pendingPaths = new(); // 已取回的本地路径缓存
+    static int _installAttempts;
+    static bool _installed;
+
+    // 窗口创建后调度安装：gdk_threads_add_idle 等 GTK 主循环跑起来再挂信号
+    // （webview 在 WaitForClose → Photino_ctor → Photino::Show 时才建好，主线程正阻塞在里面）
+    public static void ScheduleInstall(PhotinoWindow window)
+    {
+        Window = window;
+        DropLog.Log($"schedule install (OS={Environment.OSVersion.Platform})");
+        try { gdk_threads_add_idle(InstallIdleFn, IntPtr.Zero); } catch (Exception ex) { DropLog.Log($"gdk_threads_add_idle threw {ex.Message}"); }
+    }
+
+    static bool OnInstallIdle(IntPtr data)
+    {
+        try { Install(); }
+        catch (Exception ex) { DropLog.Log($"install threw {ex.Message}"); }
+        if (!_installed && ++_installAttempts < 30)
+            gdk_threads_add_idle(InstallIdleFn, IntPtr.Zero); // 窗口可能还没建好，稍后重试
+        return false;
+    }
+
+    static void Install()
+    {
+        if (_installed) return;
+        // 找 Photino 主窗口里的 WebKitWebView：顶层窗口（启动时只有主窗口）的 bin child 即 webview
+        var toplevels = gtk_window_list_toplevels();
+        var count = 0;
+        for (var node = toplevels; node != IntPtr.Zero; node = NextList(node))
+        {
+            count++;
+            var win = ListData(node);
+            if (win == IntPtr.Zero) continue;
+            var child = gtk_bin_get_child(win);
+            if (child == IntPtr.Zero) continue;
+            var h1 = g_signal_connect_data(child, "drag-motion", MotionFn, IntPtr.Zero, IntPtr.Zero, 0);
+            var h2 = g_signal_connect_data(child, "drag-leave", LeaveFn, IntPtr.Zero, IntPtr.Zero, 0);
+            var h3 = g_signal_connect_data(child, "drag-drop", DropFn, IntPtr.Zero, IntPtr.Zero, 0);
+            var h4 = g_signal_connect_data(child, "drag-data-received", DataReceivedFn, IntPtr.Zero, IntPtr.Zero, 0);
+            DropLog.Log($"install: toplevel#{count} win={win} child={child} handlers={h1},{h2},{h3},{h4}");
+            // 只要尝试过连接就标记完成（重试会重复挂信号导致 desktopDrop 重复触发）；
+            // handler id 为 0（连接失败）的情况由日志暴露，正常启动这里都是非 0
+            _installed = true;
+        }
+        if (count == 0) DropLog.Log("install: no toplevels yet, will retry");
+    }
+
+    static bool OnDragMotion(IntPtr widget, IntPtr context, int x, int y, uint time, IntPtr userData)
+    {
+        if (!HasUriTarget(context))
+        {
+            DropLog.Log($"drag-motion({context}): no uri target, hand back to WebKit");
+            return false; // 非文件拖拽：交还 WebKit 默认处理
+        }
+        gdk_drag_status(context, GDK_ACTION_COPY, time);
+        if (!_dragActive || _dragContext != context)
+        {
+            DropLog.Log($"drag-motion({context}): takeover");
+            _dragActive = true;
+            _dragContext = context;
+            _pendingPaths.Clear();
+            Send(new { op = "desktopDragState", active = true }); // 前端浮出「松开以上传」遮罩
+            // 进入即取数据（WebKit DropTarget 同款模式：motion 阶段取回、drop 用缓存，兼容性最好）
+            try { gtk_drag_get_data(widget, context, UriListAtom, time); }
+            catch (Exception ex) { DropLog.Log($"drag-motion: gtk_drag_get_data threw {ex.Message}"); }
+        }
+        return true; // 抢占：停止后续 handler（含 WebKit 的 connect_after）
+    }
+
+    static void OnDragLeave(IntPtr widget, IntPtr context, uint time, IntPtr userData)
+    {
+        if (!_dragActive) return;
+        DropLog.Log($"drag-leave({context})");
+        _dragActive = false;
+        _dragContext = IntPtr.Zero;
+        _awaitingDropData = false;
+        _pendingPaths.Clear();
+        Send(new { op = "desktopDragState", active = false });
+    }
+
+    static bool OnDragDrop(IntPtr widget, IntPtr context, int x, int y, uint time, IntPtr userData)
+    {
+        if (!_dragActive) return false;
+        DropLog.Log($"drag-drop({context}): cachedPaths={_pendingPaths.Count}");
+        if (_pendingPaths.Count == 0)
+        {
+            // 兜底：motion 阶段没取到数据，drop 时再取一次（少数源只在放下时给数据）
+            _awaitingDropData = true;
+            try { gtk_drag_get_data(widget, context, UriListAtom, time); }
+            catch (Exception ex)
+            {
+                DropLog.Log($"drag-drop: gtk_drag_get_data threw {ex.Message}");
+                _awaitingDropData = false;
+            }
+            if (_awaitingDropData) return true; // 等 drag-data-received 收尾
+        }
+        CompleteDrop(context, time);
+        return true;
+    }
+
+    static void OnDragDataReceived(IntPtr widget, IntPtr context, int x, int y, IntPtr data, uint info, uint time, IntPtr userData)
+    {
+        if (!_dragActive || context != _dragContext) return;
+        var parsed = -1;
+        try
+        {
+            if (gtk_selection_data_get_data_type(data) == UriListAtom)
+            {
+                var len = gtk_selection_data_get_length(data);
+                parsed = len > 0 ? ParseUriList(gtk_selection_data_get_data(data), len).Count : 0;
+                if (parsed > 0)
+                {
+                    _pendingPaths.Clear();
+                    _pendingPaths.AddRange(ParseUriList(gtk_selection_data_get_data(data), gtk_selection_data_get_length(data)));
+                }
+            }
+            DropLog.Log($"drag-data-received({context}): type={(gtk_selection_data_get_data_type(data) == UriListAtom ? "uri-list" : "other")} len={gtk_selection_data_get_length(data)} parsed={parsed}");
+        }
+        catch (Exception ex) { DropLog.Log($"drag-data-received: parse threw {ex.Message}"); }
+        if (_awaitingDropData)
+        {
+            _awaitingDropData = false;
+            CompleteDrop(context, time);
+        }
+    }
+
+    static void CompleteDrop(IntPtr context, uint time)
+    {
+        _dragActive = false;
+        _dragContext = IntPtr.Zero;
+        Send(new { op = "desktopDragState", active = false }); // 收起遮罩
+        var paths = _pendingPaths.ToArray();
+        _pendingPaths.Clear();
+        DropLog.Log($"drop complete({context}): {paths.Length} paths: {string.Join(" | ", paths)}");
+        try { gtk_drag_finish(context, paths.Length > 0, false, time); } catch (Exception ex) { DropLog.Log($"gtk_drag_finish threw {ex.Message}"); }
+        if (paths.Length > 0)
+            Send(new { op = "desktopDrop", paths });
+    }
+
+    static bool HasUriTarget(IntPtr context)
+    {
+        try
+        {
+            var list = gdk_drag_context_list_targets(context);
+            for (var node = list; node != IntPtr.Zero; node = NextList(node))
+                if (ListData(node) == UriListAtom) return true;
+        }
+        catch { }
+        return false;
+    }
+
+    // text/uri-list：多行 file:// URI，逐行解析为本地路径
+    static List<string> ParseUriList(IntPtr data, int len)
+    {
+        var paths = new List<string>();
+        var bytes = new byte[len];
+        Marshal.Copy(data, bytes, 0, len);
+        var text = Encoding.UTF8.GetString(bytes);
+        foreach (var raw in text.Split('\n', '\r'))
+        {
+            var uri = raw.Trim();
+            if (uri.Length == 0 || !uri.StartsWith("file://", StringComparison.OrdinalIgnoreCase)) continue;
+            try { paths.Add(new Uri(uri).LocalPath); } catch { }
+        }
+        return paths;
+    }
+
+    static void Send(object payload)
+    {
+        if (Window == null || AppState.WindowClosing) return;
+        try { DesktopBridge.SendResponse(Window!, payload); } catch { }
+    }
+
+    // GList/GSList 同布局：data(0) / next(8)
+    static IntPtr ListData(IntPtr node) => Marshal.ReadIntPtr(node);
+    static IntPtr NextList(IntPtr node) => Marshal.ReadIntPtr(node, IntPtr.Size);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_window_list_toplevels();
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_bin_get_child(IntPtr bin);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_drag_get_data(IntPtr widget, IntPtr context, IntPtr target, uint time_);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_drag_finish(IntPtr context, bool success, bool del, uint time_);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_selection_data_get_data_type(IntPtr data);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int gtk_selection_data_get_length(IntPtr data);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_selection_data_get_data(IntPtr data);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gdk_drag_context_list_targets(IntPtr context);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gdk_drag_status(IntPtr context, int action, uint time_);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gdk_atom_intern_static_string([MarshalAs(UnmanagedType.LPUTF8Str)] string atomName);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern uint gdk_threads_add_idle(GSourceFn function, IntPtr data);
+
+    [DllImport("libgobject-2.0.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern ulong g_signal_connect_data(IntPtr instance, [MarshalAs(UnmanagedType.LPUTF8Str)] string detailedSignal, Delegate cHandler, IntPtr data, IntPtr destroyData, int connectFlags);
 }
 
 // ---- 桌面消息桥：把结果 JSON 回传给前端（前端用 window.external.receiveMessage 接收）----
@@ -471,6 +882,13 @@ static class Dialogs
             // 转成 OPENFILENAME 的 \0 分隔过滤器串：desc\0ext1;ext2\0...\0
             var winFilter = string.Concat(filters.Select(f => $"{f.desc}\0{string.Join(';', f.exts)}\0")) + "\0";
             return SaveFile(title, defaultName, winFilter, null);
+        }
+        if (OperatingSystem.IsLinux())
+        {
+            // Linux：Photino 原生 ShowSaveFile 把 defaultPath 当目录传给 gtk_file_chooser_set_current_folder，
+            // 传文件名必然失败 → 对话框文件名框为空（用户报的「下载没有默认名字」）。
+            // 用 GTK3 P/Invoke 自建保存对话框预填文件名；失败回退 Photino 原生对话框（仍可用，只是没预填名）。
+            return GtkDialogs.SaveFile(window, title, defaultName, filters);
         }
         var picked = window.ShowSaveFile(title, defaultName, filters);
         return string.IsNullOrEmpty(picked) ? null : picked;
@@ -548,6 +966,126 @@ static class Dialogs
     }
 }
 
+// ---- Linux GTK3 原生「另存为」对话框 ----
+// Photino.Native 的 Linux ShowSaveFile 把 defaultPath 传给 gtk_file_chooser_set_current_folder（目录），
+// 传文件名必然失败 → 保存对话框文件名框为空（用户报的「下载文件没有默认名字」）。
+// 这里 P/Invoke GTK3 自建保存对话框，调 gtk_file_chooser_set_current_name 预填文件名；
+// 任何异常回退 Photino 原生对话框（功能仍可用，只是没有预填名）。
+// 进程本身已加载 libgtk-3/libglib-2（Photino 用 WebKitGTK），且调用发生在 GTK 主线程，直接调即可。
+static class GtkDialogs
+{
+    const int GTK_RESPONSE_ACCEPT = -3;
+    const int GTK_RESPONSE_CANCEL = -6;
+    const int GTK_FILE_CHOOSER_ACTION_SAVE = 1;
+
+    public static string? SaveFile(PhotinoWindow window, string title, string defaultName, (string desc, string[] exts)[] filters)
+    {
+        try
+        {
+            var dialog = gtk_dialog_new();
+            try
+            {
+                var chooser = gtk_file_chooser_widget_new(GTK_FILE_CHOOSER_ACTION_SAVE);
+                gtk_box_pack_start(gtk_dialog_get_content_area(dialog), chooser, true, true, 0);
+                gtk_window_set_title(dialog, title);
+                // 自建对话框不像 GtkFileChooserDialog 那样自动带尺寸：给个合适的默认大小，保证文件列表可见
+                gtk_window_set_default_size(dialog, 760, 480);
+                gtk_dialog_add_button(dialog, "_取消", GTK_RESPONSE_CANCEL);
+                gtk_dialog_add_button(dialog, "_保存", GTK_RESPONSE_ACCEPT);
+                gtk_dialog_set_default_response(dialog, GTK_RESPONSE_ACCEPT);
+                gtk_file_chooser_set_do_overwrite_confirmation(chooser, true);
+                if (!string.IsNullOrEmpty(defaultName))
+                    gtk_file_chooser_set_current_name(chooser, defaultName);
+                foreach (var (desc, exts) in filters)
+                {
+                    var filter = gtk_file_filter_new();
+                    gtk_file_filter_set_name(filter, desc);
+                    foreach (var ext in exts) gtk_file_filter_add_pattern(filter, ext);
+                    gtk_file_chooser_add_filter(chooser, filter);
+                }
+                // 关键：gtk_dialog_run 内部只 gtk_widget_show(dialog)，GtkDialog::show 只显示自己的
+                // 内容区/按钮区、不会递归显示 pack 进去的 GtkFileChooserWidget —— 必须 show_all，
+                // 否则弹出来只有标题和按钮、中间选路径的区域是空的（用户实测“连选路径的地方都没”）。
+                gtk_widget_show_all(dialog);
+                var res = gtk_dialog_run(dialog);
+                if (res != GTK_RESPONSE_ACCEPT) return null;
+                var ptr = gtk_file_chooser_get_filename(chooser);
+                if (ptr == IntPtr.Zero) return null;
+                var path = Marshal.PtrToStringUTF8(ptr);
+                g_free(ptr);
+                return string.IsNullOrEmpty(path) ? null : path;
+            }
+            finally
+            {
+                gtk_widget_destroy(dialog);
+            }
+        }
+        catch
+        {
+            // GTK 库缺失等异常：回退 Photino 原生对话框（无预填文件名）
+            var picked = window.ShowSaveFile(title, defaultName, filters);
+            return string.IsNullOrEmpty(picked) ? null : picked;
+        }
+    }
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_dialog_new();
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_dialog_get_content_area(IntPtr dialog);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_dialog_add_button(IntPtr dialog, [MarshalAs(UnmanagedType.LPUTF8Str)] string buttonText, int responseId);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_dialog_set_default_response(IntPtr dialog, int responseId);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern int gtk_dialog_run(IntPtr dialog);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_file_chooser_widget_new(int action);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_file_chooser_set_current_name(IntPtr chooser, [MarshalAs(UnmanagedType.LPUTF8Str)] string name);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_file_chooser_set_do_overwrite_confirmation(IntPtr chooser, bool confirm);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_file_chooser_add_filter(IntPtr chooser, IntPtr filter);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_file_chooser_get_filename(IntPtr chooser);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern IntPtr gtk_file_filter_new();
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_file_filter_set_name(IntPtr filter, [MarshalAs(UnmanagedType.LPUTF8Str)] string name);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_file_filter_add_pattern(IntPtr filter, [MarshalAs(UnmanagedType.LPUTF8Str)] string pattern);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_box_pack_start(IntPtr box, IntPtr child, bool expand, bool fill, uint padding);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_window_set_title(IntPtr window, [MarshalAs(UnmanagedType.LPUTF8Str)] string title);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_widget_show_all(IntPtr widget);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_widget_destroy(IntPtr widget);
+
+    [DllImport("libgtk-3.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void gtk_window_set_default_size(IntPtr window, int width, int height);
+
+    [DllImport("libglib-2.0.so.0", CallingConvention = CallingConvention.Cdecl)]
+    private static extern void g_free(IntPtr mem);
+}
+
 [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
 struct BROWSEINFO
 {
@@ -589,13 +1127,17 @@ struct OPENFILENAME
     public int FlagsEx;
 }
 
-// 前端 window.external.sendMessage 发的请求结构（目前支持 op=saveFile/downloadFile/downloadMany/downloadManyCancel）
+// 前端 window.external.sendMessage 发的请求结构（目前支持 op=saveFile/downloadFile/downloadMany/downloadManyCancel/uploadDropped/uploadDroppedCancel）
 sealed class DesktopRequest
 {
     public string? Op { get; set; }
-    public string? Id { get; set; } // downloadMany 任务 id：取消/结果回执按此对应
+    public string? Id { get; set; } // downloadMany/uploadDropped 任务 id：取消/结果回执按此对应
     public string? DefaultName { get; set; }
     public string? Content { get; set; }
     public string? Url { get; set; }
     public string[]? Paths { get; set; }
+    public string? ConnId { get; set; } // 拖拽上传：连接 id
+    public string? Dir { get; set; } // 拖拽上传：目标远端目录（前端 cwd）
+    public string? Token { get; set; } // 拖拽上传：鉴权 token（/api/upload 需要）
+    public string? BaseUrl { get; set; } // 拖拽上传：本地 Kestrel 地址（location.origin）
 }

@@ -349,9 +349,18 @@ export function openNetStream(connId, onMessage, intervalSec = 1) {
 
 // ---- 桌面壳（Photino）消息桥 ----
 // JS→C#：window.external.sendMessage(JSON)；C#→JS：window.external.receiveMessage = fn（Photino 注入）。
-// 仅存在于桌面壳（WebView2）；普通浏览器里 window.external 没有 sendMessage，静默跳过。
-// 协议：请求 { op, ... } → C# 处理 → 响应 { op: '<op>Result', ... }，按 op 分发一次性回调。
+// 仅存在于桌面壳（WebView2/WebKitGTK）；普通浏览器里 window.external 没有 sendMessage，静默跳过。
+// 协议：请求 { op, ... } → C# 处理 → 响应 { op: '<op>Result', ... }，按 op 分发一次性回调；
+// 持续事件（desktopDragState / desktopDrop，Linux 拖拽）走 onDesktopEvent 订阅。
 const desktopOps = {}
+// C# → JS 的持续事件订阅：onDesktopEvent(op, fn) 返回取消订阅函数。
+// 一次性结果仍走 desktopOps（任务完成即删），这里只处理没有一次性 handler 的事件。
+const desktopEvents = {}
+export function onDesktopEvent(op, fn) {
+  if (!desktopEvents[op]) desktopEvents[op] = new Set()
+  desktopEvents[op].add(fn)
+  return () => desktopEvents[op]?.delete(fn)
+}
 if (typeof window !== 'undefined' && window.external?.sendMessage) {
   // Photino 注入的 receiveMessage 是「传入回调注册」的函数（内部监听 chrome.webview 的 message 事件），
   // 必须调用它注册回调（如 window.external.receiveMessage(cb)），不能赋值覆盖，否则 C#→JS 消息收不到
@@ -359,7 +368,13 @@ if (typeof window !== 'undefined' && window.external?.sendMessage) {
     let msg = null
     try { msg = JSON.parse(raw) } catch (_) { return }
     const h = desktopOps[msg?.op]
-    if (h) { delete desktopOps[msg.op]; h(msg) }
+    if (h) {
+      delete desktopOps[msg.op]
+      h(msg)
+      return
+    }
+    const ev = desktopEvents[msg?.op]
+    if (ev) ev.forEach((fn) => { try { fn(msg) } catch (_) { /* 单个监听器异常不影响其他 */ } })
   })
 }
 
@@ -447,4 +462,36 @@ export function desktopDownloadFile(url, defaultName) {
     }
     window.external.sendMessage(JSON.stringify({ op: 'downloadFile', url, defaultName }))
   })
+}
+
+let droppedUploadSeq = 0
+// 桌面壳（Linux GTK 拖放）：把拖入的本地文件/文件夹路径交给 C# 代读代传——浏览器 JS 无法读取任意
+// 本地路径，由壳进程经本地 /api/ensure-dirs + /api/upload 上传到远端，进度走 uploadDroppedProgress。
+// 返回 { promise, cancel }：promise 解析为 { count }；用户点「停止上传」解析 null；出错 reject。
+export function desktopUploadDropped(baseUrl, connId, dir, paths, token, onProgress) {
+  let cancelFn = null
+  const promise = new Promise((resolve, reject) => {
+    if (typeof window === 'undefined' || !window.external?.sendMessage) {
+      reject(new Error('当前不是桌面环境，无法拖拽上传'))
+      return
+    }
+    const id = 'up' + ++droppedUploadSeq + '-' + Date.now()
+    // 进度/结果都是共享 key（同时只有一个拖拽上传在跑：前端 uploading 状态 + 激活标签限制），
+    // C# 回执带 id，结果回调里按 id 过滤避免串台（与 downloadMany 同模式）
+    desktopOps.uploadDroppedProgress = (msg) => onProgress?.(msg)
+    desktopOps.uploadDroppedResult = (msg) => {
+      if (msg.id && msg.id !== id) return
+      delete desktopOps.uploadDroppedProgress
+      if (msg.ok) resolve({ count: msg.count })
+      else if (msg.canceled) resolve(null)
+      else reject(new Error(msg.error || '拖拽上传失败'))
+    }
+    window.external.sendMessage(JSON.stringify({ op: 'uploadDropped', id, baseUrl, connId, dir, paths, token }))
+    cancelFn = () => {
+      if (window.external?.sendMessage) {
+        window.external.sendMessage(JSON.stringify({ op: 'uploadDroppedCancel', id }))
+      }
+    }
+  })
+  return { promise, cancel: () => cancelFn?.() }
 }
