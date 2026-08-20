@@ -81,7 +81,13 @@ const theme = EditorView.theme({
   },
   '.cm-activeLineGutter': { backgroundColor: '#eaf1fb', color: '#5b6b7c' },
   '.cm-activeLine': { backgroundColor: '#f7fafd' },
-  '.cm-selectionBackground, &.cm-focused .cm-selectionBackground': { backgroundColor: '#d6e6ff' },
+  // 有选区时让出当行高亮 —— 它是不透明色，会把画在底下的选区盖掉（见 hideActiveLineOnSelection）
+  '&.cm-hasSelection .cm-activeLine': { backgroundColor: 'transparent' },
+  // 选区色要按官方基础样式那条选择器的层级写满，否则基础样式的 #d7d4f0 更具体，聚焦时会赢
+  '.cm-selectionBackground': { backgroundColor: '#d6e6ff' },
+  '&.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground': {
+    backgroundColor: '#d6e6ff',
+  },
   '.cm-cursor, .cm-dropCursor': { borderLeftColor: '#409eff' },
   '.cm-searchMatch': { backgroundColor: '#fff2a8', outline: '1px solid #e6c34a' },
   '.cm-searchMatch.cm-searchMatch-selected': { backgroundColor: '#ffc86b' },
@@ -116,6 +122,14 @@ const theme = EditorView.theme({
 // 也不该被当成用户改动（否则一打开就显示未保存）。
 const silentWrite = Annotation.define()
 
+// CodeMirror 的选区画在一个 z-index:-1 的图层里，也就是在 .cm-content 底下 —— 任何不透明的
+// 行背景都会把选区盖住（官方默认的当行色 #cceeff44 带 alpha 就是为了这个）。本主题的当行色
+// 是不透明的，于是表现为「选中同一行内的文字看不出选中，跨行才正常」：跨行时只有光标所在的
+// 那一行被盖住。这里在有选区时给编辑器挂个 class，由 CSS 把当行高亮让出来。
+const hideActiveLineOnSelection = EditorView.editorAttributes.compute(['selection'], (state) =>
+  state.selection.ranges.some((r) => !r.empty) ? { class: 'cm-hasSelection' } : null,
+)
+
 /**
  * 建一个编辑器实例。返回的 handle 只暴露组件用得到的动作，
  * 调用方不需要碰 CodeMirror 的 transaction 细节。
@@ -135,6 +149,7 @@ export function createEditor({ parent, readOnly = false, onSave, onChange }) {
         lineNumbers(),
         highlightActiveLine(),
         highlightActiveLineGutter(),
+        hideActiveLineOnSelection,
         highlightSpecialChars(),
         drawSelection(),
         dropCursor(),
