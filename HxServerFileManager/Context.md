@@ -1,100 +1,27 @@
-# HxServerFileManager · 上下文简报
-
-> 更新：2026-08-14 ｜ 控制台项目（Exe）+ Kestrel + SSH.NET 管理 Linux 服务器
-
-## 架构
-- 后端：.NET 10 控制台，`FrameworkReference AspNetCore` 启用 Kestrel；SSH.NET 连接 Linux（SFTP + SSH）。监听默认 **5101**（`PORT` 可改）。
-- 前端：Vue3 + Vite 工程（`client/`），构建产物输出到 `../wwwroot`。
-
-## 已完成
-- ✅ macOS Intel（amd64）编译支持：build.sh 交互菜单新增「macOS Intel .app」选项，「全部桌面」扩为四平台（Windows + Linux + macOS ARM + Intel）；`.app` 产物改带架构后缀 `dist/HxServerFileManager-<rid>.app`（双架构共存不覆盖），新增 CLI 目标 `mac-app-osx-arm64`/`mac-app-osx-x64`；实测 Windows 构建机产出 Mach-O x86_64 的 `HxServerFileManager-osx-x64.app`。
-- ✅ server 启动脚本随发布带入 + 后台运行：`build.sh server` 发布 Linux 服务端时自动把 `start-linux.sh` 拷进产物目录（此前不在）+ 对主程序 chmod +x（Windows 产物默认无执行位）；`start-linux.sh` 重写：**默认后台启动**（nohup + hxsfm.log + hxsfm.pid，1s 存活探测），`-f` 前台，`stop`/`restart`/`status`/`-h`，支持端口参数、`.env`、`PORT` 等环境变量；脚本侧 `find_binary` 会先补执行位再启动（Windows 打 tar 传 Linux 丢执行位的兜底）。真机（Alpine）实测后台/状态/停止/重启/前台全流程通过；Alpine 需 musl 版发布（`-r linux-musl-x64`）且容器要装 libstdc++/libgcc，属环境依赖非脚本问题。
-- ✅ 连接列表「重连」→「连接」+ 立即开 tab：右侧已保存连接列表的按钮改为「连接」，点击走 App.vue `openSaved` 立即开占位 tab（与顶栏「已保存连接」下拉一致）。
-- ✅ 删除非空文件夹修复：`/api/delete` 原来对目录走 SFTP `DeleteDirectory`（只删空目录，有内容直接抛异常），且 `sftp.DeleteFile` 对符号链接会跟随并删掉链接目标（危险）。现一律走远端 `rm -rf --`：文件/空目录/非空目录/链接通吃，链接只删链接本身；加根目录/`..` 穿越守卫。
-- ✅ 命令历史 + 版本号：**历史 SSH 命令查看/双击执行** —— Terminal 实际执行过的命令（快捷命令回车 + 交互终端按回车）记入 `Data/settings.json`（`CommandHistoryItem`：connKey/command/cwd/exitStatus/createdAt，按连接隔离，同一命令重复执行只留最新一条，每连接上限 200 条），端点 `GET/POST/DELETE /api/settings/history`；前端 `useSettings.history` 全局状态 + Terminal「命令历史」按钮弹窗（时间/命令/目录/状态，**双击一行或点「执行」再次执行**——交互模式直接发到终端并回车、快捷命令模式填入输入框立即跑），可「清空本连接历史」（确认后 DELETE）。交互终端记录靠 `sendInput` 按回车切分输入缓冲（控制字符/转义序列/方向键清缓冲，避免拼出脏行）。**版本号**：两项目 csproj 加 `<Version>1.0.0</Version>`；HX 启动时打印 `版本 1.0.0`、`/api/health` 返回 `version` 字段（`WebHost.AppVersion()` 读 InformationalVersion 去 `+哈希` 后缀）；桌面壳窗口标题 `HxServerFileManager v1.0.0`（同样读 `WebHost.AppVersion()`，与 HX 一致）。
-- ✅ 网络状态修复 + 实时上下行：网卡列表一直为空的根因是**源码里的 CRLF 泄漏进远端 shell**（NET 段 awk 末行 `2>&1` 变成 `2>&1\r` → bash `ambiguous redirect`，命令根本没执行），修复为发送前统一 `Sh()` 归一化换行。新增 SSE `GET /api/net-stream?connId=&interval=1`：常驻一条 SSH exec 通道每秒 `cat /proc/net/dev`，后端按相邻两帧算 B/s 推给前端；迷你状态栏显示 `↓/↑` 实时速率，详情表网卡速率/累计字节走实时流、连接状态仍来自 10s 轮询。
-- ✅ 磁盘视图排除 docker/containerd 容器挂载：`/api/system-status` 的 df awk 过滤 `/var/lib/docker/`、`/var/lib/containerd/` 前缀挂载点（overlay2/<hash>、containers/<id>/shm、snapshot 等每容器一条的噪音），`/var/lib/docker` 根挂载保留；前端 SystemStatus 详情表格（`viewDisks`）与迷你条（`mainDisks`）同样过滤。
-- ✅ 批量下载报错修复 + 停止下载：`/api/download`、`/api/download-many` 流式写完响应体后返回 `Results.Ok()` 会抛 “StatusCode cannot be set because the response has already started”（响应已开始不能再设状态码），Kestrel 掐断连接 → 客户端报 “Error while copying content to a stream / response ended prematurely”——已改 `Results.Empty`（与 SSE 端点同一坑）。批量下载支持「停止下载」：前端按钮 → `downloadManyCancel` 消息 → C# 按 id 取消在途请求 → 服务端 RequestAborted 终止远端 tar → 本地清理已解包的部分文件。顺带：桌面端改 `ResponseHeadersRead` 流式（原 PostAsync 会整包缓冲进内存）；tar 命令加 `--` 支持 `-` 开头文件名；错误回执带 `innerError` 显示真实根因。
-- ✅ 桌面壳导出/下载选保存路径：**桌面端**弹原生「另存为」对话框（Win32 `GetSaveFileName`，消息桥 `window.external.sendMessage/receiveMessage`，C# 写文件/流式下载后回传结果）；**浏览器端**保持 `<a download>` 默认下载目录。判定：`/api/health` 返回 `desktop` 标记（桌面壳进程设 `HXSFM_DESKTOP=1`）；导出保存时自动补 `.json` 后缀。**下载**对话框预填远端文件名（用户删掉扩展名时按原扩展名自动补回）。已修两个坑：Photino `ShowSaveFile` 的 defaultPath bug（改用 Win32 对话框彻底绕开）；下载超时/闪退（关 Kestrel 响应速率限制 + 下载期间 Touch 防会话回收 + 窗口关闭时取消在途下载并禁止再回传消息）。**批量下载**（操作菜单多选文件/文件夹）：桌面端弹文件夹选择器（`SHBrowseForFolder`）选一个本地目录，远端 `tar` 流打包 → C# `TarReader` 解包到该目录保留目录结构；浏览器端逐个 `<a download>` 下载文件（目录跳过）。后端 `/api/download-many` 用 `BeginExecute`+`OutputStream` 流式直出，busybox tar 兼容。
-- ✅ 交互终端剪贴板：**选中即复制**（xterm `onSelectionChange` → Clipboard API，兜底隐藏 textarea + execCommand）+ **右键粘贴**（`rightClickSelectsWord: false`，接管 contextmenu 读剪贴板）；粘贴内容以回车结尾时弹窗询问是否执行，内容可编辑（执行 / 仅粘贴 / 取消，Ctrl+Enter 快捷执行）。
-- ✅ 后端三增强：连接信息持久化到 `Data/connections.json`、文本文件 `GET/PUT /api/file-content` 在线编辑、`GET /api/logs/stream` SSE 实时日志。编译+启动已验证。
-- ✅ 双击打开提速：`GET /api/file-content` 改为**原始字节流返回**（不再 JSON 包裹，避免 System.Text.Json 对非 ASCII 的 `\uXXXX` 转义膨胀 + 浏览器 JSON.parse 开销），二进制检查改为开头 64KB NUL 嗅探，前端 fetch 流式读取边收边显示（编辑器带进度条，接近终端 cat 的渐进体验）。
-- ✅ 上传文件夹 + 拖拽上传：文件列表支持**拖拽上传**（文件/文件夹/混搭一次拖入，浏览器唯一能同时选两者的方式；`webkitGetAsEntry` 递归遍历保留目录结构与空目录），「操作」下拉只留一个「上传」（多选文件）；后端 `EnsureRemoteDir` 递归建目录 + `POST /api/ensure-dirs` 批量创建（已存在跳过），再逐文件上传保留相对路径。
-- ✅ 服务器间直传（发送到连接）：两个已打开的连接之间直接传文件/文件夹，**不经本机中转** —— 源机执行 `scp` 直连目标机，数据在两端服务器之间流动，本机只下发指令 + 轮询状态。`POST /api/server-copy`（含目标目录自动补建、源≠目标校验）+ `GET /api/server-copy/{jobId}` 轮询；目标认证：密码走 sshpass（源机未装则尝试免密并给安装提示）、私钥走 /tmp 临时文件 + `scp -i`（带口令私钥不支持）。前端：FileManager「操作 → 发送到连接…」，App 弹窗选目标连接（去重、排除自身、默认目标目录 = 源选中项所在目录）+ 进度轮询 + 完成后自动刷新目标连接的文件列表。
-- ✅ 前端已全部改为 Element Plus：`main.js` 注册 EP + 全部图标；6 组件 + `App.vue` 使用 `el-form/el-table/el-dialog/el-breadcrumb/el-button/el-tag` 等。
-- ✅ `package.json` 已声明 `element-plus ^2.14.4` + `@element-plus/icons-vue ^2.3.2`。
-- ✅ 后端已加 `MapFallbackToFile("index.html")`。
-- ✅ `npm run build` 已覆盖 `wwwroot`（index.html + assets/，旧 app.js/style.css 已被清空）。
-- ✅ **多服务器并发连接**：`App.vue` 会话标签栏（自定义 pill tab，可关闭+确认）、新建连接对话框、每标签独立 FileManager/Terminal/编辑器（`v-show` 保留各自终端历史/目录状态）。后端本就支持多会话，无需改动。
-- ✅ **交互终端**：`Terminal.vue` 双模式（快捷命令 exec / 交互终端 interactive）。交互终端 = 后端 SSH.NET `ShellStream`（pty xterm-256color）+ 前端 `@xterm/xterm` 6.0.0。输出 SSE（`/api/terminal/stream`，先回放最近输出再实时推送，ShellOutput 有界 Channel 防积压），输入 `POST /api/terminal/input`，关闭 `POST /api/terminal/close`（DisposeShell）。可跑 nano/vim/read 脚本等需要 TTY 的程序。
-
-## 文件列表空白 bug 已修（字段大小写）
-- 后端 `/api/files` 的 `FileEntry` 经最小 API 序列化为 camelCase（`name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`），前端 FileManager 原来读 PascalCase，导致名称/大小/修改时间全空白。已统一改读 camelCase。
-
-## 终端默认交互模式 + 路径双向同步
-- 终端模式 radio 默认选中「交互终端」（Terminal.vue `mode` 默认值 + onMounted 自动打开）；快捷命令保留为二线工具。
-- 后端 `EnsureShell` 创建 shell 后注入：`export PROMPT_COMMAND='printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'` + 自定义 `PS1='\u@\h:\w$ '`。bash 每次提示符前输出 OSC 7 序列（含当前目录），前端 Terminal.vue 在 SSE 流里用正则提取（跨 chunk 缓冲，剥掉序列再渲染）。
-- 正向：终端 `cd /etc` → OSC 7 推送 → 文件列表面包屑自动变 `/etc`。
-- 反向：文件列表导航（点目录/面包屑/上级）→ App 调 `termRefs[connId].injectCd(path)` → 向交互终端写 `cd <path>\r`，终端提示符同步变化。
-- checkbox 已改名「同步路径」：**开 = 双向同步（终端 cd ⇄ 文件列表导航互相跟随）；关 = 两边完全独立**（终端 cd 不动文件列表，文件列表导航也不注入终端 cd、不更新会话 cwd）。实测：关闭时点文件列表目录终端提示符不变，打开后点「上级」终端收到 `cd /config`。
-- 注意：OSC 7 依赖 bash（非 bash 默认 shell 时仅失去路径同步）；全屏程序（nano）运行时反向注入的 `cd` 会被程序接收（预期行为）。
-- 真实测试机实测通过：`cd /etc` → 面包屑 `/etc`；点「上级」→ 终端 `/`；checkbox 关闭 → 文件列表不跟随。
-
-## 终端路径持久化 + 文件列表联动
-- 根因：SSH.NET 每次 `CreateCommand` 都是新 exec 通道，`cd` 不保留，所以终端总回默认目录。
-- 方案：`SshSession.Cwd` 会话级 cwd（连接时初始化为 SFTP 工作目录）；`/api/command` 命令包装为 `cd <cwd> && <cmd>; rc=$?; pwd; exit $rc`，解析末尾 pwd 行更新并返回 cwd；新增 `/api/cwd` 供文件列表导航同步会话目录。
-- 前端：App.vue `cwdMap` 每连接共享；FileManager 工具栏「跟随终端路径」checkbox（默认开）控制文件列表随终端 cd 跳转；双向联动（点文件列表目录也会更新终端提示符和会话 cwd）。
-- 面包屑：弃用 el-breadcrumb（分隔符自带 margin 造成 `/` 右侧间隙），改自绘 span，无间隙无双斜杠。
-- 顺带修复：连接后初始目录没用家目录（ConnectPanel 未把 `homeDirectory` 传给 App）。
-
-## 已保存连接增强
-- 顶栏「已保存连接」下拉：连接中也能一键打开任意已保存连接（新开标签），含「管理已保存的连接…」入口。
-- 管理对话框：重连/编辑/删除。
-- 编辑对话框：`PUT /api/connections/{id}`，可改别名/主机/端口/用户名/凭据；**留空字段保持不变**（凭据不随列表返回，编辑时留空即不改）。
-- 别名：连接表单与编辑表单均可设置 `name`；连接/重连响应新增 `name`；标签和已保存列表显示别名（列表里别名≠主机时附带主机 tag）。
-- 已用 mock 实测：连接中下拉开第二个连接、编辑改别名、下拉/管理面板同步刷新。
-
-## 登录鉴权（HxSimpleWebAuth）
-- 后端引用 `libs/HxSimpleWebAuth.dll`（net8，net10 可引用）：`WebAdminAuth` 负责凭据/token/失败锁定/IP 绑定校验。密码来源优先级：**① 环境变量 `HXSFM_WEB_PASSWORD`（可覆盖）→ ② `configs/env.json` 的 `authPwd` 字段**（`LoadConfigPassword()` 读取，文件不存在/解析失败返回 null）——设置后所有 /api（除 /api/session、/api/auth/*）必须带 Bearer token；未设置则仅本机回环可访问。`configs/env.json` 已 gitignore（存密码不入库），模板 `configs/env.json.example` 可提交。
-- 端点：`GET /api/session`（required/authenticated 探测）、`POST /api/auth/login`（body `{"key":密码}` → `{token}`）、`POST /api/auth/logout`（吊销 token）。
-- SSE（/api/logs/stream、/api/terminal/stream）与 `<a download>` 带不了请求头：前端把 token 放 `?token=` 查询参数，后端中间件统一转成 Authorization 头再校验。
-- 前端：登录页 LoginView.vue（密码+记住我+剩余次数提示）；api.js 统一带 Bearer 头、401 触发回登录页；token 存 sessionStorage/localStorage（hxsfm_auth_token）；认证通过后才恢复会话/路径；退出登录吊销 token + 断开所有 SSH 会话。
-- 实测（curl + 浏览器）：无 token 401、错密码提示剩余次数、正确登录拿 token、SSE/download 带 ?token= 通过、登出后 token 失效、刷新记住登录、退出回登录页全部通过。
-- 上传上限：`configs/env.json` 的 `maxUploadMb`（默认 1GB，`0`=不限制），环境变量 `HXSFM_MAX_UPLOAD_MB` 可覆盖（优先）；桌面壳（Desktop）启动时强制设为 0，忽略大小限制。`/api/health` 返回 `maxUploadBytes`（0=不限制），前端据此预校验。
-
-## 文件列表：操作下拉 + 行多选
-- 「上传/新建目录/删除」收进「操作」下拉（el-dropdown：新建目录/上传/删除，删除为**批量删除**——未选中时禁用、显示「删除（N）」数量，确认后逐个删除并刷新），工具栏只剩 同步路径/上级/刷新/操作。
-- 行选择改为 Windows/Mac 风格：隐藏 selection 列 checkbox（CSS display:none，列宽 1px）；`@row-click` 自处理——普通单击单选、Ctrl/Cmd 加减选、Shift 范围选（lastSelected 到当前行），`row-key=fullPath`，`.row-selected` 高亮。双击目录/文件仍打开/编辑。
-- 实测：单选、Ctrl 加选、Meta 减选、Shift 范围选（logs→test 中间 4 项全选）、批量删除（btest 内 4 项、3 个 txt 各验一次）、新建目录对话框/上传触发均正常。
-
-## 交互终端实测（真实测试机 192.168.31.254:2222）
-- `ls -la` 输出、`read -p` 等待输入并回显、nano 全屏打开并输入文字（标题显示 Modified）均正常；切回快捷命令模式 shell 正确关闭。
-- 修复：SSE 客户端断开后 `Results.Ok()` 重复设状态码抛异常 → 改 `Results.Empty`，日志已无异常。
-- 注意：Ctrl 组合键（Ctrl+X 等）无法用合成事件自动化测试，真实键盘可用（xterm 标准处理）。
-- 部署提醒：交互终端依赖 `@xterm/xterm`，`npm run build` 会打进产物；bin 里运行需重新 `dotnet build` 同步 wwwroot。
-
-## 字段名 bug 已全部修复（connId → connectionId）
-- 断开：`api.disconnect` 改发 JSON `{ connectionId }`，后端 `IdRequest` 可正确绑定。
-- 重连：`api.reconnect` 改发 JSON `{ connectionId }`，不再 404。
-- 补修：`mkdir / rename / delete / command / saveFileContent` 之前同样发 `connId` 而绑定失败，已全部改为 `connectionId`（rename 的 `dir/oldName` 本就是 `path/name`，无需改）。**教训：后端 POST 一律读 `ConnectionId`，前端发 `connId` 会静默失败。**
-- dev proxy：`vite.config.js` 指向 `http://localhost:5101`。
-
-## 验证情况
-- ✅ 后端编译 0 错、启动、`/api/health`、首页与静态资源、SPA fallback、断开绑定、连接失败错误提示、日志 SSE 均已在本机验证。
-- ✅ 多连接 UI 已用临时 mock 后端（node，纯内存）在浏览器实测：连两台不同主机、标签切换、每标签终端历史/文件列表独立、关闭标签确认+断开+自动切到剩余标签、编辑器按标签绑定保存。
-- ⏳ 真机端到端（连 Docker 测试机）尚未跑：本环境无 docker，需在装有 Docker 的机器上执行。
-
-## 测试机（test-linux/）
-`docker compose up -d --build` → 容器 22 映射本机 2222，`testuser/testpass`。
-
-## 安全提醒
-- `connections.json` 明文存密码/私钥，仅限本地/内网。
-- 访问控制：设密码（`HXSFM_WEB_PASSWORD` 或 `configs/env.json` 的 `authPwd`）后所有接口需登录；未设置时仅本机回环可访问。局域网/公网使用必须设置强密码。
-
-## 运行
+﻿# HxServerFileManager 路 涓婁笅鏂囩畝鎶?
+> 鏇存柊锛?026-08-14 锝?鎺у埗鍙伴」鐩紙Exe锛? Kestrel + SSH.NET 绠＄悊 Linux 鏈嶅姟鍣?
+## 鏋舵瀯
+- 鍚庣锛?NET 10 鎺у埗鍙帮紝`FrameworkReference AspNetCore` 鍚敤 Kestrel锛汼SH.NET 杩炴帴 Linux锛圫FTP + SSH锛夈€傜洃鍚粯璁?**15511**锛坄PORT` 鍙敼锛夈€?- 鍓嶇锛歏ue3 + Vite 宸ョ▼锛坄client/`锛夛紝鏋勫缓浜х墿杈撳嚭鍒?`../wwwroot`銆?
+## 宸插畬鎴?- 鉁?macOS Intel锛坅md64锛夌紪璇戞敮鎸侊細build.sh 浜や簰鑿滃崟鏂板銆宮acOS Intel .app銆嶉€夐」锛屻€屽叏閮ㄦ闈€嶆墿涓哄洓骞冲彴锛圵indows + Linux + macOS ARM + Intel锛夛紱`.app` 浜х墿鏀瑰甫鏋舵瀯鍚庣紑 `dist/HxServerFileManager-<rid>.app`锛堝弻鏋舵瀯鍏卞瓨涓嶈鐩栵級锛屾柊澧?CLI 鐩爣 `mac-app-osx-arm64`/`mac-app-osx-x64`锛涘疄娴?Windows 鏋勫缓鏈轰骇鍑?Mach-O x86_64 鐨?`HxServerFileManager-osx-x64.app`銆?- 鉁?server 鍚姩鑴氭湰闅忓彂甯冨甫鍏?+ 鍚庡彴杩愯锛歚build.sh server` 鍙戝竷 Linux 鏈嶅姟绔椂鑷姩鎶?`start-linux.sh` 鎷疯繘浜х墿鐩綍锛堟鍓嶄笉鍦級+ 瀵逛富绋嬪簭 chmod +x锛圵indows 浜х墿榛樿鏃犳墽琛屼綅锛夛紱`start-linux.sh` 閲嶅啓锛?*榛樿鍚庡彴鍚姩**锛坣ohup + hxsfm.log + hxsfm.pid锛?s 瀛樻椿鎺㈡祴锛夛紝`-f` 鍓嶅彴锛宍stop`/`restart`/`status`/`-h`锛屾敮鎸佺鍙ｅ弬鏁般€乣.env`銆乣PORT` 绛夌幆澧冨彉閲忥紱鑴氭湰渚?`find_binary` 浼氬厛琛ユ墽琛屼綅鍐嶅惎鍔紙Windows 鎵?tar 浼?Linux 涓㈡墽琛屼綅鐨勫厹搴曪級銆傜湡鏈猴紙Alpine锛夊疄娴嬪悗鍙?鐘舵€?鍋滄/閲嶅惎/鍓嶅彴鍏ㄦ祦绋嬮€氳繃锛汚lpine 闇€ musl 鐗堝彂甯冿紙`-r linux-musl-x64`锛変笖瀹瑰櫒瑕佽 libstdc++/libgcc锛屽睘鐜渚濊禆闈炶剼鏈棶棰樸€?- 鉁?杩炴帴鍒楄〃銆岄噸杩炪€嶁啋銆岃繛鎺ャ€? 绔嬪嵆寮€ tab锛氬彸渚у凡淇濆瓨杩炴帴鍒楄〃鐨勬寜閽敼涓恒€岃繛鎺ャ€嶏紝鐐瑰嚮璧?App.vue `openSaved` 绔嬪嵆寮€鍗犱綅 tab锛堜笌椤舵爮銆屽凡淇濆瓨杩炴帴銆嶄笅鎷変竴鑷达級銆?- 鉁?鍒犻櫎闈炵┖鏂囦欢澶逛慨澶嶏細`/api/delete` 鍘熸潵瀵圭洰褰曡蛋 SFTP `DeleteDirectory`锛堝彧鍒犵┖鐩綍锛屾湁鍐呭鐩存帴鎶涘紓甯革級锛屼笖 `sftp.DeleteFile` 瀵圭鍙烽摼鎺ヤ細璺熼殢骞跺垹鎺夐摼鎺ョ洰鏍囷紙鍗遍櫓锛夈€傜幇涓€寰嬭蛋杩滅 `rm -rf --`锛氭枃浠?绌虹洰褰?闈炵┖鐩綍/閾炬帴閫氬悆锛岄摼鎺ュ彧鍒犻摼鎺ユ湰韬紱鍔犳牴鐩綍/`..` 绌胯秺瀹堝崼銆?- 鉁?鍛戒护鍘嗗彶 + 鐗堟湰鍙凤細**鍘嗗彶 SSH 鍛戒护鏌ョ湅/鍙屽嚮鎵ц** 鈥斺€?Terminal 瀹為檯鎵ц杩囩殑鍛戒护锛堝揩鎹峰懡浠ゅ洖杞?+ 浜や簰缁堢鎸夊洖杞︼級璁板叆 `Data/settings.json`锛坄CommandHistoryItem`锛歝onnKey/command/cwd/exitStatus/createdAt锛屾寜杩炴帴闅旂锛屽悓涓€鍛戒护閲嶅鎵ц鍙暀鏈€鏂颁竴鏉★紝姣忚繛鎺ヤ笂闄?200 鏉★級锛岀鐐?`GET/POST/DELETE /api/settings/history`锛涘墠绔?`useSettings.history` 鍏ㄥ眬鐘舵€?+ Terminal銆屽懡浠ゅ巻鍙层€嶆寜閽脊绐楋紙鏃堕棿/鍛戒护/鐩綍/鐘舵€侊紝**鍙屽嚮涓€琛屾垨鐐广€屾墽琛屻€嶅啀娆℃墽琛?*鈥斺€斾氦浜掓ā寮忕洿鎺ュ彂鍒扮粓绔苟鍥炶溅銆佸揩鎹峰懡浠ゆā寮忓～鍏ヨ緭鍏ユ绔嬪嵆璺戯級锛屽彲銆屾竻绌烘湰杩炴帴鍘嗗彶銆嶏紙纭鍚?DELETE锛夈€備氦浜掔粓绔褰曢潬 `sendInput` 鎸夊洖杞﹀垏鍒嗚緭鍏ョ紦鍐诧紙鎺у埗瀛楃/杞箟搴忓垪/鏂瑰悜閿竻缂撳啿锛岄伩鍏嶆嫾鍑鸿剰琛岋級銆?*鐗堟湰鍙?*锛氫袱椤圭洰 csproj 鍔?`<Version>1.0.0</Version>`锛汬X 鍚姩鏃舵墦鍗?`鐗堟湰 1.0.0`銆乣/api/health` 杩斿洖 `version` 瀛楁锛坄WebHost.AppVersion()` 璇?InformationalVersion 鍘?`+鍝堝笇` 鍚庣紑锛夛紱妗岄潰澹崇獥鍙ｆ爣棰?`HxServerFileManager v1.0.0`锛堝悓鏍疯 `WebHost.AppVersion()`锛屼笌 HX 涓€鑷达級銆?- 鉁?缃戠粶鐘舵€佷慨澶?+ 瀹炴椂涓婁笅琛岋細缃戝崱鍒楄〃涓€鐩翠负绌虹殑鏍瑰洜鏄?*婧愮爜閲岀殑 CRLF 娉勬紡杩涜繙绔?shell**锛圢ET 娈?awk 鏈 `2>&1` 鍙樻垚 `2>&1\r` 鈫?bash `ambiguous redirect`锛屽懡浠ゆ牴鏈病鎵ц锛夛紝淇涓哄彂閫佸墠缁熶竴 `Sh()` 褰掍竴鍖栨崲琛屻€傛柊澧?SSE `GET /api/net-stream?connId=&interval=1`锛氬父椹讳竴鏉?SSH exec 閫氶亾姣忕 `cat /proc/net/dev`锛屽悗绔寜鐩搁偦涓ゅ抚绠?B/s 鎺ㄧ粰鍓嶇锛涜糠浣犵姸鎬佹爮鏄剧ず `鈫?鈫慲 瀹炴椂閫熺巼锛岃鎯呰〃缃戝崱閫熺巼/绱瀛楄妭璧板疄鏃舵祦銆佽繛鎺ョ姸鎬佷粛鏉ヨ嚜 10s 杞銆?- 鉁?纾佺洏瑙嗗浘鎺掗櫎 docker/containerd 瀹瑰櫒鎸傝浇锛歚/api/system-status` 鐨?df awk 杩囨护 `/var/lib/docker/`銆乣/var/lib/containerd/` 鍓嶇紑鎸傝浇鐐癸紙overlay2/<hash>銆乧ontainers/<id>/shm銆乻napshot 绛夋瘡瀹瑰櫒涓€鏉＄殑鍣煶锛夛紝`/var/lib/docker` 鏍规寕杞戒繚鐣欙紱鍓嶇 SystemStatus 璇︽儏琛ㄦ牸锛坄viewDisks`锛変笌杩蜂綘鏉★紙`mainDisks`锛夊悓鏍疯繃婊ゃ€?- 鉁?鎵归噺涓嬭浇鎶ラ敊淇 + 鍋滄涓嬭浇锛歚/api/download`銆乣/api/download-many` 娴佸紡鍐欏畬鍝嶅簲浣撳悗杩斿洖 `Results.Ok()` 浼氭姏 鈥淪tatusCode cannot be set because the response has already started鈥濓紙鍝嶅簲宸插紑濮嬩笉鑳藉啀璁剧姸鎬佺爜锛夛紝Kestrel 鎺愭柇杩炴帴 鈫?瀹㈡埛绔姤 鈥淓rror while copying content to a stream / response ended prematurely鈥濃€斺€斿凡鏀?`Results.Empty`锛堜笌 SSE 绔偣鍚屼竴鍧戯級銆傛壒閲忎笅杞芥敮鎸併€屽仠姝笅杞姐€嶏細鍓嶇鎸夐挳 鈫?`downloadManyCancel` 娑堟伅 鈫?C# 鎸?id 鍙栨秷鍦ㄩ€旇姹?鈫?鏈嶅姟绔?RequestAborted 缁堟杩滅 tar 鈫?鏈湴娓呯悊宸茶В鍖呯殑閮ㄥ垎鏂囦欢銆傞『甯︼細妗岄潰绔敼 `ResponseHeadersRead` 娴佸紡锛堝師 PostAsync 浼氭暣鍖呯紦鍐茶繘鍐呭瓨锛夛紱tar 鍛戒护鍔?`--` 鏀寔 `-` 寮€澶存枃浠跺悕锛涢敊璇洖鎵у甫 `innerError` 鏄剧ず鐪熷疄鏍瑰洜銆?- 鉁?妗岄潰澹冲鍑?涓嬭浇閫変繚瀛樿矾寰勶細**妗岄潰绔?*寮瑰師鐢熴€屽彟瀛樹负銆嶅璇濇锛圵in32 `GetSaveFileName`锛屾秷鎭ˉ `window.external.sendMessage/receiveMessage`锛孋# 鍐欐枃浠?娴佸紡涓嬭浇鍚庡洖浼犵粨鏋滐級锛?*娴忚鍣ㄧ**淇濇寔 `<a download>` 榛樿涓嬭浇鐩綍銆傚垽瀹氾細`/api/health` 杩斿洖 `desktop` 鏍囪锛堟闈㈠３杩涚▼璁?`HXSFM_DESKTOP=1`锛夛紱瀵煎嚭淇濆瓨鏃惰嚜鍔ㄨˉ `.json` 鍚庣紑銆?*涓嬭浇**瀵硅瘽妗嗛濉繙绔枃浠跺悕锛堢敤鎴峰垹鎺夋墿灞曞悕鏃舵寜鍘熸墿灞曞悕鑷姩琛ュ洖锛夈€傚凡淇袱涓潙锛歅hotino `ShowSaveFile` 鐨?defaultPath bug锛堟敼鐢?Win32 瀵硅瘽妗嗗交搴曠粫寮€锛夛紱涓嬭浇瓒呮椂/闂€€锛堝叧 Kestrel 鍝嶅簲閫熺巼闄愬埗 + 涓嬭浇鏈熼棿 Touch 闃蹭細璇濆洖鏀?+ 绐楀彛鍏抽棴鏃跺彇娑堝湪閫斾笅杞藉苟绂佹鍐嶅洖浼犳秷鎭級銆?*鎵归噺涓嬭浇**锛堟搷浣滆彍鍗曞閫夋枃浠?鏂囦欢澶癸級锛氭闈㈢寮规枃浠跺す閫夋嫨鍣紙`SHBrowseForFolder`锛夐€変竴涓湰鍦扮洰褰曪紝杩滅 `tar` 娴佹墦鍖?鈫?C# `TarReader` 瑙ｅ寘鍒拌鐩綍淇濈暀鐩綍缁撴瀯锛涙祻瑙堝櫒绔€愪釜 `<a download>` 涓嬭浇鏂囦欢锛堢洰褰曡烦杩囷級銆傚悗绔?`/api/download-many` 鐢?`BeginExecute`+`OutputStream` 娴佸紡鐩村嚭锛宐usybox tar 鍏煎銆?- 鉁?浜や簰缁堢鍓创鏉匡細**閫変腑鍗冲鍒?*锛坸term `onSelectionChange` 鈫?Clipboard API锛屽厹搴曢殣钘?textarea + execCommand锛? **鍙抽敭绮樿创**锛坄rightClickSelectsWord: false`锛屾帴绠?contextmenu 璇诲壀璐存澘锛夛紱绮樿创鍐呭浠ュ洖杞︾粨灏炬椂寮圭獥璇㈤棶鏄惁鎵ц锛屽唴瀹瑰彲缂栬緫锛堟墽琛?/ 浠呯矘璐?/ 鍙栨秷锛孋trl+Enter 蹇嵎鎵ц锛夈€?- 鉁?鍚庣涓夊寮猴細杩炴帴淇℃伅鎸佷箙鍖栧埌 `Data/connections.json`銆佹枃鏈枃浠?`GET/PUT /api/file-content` 鍦ㄧ嚎缂栬緫銆乣GET /api/logs/stream` SSE 瀹炴椂鏃ュ織銆傜紪璇?鍚姩宸查獙璇併€?- 鉁?鍙屽嚮鎵撳紑鎻愰€燂細`GET /api/file-content` 鏀逛负**鍘熷瀛楄妭娴佽繑鍥?*锛堜笉鍐?JSON 鍖呰９锛岄伩鍏?System.Text.Json 瀵归潪 ASCII 鐨?`\uXXXX` 杞箟鑶ㄨ儉 + 娴忚鍣?JSON.parse 寮€閿€锛夛紝浜岃繘鍒舵鏌ユ敼涓哄紑澶?64KB NUL 鍡呮帰锛屽墠绔?fetch 娴佸紡璇诲彇杈规敹杈规樉绀猴紙缂栬緫鍣ㄥ甫杩涘害鏉★紝鎺ヨ繎缁堢 cat 鐨勬笎杩涗綋楠岋級銆?- 鉁?涓婁紶鏂囦欢澶?+ 鎷栨嫿涓婁紶锛氭枃浠跺垪琛ㄦ敮鎸?*鎷栨嫿涓婁紶**锛堟枃浠?鏂囦欢澶?娣锋惌涓€娆℃嫋鍏ワ紝娴忚鍣ㄥ敮涓€鑳藉悓鏃堕€変袱鑰呯殑鏂瑰紡锛沗webkitGetAsEntry` 閫掑綊閬嶅巻淇濈暀鐩綍缁撴瀯涓庣┖鐩綍锛夛紝銆屾搷浣溿€嶄笅鎷夊彧鐣欎竴涓€屼笂浼犮€嶏紙澶氶€夋枃浠讹級锛涘悗绔?`EnsureRemoteDir` 閫掑綊寤虹洰褰?+ `POST /api/ensure-dirs` 鎵归噺鍒涘缓锛堝凡瀛樺湪璺宠繃锛夛紝鍐嶉€愭枃浠朵笂浼犱繚鐣欑浉瀵硅矾寰勩€?- 鉁?鏈嶅姟鍣ㄩ棿鐩翠紶锛堝彂閫佸埌杩炴帴锛夛細涓や釜宸叉墦寮€鐨勮繛鎺ヤ箣闂寸洿鎺ヤ紶鏂囦欢/鏂囦欢澶癸紝**涓嶇粡鏈満涓浆** 鈥斺€?婧愭満鎵ц `scp` 鐩磋繛鐩爣鏈猴紝鏁版嵁鍦ㄤ袱绔湇鍔″櫒涔嬮棿娴佸姩锛屾湰鏈哄彧涓嬪彂鎸囦护 + 杞鐘舵€併€俙POST /api/server-copy`锛堝惈鐩爣鐩綍鑷姩琛ュ缓銆佹簮鈮犵洰鏍囨牎楠岋級+ `GET /api/server-copy/{jobId}` 杞锛涚洰鏍囪璇侊細瀵嗙爜璧?sshpass锛堟簮鏈烘湭瑁呭垯灏濊瘯鍏嶅瘑骞剁粰瀹夎鎻愮ず锛夈€佺閽ヨ蛋 /tmp 涓存椂鏂囦欢 + `scp -i`锛堝甫鍙ｄ护绉侀挜涓嶆敮鎸侊級銆傚墠绔細FileManager銆屾搷浣?鈫?鍙戦€佸埌杩炴帴鈥︺€嶏紝App 寮圭獥閫夌洰鏍囪繛鎺ワ紙鍘婚噸銆佹帓闄よ嚜韬€侀粯璁ょ洰鏍囩洰褰?= 婧愰€変腑椤规墍鍦ㄧ洰褰曪級+ 杩涘害杞 + 瀹屾垚鍚庤嚜鍔ㄥ埛鏂扮洰鏍囪繛鎺ョ殑鏂囦欢鍒楄〃銆?- 鉁?鍓嶇宸插叏閮ㄦ敼涓?Element Plus锛歚main.js` 娉ㄥ唽 EP + 鍏ㄩ儴鍥炬爣锛? 缁勪欢 + `App.vue` 浣跨敤 `el-form/el-table/el-dialog/el-breadcrumb/el-button/el-tag` 绛夈€?- 鉁?`package.json` 宸插０鏄?`element-plus ^2.14.4` + `@element-plus/icons-vue ^2.3.2`銆?- 鉁?鍚庣宸插姞 `MapFallbackToFile("index.html")`銆?- 鉁?`npm run build` 宸茶鐩?`wwwroot`锛坕ndex.html + assets/锛屾棫 app.js/style.css 宸茶娓呯┖锛夈€?- 鉁?**澶氭湇鍔″櫒骞跺彂杩炴帴**锛歚App.vue` 浼氳瘽鏍囩鏍忥紙鑷畾涔?pill tab锛屽彲鍏抽棴+纭锛夈€佹柊寤鸿繛鎺ュ璇濇銆佹瘡鏍囩鐙珛 FileManager/Terminal/缂栬緫鍣紙`v-show` 淇濈暀鍚勮嚜缁堢鍘嗗彶/鐩綍鐘舵€侊級銆傚悗绔湰灏辨敮鎸佸浼氳瘽锛屾棤闇€鏀瑰姩銆?- 鉁?**浜や簰缁堢**锛歚Terminal.vue` 鍙屾ā寮忥紙蹇嵎鍛戒护 exec / 浜や簰缁堢 interactive锛夈€備氦浜掔粓绔?= 鍚庣 SSH.NET `ShellStream`锛坧ty xterm-256color锛? 鍓嶇 `@xterm/xterm` 6.0.0銆傝緭鍑?SSE锛坄/api/terminal/stream`锛屽厛鍥炴斁鏈€杩戣緭鍑哄啀瀹炴椂鎺ㄩ€侊紝ShellOutput 鏈夌晫 Channel 闃茬Н鍘嬶級锛岃緭鍏?`POST /api/terminal/input`锛屽叧闂?`POST /api/terminal/close`锛圖isposeShell锛夈€傚彲璺?nano/vim/read 鑴氭湰绛夐渶瑕?TTY 鐨勭▼搴忋€?
+## 鏂囦欢鍒楄〃绌虹櫧 bug 宸蹭慨锛堝瓧娈靛ぇ灏忓啓锛?- 鍚庣 `/api/files` 鐨?`FileEntry` 缁忔渶灏?API 搴忓垪鍖栦负 camelCase锛坄name/fullPath/isDirectory/size/lastWriteTimeUtc/isText`锛夛紝鍓嶇 FileManager 鍘熸潵璇?PascalCase锛屽鑷村悕绉?澶у皬/淇敼鏃堕棿鍏ㄧ┖鐧姐€傚凡缁熶竴鏀硅 camelCase銆?
+## 缁堢榛樿浜や簰妯″紡 + 璺緞鍙屽悜鍚屾
+- 缁堢妯″紡 radio 榛樿閫変腑銆屼氦浜掔粓绔€嶏紙Terminal.vue `mode` 榛樿鍊?+ onMounted 鑷姩鎵撳紑锛夛紱蹇嵎鍛戒护淇濈暀涓轰簩绾垮伐鍏枫€?- 鍚庣 `EnsureShell` 鍒涘缓 shell 鍚庢敞鍏ワ細`export PROMPT_COMMAND='printf "\033]7;file://%s%s\007" "$HOSTNAME" "$PWD"'` + 鑷畾涔?`PS1='\u@\h:\w$ '`銆俠ash 姣忔鎻愮ず绗﹀墠杈撳嚭 OSC 7 搴忓垪锛堝惈褰撳墠鐩綍锛夛紝鍓嶇 Terminal.vue 鍦?SSE 娴侀噷鐢ㄦ鍒欐彁鍙栵紙璺?chunk 缂撳啿锛屽墺鎺夊簭鍒楀啀娓叉煋锛夈€?- 姝ｅ悜锛氱粓绔?`cd /etc` 鈫?OSC 7 鎺ㄩ€?鈫?鏂囦欢鍒楄〃闈㈠寘灞戣嚜鍔ㄥ彉 `/etc`銆?- 鍙嶅悜锛氭枃浠跺垪琛ㄥ鑸紙鐐圭洰褰?闈㈠寘灞?涓婄骇锛夆啋 App 璋?`termRefs[connId].injectCd(path)` 鈫?鍚戜氦浜掔粓绔啓 `cd <path>\r`锛岀粓绔彁绀虹鍚屾鍙樺寲銆?- checkbox 宸叉敼鍚嶃€屽悓姝ヨ矾寰勩€嶏細**寮€ = 鍙屽悜鍚屾锛堢粓绔?cd 鈬?鏂囦欢鍒楄〃瀵艰埅浜掔浉璺熼殢锛夛紱鍏?= 涓よ竟瀹屽叏鐙珛**锛堢粓绔?cd 涓嶅姩鏂囦欢鍒楄〃锛屾枃浠跺垪琛ㄥ鑸篃涓嶆敞鍏ョ粓绔?cd銆佷笉鏇存柊浼氳瘽 cwd锛夈€傚疄娴嬶細鍏抽棴鏃剁偣鏂囦欢鍒楄〃鐩綍缁堢鎻愮ず绗︿笉鍙橈紝鎵撳紑鍚庣偣銆屼笂绾с€嶇粓绔敹鍒?`cd /config`銆?- 娉ㄦ剰锛歄SC 7 渚濊禆 bash锛堥潪 bash 榛樿 shell 鏃朵粎澶卞幓璺緞鍚屾锛夛紱鍏ㄥ睆绋嬪簭锛坣ano锛夎繍琛屾椂鍙嶅悜娉ㄥ叆鐨?`cd` 浼氳绋嬪簭鎺ユ敹锛堥鏈熻涓猴級銆?- 鐪熷疄娴嬭瘯鏈哄疄娴嬮€氳繃锛歚cd /etc` 鈫?闈㈠寘灞?`/etc`锛涚偣銆屼笂绾с€嶁啋 缁堢 `/`锛沜heckbox 鍏抽棴 鈫?鏂囦欢鍒楄〃涓嶈窡闅忋€?
+## 缁堢璺緞鎸佷箙鍖?+ 鏂囦欢鍒楄〃鑱斿姩
+- 鏍瑰洜锛歋SH.NET 姣忔 `CreateCommand` 閮芥槸鏂?exec 閫氶亾锛宍cd` 涓嶄繚鐣欙紝鎵€浠ョ粓绔€诲洖榛樿鐩綍銆?- 鏂规锛歚SshSession.Cwd` 浼氳瘽绾?cwd锛堣繛鎺ユ椂鍒濆鍖栦负 SFTP 宸ヤ綔鐩綍锛夛紱`/api/command` 鍛戒护鍖呰涓?`cd <cwd> && <cmd>; rc=$?; pwd; exit $rc`锛岃В鏋愭湯灏?pwd 琛屾洿鏂板苟杩斿洖 cwd锛涙柊澧?`/api/cwd` 渚涙枃浠跺垪琛ㄥ鑸悓姝ヤ細璇濈洰褰曘€?- 鍓嶇锛欰pp.vue `cwdMap` 姣忚繛鎺ュ叡浜紱FileManager 宸ュ叿鏍忋€岃窡闅忕粓绔矾寰勩€峜heckbox锛堥粯璁ゅ紑锛夋帶鍒舵枃浠跺垪琛ㄩ殢缁堢 cd 璺宠浆锛涘弻鍚戣仈鍔紙鐐规枃浠跺垪琛ㄧ洰褰曚篃浼氭洿鏂扮粓绔彁绀虹鍜屼細璇?cwd锛夈€?- 闈㈠寘灞戯細寮冪敤 el-breadcrumb锛堝垎闅旂鑷甫 margin 閫犳垚 `/` 鍙充晶闂撮殭锛夛紝鏀硅嚜缁?span锛屾棤闂撮殭鏃犲弻鏂滄潬銆?- 椤哄甫淇锛氳繛鎺ュ悗鍒濆鐩綍娌＄敤瀹剁洰褰曪紙ConnectPanel 鏈妸 `homeDirectory` 浼犵粰 App锛夈€?
+## 宸蹭繚瀛樿繛鎺ュ寮?- 椤舵爮銆屽凡淇濆瓨杩炴帴銆嶄笅鎷夛細杩炴帴涓篃鑳戒竴閿墦寮€浠绘剰宸蹭繚瀛樿繛鎺ワ紙鏂板紑鏍囩锛夛紝鍚€岀鐞嗗凡淇濆瓨鐨勮繛鎺モ€︺€嶅叆鍙ｃ€?- 绠＄悊瀵硅瘽妗嗭細閲嶈繛/缂栬緫/鍒犻櫎銆?- 缂栬緫瀵硅瘽妗嗭細`PUT /api/connections/{id}`锛屽彲鏀瑰埆鍚?涓绘満/绔彛/鐢ㄦ埛鍚?鍑嵁锛?*鐣欑┖瀛楁淇濇寔涓嶅彉**锛堝嚟鎹笉闅忓垪琛ㄨ繑鍥烇紝缂栬緫鏃剁暀绌哄嵆涓嶆敼锛夈€?- 鍒悕锛氳繛鎺ヨ〃鍗曚笌缂栬緫琛ㄥ崟鍧囧彲璁剧疆 `name`锛涜繛鎺?閲嶈繛鍝嶅簲鏂板 `name`锛涙爣绛惧拰宸蹭繚瀛樺垪琛ㄦ樉绀哄埆鍚嶏紙鍒楄〃閲屽埆鍚嶁墵涓绘満鏃堕檮甯︿富鏈?tag锛夈€?- 宸茬敤 mock 瀹炴祴锛氳繛鎺ヤ腑涓嬫媺寮€绗簩涓繛鎺ャ€佺紪杈戞敼鍒悕銆佷笅鎷?绠＄悊闈㈡澘鍚屾鍒锋柊銆?
+## 鐧诲綍閴存潈锛圚xSimpleWebAuth锛?- 鍚庣寮曠敤 `libs/HxSimpleWebAuth.dll`锛坣et8锛宯et10 鍙紩鐢級锛歚WebAdminAuth` 璐熻矗鍑嵁/token/澶辫触閿佸畾/IP 缁戝畾鏍￠獙銆傚瘑鐮佹潵婧愪紭鍏堢骇锛?*鈶?鐜鍙橀噺 `HXSFM_WEB_PASSWORD`锛堝彲瑕嗙洊锛夆啋 鈶?`configs/env.json` 鐨?`authPwd` 瀛楁**锛坄LoadConfigPassword()` 璇诲彇锛屾枃浠朵笉瀛樺湪/瑙ｆ瀽澶辫触杩斿洖 null锛夆€斺€旇缃悗鎵€鏈?/api锛堥櫎 /api/session銆?api/auth/*锛夊繀椤诲甫 Bearer token锛涙湭璁剧疆鍒欎粎鏈満鍥炵幆鍙闂€俙configs/env.json` 宸?gitignore锛堝瓨瀵嗙爜涓嶅叆搴擄級锛屾ā鏉?`configs/env.json.example` 鍙彁浜ゃ€?- 绔偣锛歚GET /api/session`锛坮equired/authenticated 鎺㈡祴锛夈€乣POST /api/auth/login`锛坆ody `{"key":瀵嗙爜}` 鈫?`{token}`锛夈€乣POST /api/auth/logout`锛堝悐閿€ token锛夈€?- SSE锛?api/logs/stream銆?api/terminal/stream锛変笌 `<a download>` 甯︿笉浜嗚姹傚ご锛氬墠绔妸 token 鏀?`?token=` 鏌ヨ鍙傛暟锛屽悗绔腑闂翠欢缁熶竴杞垚 Authorization 澶村啀鏍￠獙銆?- 鍓嶇锛氱櫥褰曢〉 LoginView.vue锛堝瘑鐮?璁颁綇鎴?鍓╀綑娆℃暟鎻愮ず锛夛紱api.js 缁熶竴甯?Bearer 澶淬€?01 瑙﹀彂鍥炵櫥褰曢〉锛泃oken 瀛?sessionStorage/localStorage锛坔xsfm_auth_token锛夛紱璁よ瘉閫氳繃鍚庢墠鎭㈠浼氳瘽/璺緞锛涢€€鍑虹櫥褰曞悐閿€ token + 鏂紑鎵€鏈?SSH 浼氳瘽銆?- 瀹炴祴锛坈url + 娴忚鍣級锛氭棤 token 401銆侀敊瀵嗙爜鎻愮ず鍓╀綑娆℃暟銆佹纭櫥褰曟嬁 token銆丼SE/download 甯??token= 閫氳繃銆佺櫥鍑哄悗 token 澶辨晥銆佸埛鏂拌浣忕櫥褰曘€侀€€鍑哄洖鐧诲綍椤靛叏閮ㄩ€氳繃銆?- 涓婁紶涓婇檺锛歚configs/env.json` 鐨?`maxUploadMb`锛堥粯璁?1GB锛宍0`=涓嶉檺鍒讹級锛岀幆澧冨彉閲?`HXSFM_MAX_UPLOAD_MB` 鍙鐩栵紙浼樺厛锛夛紱妗岄潰澹筹紙Desktop锛夊惎鍔ㄦ椂寮哄埗璁句负 0锛屽拷鐣ュぇ灏忛檺鍒躲€俙/api/health` 杩斿洖 `maxUploadBytes`锛?=涓嶉檺鍒讹級锛屽墠绔嵁姝ら鏍￠獙銆?
+## 鏂囦欢鍒楄〃锛氭搷浣滀笅鎷?+ 琛屽閫?- 銆屼笂浼?鏂板缓鐩綍/鍒犻櫎銆嶆敹杩涖€屾搷浣溿€嶄笅鎷夛紙el-dropdown锛氭柊寤虹洰褰?涓婁紶/鍒犻櫎锛屽垹闄や负**鎵归噺鍒犻櫎**鈥斺€旀湭閫変腑鏃剁鐢ㄣ€佹樉绀恒€屽垹闄わ紙N锛夈€嶆暟閲忥紝纭鍚庨€愪釜鍒犻櫎骞跺埛鏂帮級锛屽伐鍏锋爮鍙墿 鍚屾璺緞/涓婄骇/鍒锋柊/鎿嶄綔銆?- 琛岄€夋嫨鏀逛负 Windows/Mac 椋庢牸锛氶殣钘?selection 鍒?checkbox锛圕SS display:none锛屽垪瀹?1px锛夛紱`@row-click` 鑷鐞嗏€斺€旀櫘閫氬崟鍑诲崟閫夈€丆trl/Cmd 鍔犲噺閫夈€丼hift 鑼冨洿閫夛紙lastSelected 鍒板綋鍓嶈锛夛紝`row-key=fullPath`锛宍.row-selected` 楂樹寒銆傚弻鍑荤洰褰?鏂囦欢浠嶆墦寮€/缂栬緫銆?- 瀹炴祴锛氬崟閫夈€丆trl 鍔犻€夈€丮eta 鍑忛€夈€丼hift 鑼冨洿閫夛紙logs鈫抰est 涓棿 4 椤瑰叏閫夛級銆佹壒閲忓垹闄わ紙btest 鍐?4 椤广€? 涓?txt 鍚勯獙涓€娆★級銆佹柊寤虹洰褰曞璇濇/涓婁紶瑙﹀彂鍧囨甯搞€?
+## 浜や簰缁堢瀹炴祴锛堢湡瀹炴祴璇曟満 192.168.31.254:2222锛?- `ls -la` 杈撳嚭銆乣read -p` 绛夊緟杈撳叆骞跺洖鏄俱€乶ano 鍏ㄥ睆鎵撳紑骞惰緭鍏ユ枃瀛楋紙鏍囬鏄剧ず Modified锛夊潎姝ｅ父锛涘垏鍥炲揩鎹峰懡浠ゆā寮?shell 姝ｇ‘鍏抽棴銆?- 淇锛歋SE 瀹㈡埛绔柇寮€鍚?`Results.Ok()` 閲嶅璁剧姸鎬佺爜鎶涘紓甯?鈫?鏀?`Results.Empty`锛屾棩蹇楀凡鏃犲紓甯搞€?- 娉ㄦ剰锛欳trl 缁勫悎閿紙Ctrl+X 绛夛級鏃犳硶鐢ㄥ悎鎴愪簨浠惰嚜鍔ㄥ寲娴嬭瘯锛岀湡瀹為敭鐩樺彲鐢紙xterm 鏍囧噯澶勭悊锛夈€?- 閮ㄧ讲鎻愰啋锛氫氦浜掔粓绔緷璧?`@xterm/xterm`锛宍npm run build` 浼氭墦杩涗骇鐗╋紱bin 閲岃繍琛岄渶閲嶆柊 `dotnet build` 鍚屾 wwwroot銆?
+## 瀛楁鍚?bug 宸插叏閮ㄤ慨澶嶏紙connId 鈫?connectionId锛?- 鏂紑锛歚api.disconnect` 鏀瑰彂 JSON `{ connectionId }`锛屽悗绔?`IdRequest` 鍙纭粦瀹氥€?- 閲嶈繛锛歚api.reconnect` 鏀瑰彂 JSON `{ connectionId }`锛屼笉鍐?404銆?- 琛ヤ慨锛歚mkdir / rename / delete / command / saveFileContent` 涔嬪墠鍚屾牱鍙?`connId` 鑰岀粦瀹氬け璐ワ紝宸插叏閮ㄦ敼涓?`connectionId`锛坮ename 鐨?`dir/oldName` 鏈氨鏄?`path/name`锛屾棤闇€鏀癸級銆?*鏁欒锛氬悗绔?POST 涓€寰嬭 `ConnectionId`锛屽墠绔彂 `connId` 浼氶潤榛樺け璐ャ€?*
+- dev proxy锛歚vite.config.js` 鎸囧悜 `http://localhost:15511`銆?
+## 楠岃瘉鎯呭喌
+- 鉁?鍚庣缂栬瘧 0 閿欍€佸惎鍔ㄣ€乣/api/health`銆侀椤典笌闈欐€佽祫婧愩€丼PA fallback銆佹柇寮€缁戝畾銆佽繛鎺ュけ璐ラ敊璇彁绀恒€佹棩蹇?SSE 鍧囧凡鍦ㄦ湰鏈洪獙璇併€?- 鉁?澶氳繛鎺?UI 宸茬敤涓存椂 mock 鍚庣锛坣ode锛岀函鍐呭瓨锛夊湪娴忚鍣ㄥ疄娴嬶細杩炰袱鍙颁笉鍚屼富鏈恒€佹爣绛惧垏鎹€佹瘡鏍囩缁堢鍘嗗彶/鏂囦欢鍒楄〃鐙珛銆佸叧闂爣绛剧‘璁?鏂紑+鑷姩鍒囧埌鍓╀綑鏍囩銆佺紪杈戝櫒鎸夋爣绛剧粦瀹氫繚瀛樸€?- 鈴?鐪熸満绔埌绔紙杩?Docker 娴嬭瘯鏈猴級灏氭湭璺戯細鏈幆澧冩棤 docker锛岄渶鍦ㄨ鏈?Docker 鐨勬満鍣ㄤ笂鎵ц銆?
+## 娴嬭瘯鏈猴紙test-linux/锛?`docker compose up -d --build` 鈫?瀹瑰櫒 22 鏄犲皠鏈満 2222锛宍testuser/testpass`銆?
+## 瀹夊叏鎻愰啋
+- `connections.json` 鏄庢枃瀛樺瘑鐮?绉侀挜锛屼粎闄愭湰鍦?鍐呯綉銆?- 璁块棶鎺у埗锛氳瀵嗙爜锛坄HXSFM_WEB_PASSWORD` 鎴?`configs/env.json` 鐨?`authPwd`锛夊悗鎵€鏈夋帴鍙ｉ渶鐧诲綍锛涙湭璁剧疆鏃朵粎鏈満鍥炵幆鍙闂€傚眬鍩熺綉/鍏綉浣跨敤蹇呴』璁剧疆寮哄瘑鐮併€?
+## 杩愯
 ```bash
-# 带登录鉴权（密码写进 configs/env.json 的 authPwd，模板见 configs/env.json.example）
-PORT=5101 ./bin/Debug/net10.0/HxServerFileManager.exe
-# 或用环境变量覆盖：HXSFM_WEB_PASSWORD=你的密码 PORT=5101 ...
-cd client && npm run build      # 前端产物 -> ../wwwroot
+# 甯︾櫥褰曢壌鏉冿紙瀵嗙爜鍐欒繘 configs/env.json 鐨?authPwd锛屾ā鏉胯 configs/env.json.example锛?PORT=15511 ./bin/Debug/net10.0/HxServerFileManager.exe
+# 鎴栫敤鐜鍙橀噺瑕嗙洊锛欻XSFM_WEB_PASSWORD=浣犵殑瀵嗙爜 PORT=15511 ...
+cd client && npm run build      # 鍓嶇浜х墿 -> ../wwwroot
 ```
