@@ -50,6 +50,18 @@
     <Message Importance="high"
              Text="wwwroot -&gt; $(OutDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
   </Target>
+  <!--
+    VS 里按 F5 走的是"快速最新检查"（fast up-to-date check）：它只看源码、引用和已声明的
+    输入项，vite 重新构建 wwwroot 不会让项目变脏 —— 于是 Build 整个被跳过，上面的
+    CopyWwwrootToOutput 也就不执行，调试起来还是 bin 里的旧前端。
+    把 wwwroot 声明成检查输入：前端产物一变（index.html 每次都会改哈希引用）就判定过期，
+    F5 会真正执行一次 Build，wwwroot 随之镜像到输出目录。
+    Visible=false：避免在解决方案资源管理器里重复列出这些文件。
+  -->
+  <ItemGroup>
+    <UpToDateCheckInput Include="wwwroot\**\*" Visible="false" />
+  </ItemGroup>
+
   <ItemGroup>
     <Folder Include="Data\" />
     <Folder Include="wwwroot\" />

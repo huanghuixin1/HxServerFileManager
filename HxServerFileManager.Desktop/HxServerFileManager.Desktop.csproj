@@ -51,6 +51,15 @@
   </Target>
 
   <!--
+    同主项目：让 VS 的快速最新检查（fast up-to-date check）盯住主项目的 wwwroot，
+    否则只改前端时 F5 会判定"项目已是最新"直接跳过 Build，上面的镜像 target 不执行，
+    桌面壳里看到的还是输出目录里的旧前端。
+  -->
+  <ItemGroup>
+    <UpToDateCheckInput Include="$(MSBuildThisFileDirectory)..\HxServerFileManager\wwwroot\**\*" Visible="false" />
+  </ItemGroup>
+
+  <!--
     主项目是 Exe（top-level statement 要求），ProjectReference 会把它的启动器/宿主也复制过来。
     桌面壳只需要 DLL：Windows 下多出 HxServerFileManager.exe，macOS/Linux 下多出无扩展名的
     HxServerFileManager 二进制，连同 .pdb 与 .runtimeconfig.json 一并从输出和发布目录删掉，

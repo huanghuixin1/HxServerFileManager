@@ -273,6 +273,23 @@ function waitForSize(timeout = 2500) {
 // 保证 shell 回绕列数一致）
 let fitAddon = null
 
+// 计算并应用行列数（代替 fitAddon.fit()，两者区别只在最后主动少要一行）：
+// xterm 把 .xterm-screen 及其内部 canvas 的高度按行内 style 写成 rows×cellHeight 的固定值，
+// 而外层 .xterm-wrap 的 padding 会被 fit 当成"可用高度变小"重新算进行数里 —— 所以 padding
+// 给多大都压不出留白，滚到底时最后一行始终紧贴容器下沿。这里自己取 proposeDimensions 的结果
+// 少要一行，让 .xterm-screen 比容器矮整一行，滚到底时下方就留出一行可见空白。
+// 返回 false = 容器不可见/无尺寸，调用方据此跳过后续同步。
+function applyFit() {
+  if (!xterm || !fitAddon) return false
+  let dims
+  try { dims = fitAddon.proposeDimensions() } catch (_) { return false }
+  if (!dims || !Number.isFinite(dims.cols) || !Number.isFinite(dims.rows)) return false
+  const cols = Math.max(20, dims.cols)
+  const rows = Math.max(5, dims.rows - 1) // 极窄容器兜底：至少留 5 行可用
+  if (xterm.cols !== cols || xterm.rows !== rows) xterm.resize(cols, rows)
+  return true
+}
+
 // 容器尺寸变化（窗口缩放 / 拖分隔条 / 终端最大化）时重算行列：
 // fit 改显示，ws resize 消息同步 pty，让 shell 回绕列数跟随终端宽度
 let sizeObserver = null
@@ -285,7 +302,7 @@ function scheduleRefit() {
     if (!xterm || !fitAddon) return
     const prevCols = xterm.cols
     const prevRows = xterm.rows
-    try { fitAddon.fit() } catch (_) { return } // 容器不可见/无尺寸时静默跳过
+    if (!applyFit()) return // 容器不可见/无尺寸时静默跳过
     if (xterm.cols === prevCols && xterm.rows === prevRows) return
     if (ws && ws.readyState === WebSocket.OPEN)
       ws.send(JSON.stringify({ type: 'resize', cols: xterm.cols, rows: xterm.rows }))
@@ -333,7 +350,7 @@ async function openInteractive() {
       termHost.value.addEventListener('contextmenu', onTermContextMenu)
       xterm.writeln('--- 交互终端已连接（可直接输入；Ctrl+C 中断，exit 退出） ---')
     }
-    try { fitAddon.fit() } catch (_) { /* 容器无尺寸时保持默认 80x24 */ }
+    applyFit() // 容器无尺寸时保持默认 80x24
     await api.terminalOpen(props.connId, xterm.cols, xterm.rows)
 
     // 首次打开时，若 App 给了初始目录（如本地化恢复的路径）且不是根目录，注入一次 cd
