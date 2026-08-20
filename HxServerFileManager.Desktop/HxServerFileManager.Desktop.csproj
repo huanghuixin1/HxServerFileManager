@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- 应用版本：显示在窗口标题（与主项目保持一致，改版本号时两边一起改） -->
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <!-- 桌面壳不弹控制台窗口（Windows） -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>

@@ -97,10 +97,14 @@ async function removeMacro(m) {
 const props = defineProps({
   connId: String,
   connKey: { type: String, default: '' }, // 连接稳定标识（profileId 或 host@user:port），宏按此隔离
+  username: { type: String, default: '' }, // 登录用户名：root 时快捷命令提示符用 #（交互终端由 bash 的 \$ 自行展开）
   cwd: { type: String, default: '/' },
   maximized: { type: Boolean, default: false },
 })
 const emit = defineEmits(['update:cwd', 'toggle-max', 'disconnected'])
+
+// 提示符符号：root 用 #，其他用 $（与 ssh 登录观感一致）
+const sigil = computed(() => (props.username === 'root' ? '#' : '$'))
 
 // 默认交互终端（真终端）；快捷命令保留为二线工具
 const mode = ref('interactive')
@@ -121,7 +125,7 @@ function push(type, text) {
 async function run() {
   const cmd = command.value
   if (!cmd.trim() || busy.value) return
-  push('cmd', '$ ' + cmd)
+  push('cmd', sigil.value + ' ' + cmd)
   command.value = ''
   busy.value = true
   let exit = -1
@@ -560,7 +564,7 @@ onUnmounted(() => {
 
       <div class="prompt">
         <span class="prompt-path" :title="cwd">{{ cwd || '/' }}</span>
-        <span class="sigil">$</span>
+        <span class="sigil">{{ sigil }}</span>
         <el-input
           ref="inputRef"
           v-model="command"

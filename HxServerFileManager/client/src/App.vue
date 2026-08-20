@@ -757,6 +757,7 @@ async function pollServerCopy() {
               :ref="(el) => { if (el) termRefs[c.connectionId] = el }"
               :conn-id="c.connectionId"
               :conn-key="connKeyOf(c)"
+              :username="c.username"
               :cwd="cwdMap[c.connectionId]"
               :maximized="termMax"
               @update:cwd="(p) => onCwdChanged(c.connectionId, p)"

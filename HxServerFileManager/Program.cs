@@ -1584,9 +1584,11 @@ public sealed class SshSession : IDisposable
             // （\033]7;file://host/path\007，VSCode/tmux 的标准做法），前端解析后同步文件列表
             try
             {
+                // PS1 里用 \$ 而不是字面量 $：bash 会按 EUID 展开成 # (root) / $ (普通用户)，
+                // 与直接 ssh 登录的观感一致（root 提示符是 #）
                 var init =
                     "export PROMPT_COMMAND='printf \"\\033]7;file://%s%s\\007\" \"$HOSTNAME\" \"$PWD\"'\n" +
-                    "export PS1='\\u@\\h:\\w$ '\n";
+                    "export PS1='\\u@\\h:\\w\\$ '\n";
                 stream.Write(init);
                 stream.Flush();
             }
