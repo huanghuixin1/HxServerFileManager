@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- 应用版本：显示在窗口标题（与主项目保持一致，改版本号时两边一起改） -->
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <!-- 桌面壳不弹控制台窗口（Windows） -->
     <RuntimeIdentifier Condition="'$(RuntimeIdentifier)' == ''">win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
@@ -24,8 +24,7 @@
 
   <ItemGroup>
     <!-- 引用主项目，复用 Web 服务构建逻辑。SetRuntimeIdentifier 让主项目与桌面壳用相同 RID 输出 -->
-    <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj"
-                      SetRuntimeIdentifier="true" />
+    <ProjectReference Include="..\HxServerFileManager\HxServerFileManager.csproj" SetRuntimeIdentifier="true" />
   </ItemGroup>
 
   <!-- 窗口图标：logo.png 作为内嵌资源打包（构建产物不落散文件），
@@ -46,12 +45,9 @@
       <WwwrootStale Include="$(OutDir)wwwroot\**\*;$(PublishDir)wwwroot\**\*" />
     </ItemGroup>
     <Delete Files="@(WwwrootStale)" ContinueOnError="true" />
-    <Copy SourceFiles="@(WwwrootSource)"
-          DestinationFiles="@(WwwrootSource->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
-    <Copy SourceFiles="@(WwwrootSource)"
-          DestinationFiles="@(WwwrootSource->'$(PublishDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
-    <Message Importance="high"
-             Text="wwwroot -&gt; $(OutDir)wwwroot 与 $(PublishDir)wwwroot：已复制 @(WwwrootSource->Count()) 个文件" />
+    <Copy SourceFiles="@(WwwrootSource)" DestinationFiles="@(WwwrootSource->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Copy SourceFiles="@(WwwrootSource)" DestinationFiles="@(WwwrootSource->'$(PublishDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')" />
+    <Message Importance="high" Text="wwwroot -&gt; $(OutDir)wwwroot 与 $(PublishDir)wwwroot：已复制 @(WwwrootSource-&gt;Count()) 个文件" />
   </Target>
 
   <!--

@@ -381,7 +381,7 @@ build_mac_app() {
   <key>CFBundleIconFile</key>
   <string>logo</string>
   <key>CFBundleShortVersionString</key>
-  <string>1.0.0</string>
+  <string>1.1.0</string>
   <key>CFBundleVersion</key>
   <string>1</string>
   <key>LSMinimumSystemVersion</key>
