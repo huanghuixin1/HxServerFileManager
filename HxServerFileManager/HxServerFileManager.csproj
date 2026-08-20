@@ -6,7 +6,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <!-- 应用版本：启动时打印、/api/health 返回；桌面壳标题同步显示（见 WebHost.AppVersion） -->
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <!-- 被 Desktop 项目引用时，不要继承 RID 导致 self-contained 冲突（NETSDK1151） -->
     <SelfContained>false</SelfContained>
     <!-- 应用图标：仓库根目录 logo.ico（嵌入 exe，Windows 资源管理器/任务栏显示） -->
