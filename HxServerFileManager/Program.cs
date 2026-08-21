@@ -387,7 +387,7 @@ app.MapPut("/api/connections/{id}", (string id, ConnectRequest req, ConnectionsS
             ? (string.IsNullOrWhiteSpace(req.Password) ? prof.AuthType : "password")
             : "key",
     };
-    store.Upsert(updated);
+    store.Update(updated);
     return Results.Ok(new { message = "已更新", id = updated.Id, name = updated.Name });
 });
 
@@ -2279,6 +2279,22 @@ public sealed class ConnectionsStore
             }
             Save();
             return saved;
+        }
+    }
+
+    // 按 Id 原地更新（PUT /api/connections/{id} 用）。找不到返回 false。
+    // 不能复用 Upsert：Upsert 按 host|port|username 去重，编辑时一旦改了主机/端口/用户名，
+    // 去重键随之变化 → Upsert 判定为「新连接」而追加一条，还带着传入的原 Id，于是出现
+    // 两条同 Id 的记录（就像新建了一个）。PUT 已经拿到确切 Id，直接按 Id 定位替换即可。
+    public bool Update(ConnectionProfile p)
+    {
+        lock (_gate)
+        {
+            var idx = _profiles.FindIndex(x => x.Id == p.Id);
+            if (idx < 0) return false;
+            _profiles[idx] = p;
+            Save();
+            return true;
         }
     }
 

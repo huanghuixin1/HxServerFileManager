@@ -814,7 +814,7 @@ async function pollServerCopy() {
     >
       <SavedConnections
         :reload-token="savedReload"
-        @reconnect="handleConnected"
+        @open="(p) => { manageVisible = false; openSaved(p) }"
         @edit="openEdit"
       />
     </el-dialog>
