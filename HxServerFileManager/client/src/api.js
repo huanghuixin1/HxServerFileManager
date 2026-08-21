@@ -347,7 +347,21 @@ export function openNetStream(connId, onMessage, intervalSec = 1) {
   return es
 }
 
-// ---- 桌面壳（Photino）消息桥 ----
+// SSE 按进程的实时上下行（后端按会话探测 ss / nethogs，逐 socket 做差归到 pid）。
+// 只在进程带宽面板打开时才建流；默认 2s 采样（ss 在海量 socket 机器上不便宜）。
+export function openProcNetStream(connId, onMessage, intervalSec = 2) {
+  const token = getToken()
+  const qs = new URLSearchParams({ connId, interval: String(intervalSec) })
+  if (token) qs.set('token', token)
+  const es = new EventSource(`/api/proc-net-stream?${qs.toString()}`)
+  es.onmessage = (e) => {
+    try {
+      onMessage(JSON.parse(e.data))
+    } catch (_) { /* ignore */ }
+  }
+  es.onerror = () => { /* 会话断开等：EventSource 自己重连 */ }
+  return es
+}
 // JS→C#：window.external.sendMessage(JSON)；C#→JS：window.external.receiveMessage = fn（Photino 注入）。
 // 仅存在于桌面壳（WebView2/WebKitGTK）；普通浏览器里 window.external 没有 sendMessage，静默跳过。
 // 协议：请求 { op, ... } → C# 处理 → 响应 { op: '<op>Result', ... }，按 op 分发一次性回调；

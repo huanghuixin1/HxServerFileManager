@@ -1191,6 +1191,163 @@ app.MapGet("/api/net-stream", async (string connId, HttpContext ctx, ConnectionM
     return Results.Empty;
 });
 
+// ---- 按进程的实时上下行（SSE）----
+// Linux 没有「按进程字节计数」，只能间接算：默认 ss 逐 socket 读 tcp_info 做差归到 pid（仅 TCP、
+// 零依赖）；远端有 nethogs 就用它（含 UDP，需 root）。非 root 时先探免密 sudo，有则提权跑 ss。
+// 只在前端打开进程带宽面板时才建流（ss 在海量 socket 机器上不便宜，别并进常开的 /api/net-stream）。
+app.MapGet("/api/proc-net-stream", async (string connId, HttpContext ctx, ConnectionManager mgr, int? interval) =>
+{
+    SshSession s;
+    try { s = mgr.Get(connId); }
+    catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+    var sec = Math.Clamp(interval ?? 2, 1, 10);
+
+    ctx.Response.Headers.Append("Content-Type", "text/event-stream");
+    ctx.Response.Headers.Append("Cache-Control", "no-cache");
+    ctx.Response.Headers.Append("Connection", "keep-alive");
+    ctx.Response.Headers.Append("X-Accel-Buffering", "no");
+
+    using var cts = CancellationTokenSource.CreateLinkedTokenSource(ctx.RequestAborted, shutdownCts.Token);
+
+    // 一次性探测：决定用 ss 还是 nethogs、要不要 sudo。探测失败按最保守（ss 不提权）走。
+    ProcNetProbe probe;
+    try
+    {
+        using var pcmd = s.Ssh.CreateCommand(ProcNetHelpers.ProbeScript);
+        pcmd.CommandTimeout = TimeSpan.FromSeconds(15);
+        pcmd.Execute();
+        probe = ProcNetHelpers.ParseProbe((pcmd.Result ?? "").Replace("\r\n", "\n"));
+    }
+    catch { probe = new ProcNetProbe(true, false, false, false); }
+
+    var useSudo = !probe.IsRoot && probe.CanSudo;
+    var useNethogs = probe.HasNethogs && (probe.IsRoot || probe.CanSudo);
+    var mode = useNethogs ? "nethogs" : "ss";
+    // ss 缺失又没 nethogs：无法采集，回一帧错误让前端给明确提示（不是空表）
+    if (mode == "ss" && !probe.HasSs)
+    {
+        var errPayload = new { error = "remote-missing-ss", mode = "none" };
+        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(errPayload, netJson)}\n\n", cts.Token);
+        await ctx.Response.Body.FlushAsync(cts.Token);
+        return Results.Empty;
+    }
+
+    var script = useNethogs
+        ? ProcNetHelpers.NethogsScript(sec, useSudo)
+        : ProcNetHelpers.SsStreamScript(sec, useSudo);
+
+    using var cmd = s.Ssh.CreateCommand(script);
+    cmd.CommandTimeout = Timeout.InfiniteTimeSpan;
+    cmd.BeginExecute();
+
+    var lines = Channel.CreateBounded<string>(
+        new BoundedChannelOptions(8192) { FullMode = BoundedChannelFullMode.DropOldest });
+    _ = Task.Run(() =>
+    {
+        try
+        {
+            using var sr = new StreamReader(cmd.OutputStream, Encoding.UTF8);
+            string? line;
+            while ((line = sr.ReadLine()) != null) lines.Writer.TryWrite(line);
+        }
+        catch { /* 通道释放 / SSH 断开 */ }
+        finally { lines.Writer.TryComplete(); }
+    });
+
+    var block = new List<string>();         // 当前帧累积的行
+    var devBlock = new List<string>();       // ss 模式下 /proc/net/dev 段
+    var inDev = true;                        // 每帧先出 /proc/net/dev，到 DevMarker 才切到 ss 段
+    Dictionary<long, (long Tx, long Rx)> prevSock = new();
+    List<NetStatus>? prevNet = null;
+    DateTime prevTs = default;
+
+    async Task Emit(List<ProcNet> procs, double totalRx, double totalTx, bool warmup)
+    {
+        // 未归属 = 网卡总量 − 明细之和（UDP / 内核态 / 已关闭连接 / 无权限看到的）。不为负。
+        var sumRx = procs.Sum(p => p.RxRateBps);
+        var sumTx = procs.Sum(p => p.TxRateBps);
+        var payload = new
+        {
+            mode,
+            intervalSec = sec,
+            warmup,
+            procs = procs.OrderByDescending(p => p.RxRateBps + p.TxRateBps).Take(30),
+            totalRxBps = totalRx,
+            totalTxBps = totalTx,
+            unaccountedRxBps = Math.Max(0, totalRx - sumRx),
+            unaccountedTxBps = Math.Max(0, totalTx - sumTx),
+            degraded = new { noPid = !probe.IsRoot && !useSudo, ssOnly = mode == "ss", sudoUsed = useSudo },
+        };
+        await ctx.Response.WriteAsync($"data: {JsonSerializer.Serialize(payload, netJson)}\n\n", cts.Token);
+        await ctx.Response.Body.FlushAsync(cts.Token);
+    }
+
+    try
+    {
+        await foreach (var line in lines.Reader.ReadAllAsync(cts.Token))
+        {
+            if (mode == "nethogs")
+            {
+                // nethogs 一帧以 Refreshing: 起头；见到下一个 Refreshing 就结算上一帧
+                if (line.StartsWith("Refreshing", StringComparison.Ordinal))
+                {
+                    if (block.Count > 0)
+                    {
+                        var now = DateTime.UtcNow;
+                        var dt = prevTs == default ? 0 : (now - prevTs).TotalSeconds;
+                        prevTs = now;
+                        var cur = ProcNetHelpers.ParseNethogs(block);
+                        var procs = ProcNetHelpers.WithProcRates(cur, prevSock, dt);
+                        prevSock = cur.ToDictionary(x => x.Ino, x => (x.TxBytes, x.RxBytes));
+                        block.Clear();
+                        s.Touch();
+                        var tRx = procs.Sum(p => p.RxRateBps);
+                        var tTx = procs.Sum(p => p.TxRateBps);
+                        await Emit(procs, tRx, tTx, dt <= 0);
+                    }
+                    continue;
+                }
+                if (block.Count < 4096) block.Add(line);
+                continue;
+            }
+
+            // ---- ss 模式 ----
+            if (line.StartsWith(ProcNetHelpers.DevMarker, StringComparison.Ordinal)) { inDev = false; continue; }
+            if (!line.StartsWith(ProcNetHelpers.TickMarker, StringComparison.Ordinal))
+            {
+                // TICK 之前先是 /proc/net/dev（到 DevMarker 为止），随后是 ss 输出
+                if (inDev) { if (devBlock.Count < 256) devBlock.Add(line); }
+                else if (block.Count < 8192) block.Add(line);
+                continue;
+            }
+
+            var now2 = DateTime.UtcNow;
+            var dt2 = prevTs == default ? 0 : (now2 - prevTs).TotalSeconds;
+            prevTs = now2;
+
+            var socks = ProcNetHelpers.ParseSs(block);
+            var procs2 = ProcNetHelpers.WithProcRates(socks, prevSock, dt2);
+            prevSock = new Dictionary<long, (long, long)>();
+            foreach (var so in socks) prevSock[so.Ino] = (so.TxBytes, so.RxBytes); // 同 ino 取后一条
+
+            var curNet = SystemStatusHelpers.ParseNetDev(devBlock);
+            var nets = SystemStatusHelpers.WithRates(curNet, prevNet, dt2);
+            prevNet = nets;
+
+            block.Clear();
+            devBlock.Clear();
+            inDev = true;   // 下一帧的 dev 段从新的一行开始（本行是 TICK，后面紧跟 net/dev）
+            s.Touch();
+
+            await Emit(procs2, nets.Sum(n => n.RxRateBps), nets.Sum(n => n.TxRateBps), dt2 <= 0);
+        }
+    }
+    catch (OperationCanceledException) { /* 客户端断开 / 服务停机 */ }
+    catch (Exception) { /* 会话断开等：静默收尾，前端 EventSource 会自己重连 */ }
+    return Results.Empty;
+});
+
 Console.WriteLine($"[HxServerFileManager] 版本 {AppVersion()}");
 Console.WriteLine($"[HxServerFileManager] Kestrel 已启动，监听 http://0.0.0.0:{listenPort}");
 Console.WriteLine("[HxServerFileManager] 按 Ctrl+C 停止服务");
@@ -2298,6 +2455,15 @@ public sealed class SettingsStore
 public record DiskStatus(string Fs, string Size, string Used, string Avail, string Use, string Mount);
 public record NetStatus(string Name, string State, long RxBytes, long TxBytes, double RxRateBps = 0, double TxRateBps = 0);
 
+// 按进程的网络占用（/api/proc-net-stream 推送）。RateBps 由后端算好，前端直接展示。
+public record ProcNet(int Pid, string Comm, double RxRateBps, double TxRateBps, int Conns);
+
+// ss 解析出的单个 socket 采样（跨帧按 Ino 做差得速率）。老内核可能没有字节计数字段。
+public record SockSample(long Ino, int Pid, string Comm, long TxBytes, long RxBytes);
+
+// 一次探测结果：远端有没有 ss / nethogs、当前是不是 root、能不能免密 sudo。
+public record ProcNetProbe(bool HasSs, bool HasNethogs, bool IsRoot, bool CanSudo);
+
 public record SystemStatus(
     string? Hostname,
     long UnixTs,
@@ -2557,5 +2723,137 @@ public static class SystemStatusHelpers
             cur[i] = cur[i] with { RxRateBps = rx, TxRateBps = tx };
         }
         return cur;
+    }
+}
+
+/// <summary>
+/// 按进程的网络占用采集（/api/proc-net-stream）。Linux 内核不提供「按进程的字节计数」，
+/// 只能间接算：ss 逐 socket 读 tcp_info 的 bytes_sent/bytes_received 前后做差归到 pid（打底，
+/// 仅 TCP、零依赖）；检测到 nethogs 就用它（libpcap 抓包，含 UDP，需 root）。
+/// 所有多行脚本必须过 <see cref="SystemStatusHelpers.Sh"/> 归一化换行——CRLF 的 \r 会让
+/// 远端 bash 把 `2>&amp;1\r` 当 ambiguous redirect 静默失效（历史坑）。
+/// </summary>
+public static class ProcNetHelpers
+{
+    public const string TickMarker = "===PTICK===";
+    public const string DevMarker = "===PDEV===";   // /proc/net/dev 段与 ss 段的分隔
+
+    private static string Sh(string s) => SystemStatusHelpers.Sh(s);
+
+    // ---- 一次性探测：有没有 ss/nethogs、是不是 root、能不能免密 sudo ----
+    public static readonly string ProbeScript = Sh(
+        "command -v ss >/dev/null 2>&1 && echo ss=1 || echo ss=0\n" +
+        "command -v nethogs >/dev/null 2>&1 && echo nethogs=1 || echo nethogs=0\n" +
+        "[ \"$(id -u)\" = 0 ] && echo root=1 || echo root=0\n" +
+        "sudo -n true >/dev/null 2>&1 && echo sudo=1 || echo sudo=0\n");
+
+    public static ProcNetProbe ParseProbe(string raw)
+    {
+        bool F(string k) => Regex.IsMatch(raw ?? "", $@"(?m)^{k}=1\s*$");
+        return new ProcNetProbe(F("ss"), F("nethogs"), F("root"), F("sudo"));
+    }
+
+    // ---- ss 打底：每帧先 cat /proc/net/dev（算网卡总量→未归属），再 ss 全量 socket ----
+    // -t TCP，-a 全部状态，-n 数字端口，-p 进程，-i tcp_info（含 bytes_sent/received），-e 扩展（含 ino:）
+    public static string SsStreamScript(int intervalSec, bool useSudo)
+    {
+        var ss = (useSudo ? "sudo -n " : "") + "ss -tanpie 2>/dev/null";
+        return Sh(
+            "while :; do " +
+            "cat /proc/net/dev 2>/dev/null; echo \"" + DevMarker + "\"; " +
+            ss + "; echo \"" + TickMarker + "\"; " +
+            "sleep " + intervalSec + "; done\n");
+    }
+
+    // ---- nethogs 精确模式：-t 跟踪模式逐行输出 `路径/PID/UID\t发送KB\t接收KB`（累计值） ----
+    public static string NethogsScript(int intervalSec, bool useSudo) => Sh(
+        (useSudo ? "sudo -n " : "") + "nethogs -t -d " + intervalSec + " 2>/dev/null\n");
+
+    // ss 的 -i/-p 会把 tcp_info 续行缩进接在 socket 主行后面；这里把缩进续行并回上一条主行，
+    // 再逐条正则抽 ino / pid / comm / bytes。socket 身份用 ino（四元组会被复用，做差会错）。
+    private static readonly Regex RxIno = new(@"\bino:(\d+)", RegexOptions.Compiled);
+    private static readonly Regex RxUser = new(@"users:\(\(""([^""]+)"",pid=(\d+),", RegexOptions.Compiled);
+    private static readonly Regex RxSent = new(@"\bbytes_sent:(\d+)", RegexOptions.Compiled);
+    private static readonly Regex RxAcked = new(@"\bbytes_acked:(\d+)", RegexOptions.Compiled);
+    private static readonly Regex RxRecv = new(@"\bbytes_received:(\d+)", RegexOptions.Compiled);
+
+    public static List<SockSample> ParseSs(IEnumerable<string> block)
+    {
+        // 先合并续行：非空且以空白开头的行 = 上一条 socket 的 tcp_info 续行
+        var recs = new List<string>();
+        foreach (var raw in block)
+        {
+            var line = raw.TrimEnd('\r');
+            if (line.Length == 0) continue;
+            if ((line[0] == ' ' || line[0] == '\t') && recs.Count > 0)
+                recs[^1] += " " + line.Trim();
+            else
+                recs.Add(line);
+        }
+
+        var list = new List<SockSample>();
+        foreach (var rec in recs)
+        {
+            var mUser = RxUser.Match(rec);
+            if (!mUser.Success) continue;                 // 没归到进程的（无权限/内核态）跳过，计入未归属
+            var mIno = RxIno.Match(rec);
+            if (!mIno.Success) continue;                  // 没 ino 无法跨帧对齐，跳过
+            var mSent = RxSent.Match(rec);
+            var tx = mSent.Success ? long.Parse(mSent.Groups[1].Value)
+                   : (RxAcked.Match(rec) is { Success: true } a ? long.Parse(a.Groups[1].Value) : -1);
+            var mRecv = RxRecv.Match(rec);
+            var rx = mRecv.Success ? long.Parse(mRecv.Groups[1].Value) : -1;
+            if (tx < 0 && rx < 0) continue;               // 老 iproute2 无字节计数，无法出速率
+            list.Add(new SockSample(
+                long.Parse(mIno.Groups[1].Value),
+                int.Parse(mUser.Groups[2].Value),
+                mUser.Groups[1].Value,
+                Math.Max(0, tx), Math.Max(0, rx)));
+        }
+        return list;
+    }
+
+    // 用相邻两帧的 socket 累计字节做差、按 pid 汇总成每进程速率（B/s）。
+    // prevSock：上一帧每个 ino 的累计 (tx,rx)。首见 socket 只进基线、不出速率（否则长连接一打开就爆表）。
+    public static List<ProcNet> WithProcRates(
+        List<SockSample> cur, Dictionary<long, (long Tx, long Rx)> prevSock, double dt)
+    {
+        var agg = new Dictionary<int, (string Comm, double Tx, double Rx, int Conns)>();
+        foreach (var s in cur)
+        {
+            if (!agg.TryGetValue(s.Pid, out var v)) v = (s.Comm, 0, 0, 0);
+            v.Conns++;
+            if (dt > 0 && prevSock.TryGetValue(s.Ino, out var p))
+            {
+                if (s.TxBytes >= p.Tx) v.Tx += (s.TxBytes - p.Tx) / dt;   // 计数器重置/回绕按 0
+                if (s.RxBytes >= p.Rx) v.Rx += (s.RxBytes - p.Rx) / dt;
+            }
+            agg[s.Pid] = v;
+        }
+        return agg.Select(kv => new ProcNet(kv.Key, kv.Value.Comm, kv.Value.Rx, kv.Value.Tx, kv.Value.Conns))
+                  .ToList();
+    }
+
+    // nethogs -t 一帧：`Refreshing:` 起头，随后每行 `路径/PID/UID\t发送KB\t接收KB`（累计 KB）。
+    // 路径含 `/`，PID/UID 是最后两段。做差同 ss，key 用 pid（nethogs 不给 ino）。
+    public static List<SockSample> ParseNethogs(IEnumerable<string> block)
+    {
+        var list = new List<SockSample>();
+        foreach (var raw in block)
+        {
+            var line = raw.TrimEnd('\r').Trim();
+            if (line.Length == 0 || line.StartsWith("Refreshing", StringComparison.Ordinal)) continue;
+            var cols = line.Split('\t');
+            if (cols.Length < 3) continue;
+            if (!double.TryParse(cols[1], out var sentKb) || !double.TryParse(cols[2], out var recvKb)) continue;
+            var idParts = cols[0].Split('/');
+            if (idParts.Length < 3) continue;
+            if (!int.TryParse(idParts[^2], out var pid)) continue;   // 倒数第二段是 PID
+            var path = string.Join('/', idParts.Take(idParts.Length - 2));
+            var comm = path.Split('/').LastOrDefault(x => x.Length > 0) ?? path;
+            // pid 当 ino 用（nethogs 无 socket 粒度），累计 KB→字节
+            list.Add(new SockSample(pid, pid, comm, (long)(sentKb * 1024), (long)(recvKb * 1024)));
+        }
+        return list;
     }
 }

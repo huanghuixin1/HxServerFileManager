@@ -2,6 +2,7 @@
 import { ref, computed, watch, onUnmounted } from 'vue'
 import { ElMessage } from 'element-plus'
 import { api, openNetStream } from '../api.js'
+import ProcNetPanel from './ProcNetPanel.vue'
 
 const props = defineProps({
   connId: String,
@@ -10,6 +11,7 @@ const props = defineProps({
 const status = ref(null)
 const loading = ref(false)
 const detailVisible = ref(false) // 「详情」弹窗
+const procNetVisible = ref(false) // 「进程带宽」面板（谁在占上下行）
 const auto = ref(true)            // 迷你状态栏自动刷新
 const updatedAt = ref(null)
 let timer = null
@@ -129,6 +131,11 @@ function stopAuto() {
     clearInterval(timer)
     timer = null
   }
+}
+
+// 从状态详情弹窗里点「详情」→ 打开进程带宽面板（谁在占上下行）
+function openProcNet() {
+  procNetVisible.value = true
 }
 
 // ---- 实时上下行（1 秒一帧，MobaXterm 风格）----
@@ -291,7 +298,7 @@ function formatRate(bps) {
       </span>
     </div>
 
-    <div v-if="netSummary" class="ss-item" title="网络实时上下行（1 秒采样）" @click="detailVisible = true">
+    <div v-if="netSummary" class="ss-item" title="点击查看是哪个进程在占用上下行带宽" @click="procNetVisible = true">
       <span class="lbl">网络</span>
       <span class="val mono">{{ netSummary }}</span>
     </div>
@@ -409,6 +416,7 @@ function formatRate(bps) {
           <div class="ss-block">
             <div class="ss-card-label">
               <el-icon><Connection /></el-icon>网络状态
+              <el-link type="primary" :underline="false" class="ss-net-detail" @click="openProcNet">详情</el-link>
               <span class="ss-live">{{ live ? (live.warmup ? '实时采样中…' : `实时 · ${live.intervalSec}s`) : '实时流未连接（速率为 10s 均值）' }}</span>
             </div>
             <el-table :data="viewNets" empty-text="未采集到网卡信息（容器内可能无 /proc/net/dev）" size="small" max-height="200">
@@ -446,6 +454,26 @@ function formatRate(bps) {
       <div class="ss-spacer"></div>
       <el-button :loading="loading" @click="load">刷新</el-button>
       <el-button type="primary" @click="detailVisible = false">关闭</el-button>
+    </template>
+  </el-dialog>
+
+  <!-- ====== 进程带宽面板（谁在占上下行） ====== -->
+  <el-dialog
+    v-model="procNetVisible"
+    width="min(720px, 94vw)"
+    :close-on-click-modal="false"
+    destroy-on-close
+  >
+    <template #header>
+      <div class="ss-dlg-head">
+        <span class="ss-dlg-title">进程网络占用</span>
+        <span v-if="status?.hostname" class="ss-host">{{ status.hostname }}</span>
+      </div>
+    </template>
+    <ProcNetPanel :conn-id="connId" :visible="procNetVisible" />
+    <template #footer>
+      <div class="ss-spacer"></div>
+      <el-button type="primary" @click="procNetVisible = false">关闭</el-button>
     </template>
   </el-dialog>
 </template>
@@ -611,6 +639,10 @@ function formatRate(bps) {
   margin-left: auto;
   color: #a0abba;
   font-size: 11.5px;
+}
+.ss-net-detail {
+  margin-left: 8px;
+  font-size: 12px;
 }
 @media (max-width: 640px) {
   .ss-grid {
