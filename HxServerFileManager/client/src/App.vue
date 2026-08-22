@@ -10,6 +10,7 @@ import LogPanel from './components/LogPanel.vue'
 import EditorModal from './components/EditorModal.vue'
 import LoginView from './components/LoginView.vue'
 import SystemStatus from './components/SystemStatus.vue'
+import { useSettings } from './useSettings.js'
 
 // ---- 登录鉴权状态：探测 /api/session，未认证时显示登录页 ----
 const authLoading = ref(true)
@@ -42,6 +43,47 @@ const savedReload = ref(0)
 const manageVisible = ref(false)
 const editing = ref(null)
 const editVisible = ref(false)
+
+// ---- 全局代理（头部「代理设置」弹窗）：连接默认直连，需在连接里选「跟随全局」才使用 ----
+const { proxy: globalProxy, ensureLoaded: ensureSettingsLoaded, saveProxy } = useSettings()
+const proxyDlgVisible = ref(false)
+// 弹窗编辑的是本地副本，保存成功才写回全局，避免半编辑状态影响别处
+const proxyForm = reactive({ type: 'http', host: '', port: 7890, username: '', password: '' })
+
+function openProxyDialog() {
+  const p = globalProxy.value
+  proxyForm.type = p?.type || 'http'
+  proxyForm.host = p?.host || ''
+  proxyForm.port = p?.port || 7890
+  proxyForm.username = p?.username || ''
+  proxyForm.password = p?.password || ''
+  proxyDlgVisible.value = true
+}
+
+async function saveGlobalProxy() {
+  const host = proxyForm.host.trim()
+  if (host && !(Number(proxyForm.port) > 0)) {
+    ElMessage.warning('请填写有效的代理端口')
+    return
+  }
+  // 主机清空 = 停用全局代理（连接全部直连），后端存 null
+  globalProxy.value = host
+    ? {
+        type: proxyForm.type,
+        host,
+        port: Number(proxyForm.port),
+        username: proxyForm.username.trim() || null,
+        password: proxyForm.password || null,
+      }
+    : null
+  try {
+    await saveProxy()
+    ElMessage.success(host ? '全局代理已保存' : '已停用全局代理（跟随全局的连接将直连）')
+    proxyDlgVisible.value = false
+  } catch (e) {
+    ElMessage.error('保存失败：' + e.message)
+  }
+}
 
 const activeConn = computed(
   () => connections.value.find((c) => c.connectionId === activeId.value) || null
@@ -293,6 +335,7 @@ function onGlobalKeydown(e) {
 onMounted(() => {
   healthTimer = setInterval(checkSessionHealth, HEALTH_INTERVAL)
   window.addEventListener('keydown', onGlobalKeydown)
+  ensureSettingsLoaded() // 全局代理等偏好（连接表单里展示「跟随全局（当前配置）」用）
 })
 
 onUnmounted(() => {
@@ -685,6 +728,10 @@ async function pollServerCopy() {
           </template>
         </el-dropdown>
 
+        <el-button text @click="openProxyDialog">
+          <el-icon style="margin-right: 4px"><Link /></el-icon>代理设置
+        </el-button>
+
         <el-button type="primary" plain @click="connectVisible = true">
           <el-icon style="margin-right: 4px"><Plus /></el-icon>新建连接
         </el-button>
@@ -827,6 +874,60 @@ async function pollServerCopy() {
       :close-on-click-modal="false"
     >
       <ConnectPanel mode="edit" :initial="editing" @updated="onUpdated" />
+    </el-dialog>
+
+    <!-- 全局代理：代理模式为「跟随全局」的连接（默认）建立 SSH/SFTP 时经过此代理 -->
+    <el-dialog
+      v-model="proxyDlgVisible"
+      title="全局代理"
+      width="min(500px, 92vw)"
+      :close-on-click-modal="false"
+    >
+      <el-form label-width="84px" @submit.prevent="saveGlobalProxy">
+        <el-form-item label="代理类型">
+          <el-radio-group v-model="proxyForm.type">
+            <el-radio value="http">HTTP</el-radio>
+            <el-radio value="socks5">SOCKS5</el-radio>
+            <el-radio value="socks4">SOCKS4</el-radio>
+          </el-radio-group>
+        </el-form-item>
+        <el-row :gutter="10">
+          <el-col :xs="24" :sm="14">
+            <el-form-item label="代理主机">
+              <el-input
+                v-model.trim="proxyForm.host"
+                placeholder="例如 127.0.0.1，清空则停用"
+                clearable
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="10">
+            <el-form-item label="代理端口">
+              <el-input-number
+                v-model="proxyForm.port"
+                :min="1"
+                :max="65535"
+                controls-position="right"
+                style="width: 100%"
+              />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="代理用户名">
+          <el-input v-model.trim="proxyForm.username" placeholder="可选" clearable />
+        </el-form-item>
+        <el-form-item label="代理密码">
+          <el-input v-model="proxyForm.password" type="password" placeholder="可选" show-password />
+        </el-form-item>
+        <p class="proxy-tip">
+          保存后，在连接里选择「跟随全局」的才会经过此代理（连接默认直连）；单个连接可在「新建/编辑连接」里选择。
+          修改代理不影响已建立的连接，重连/新连接时生效。
+        </p>
+      </el-form>
+      <template #footer>
+        <el-button @click="proxyDlgVisible = false">取消</el-button>
+        <el-button type="primary" @click="saveGlobalProxy">保存</el-button>
+      </template>
     </el-dialog>
 
     <EditorModal
@@ -1271,5 +1372,11 @@ async function pollServerCopy() {
 }
 .scp-alert {
   margin-top: 12px;
+}
+.proxy-tip {
+  margin: 4px 0 0;
+  color: #8a97a5;
+  font-size: 12.5px;
+  line-height: 1.6;
 }
 </style>

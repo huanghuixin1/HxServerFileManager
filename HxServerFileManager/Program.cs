@@ -230,13 +230,13 @@ app.MapFallbackToFile("index.html");
 // ----------------------------------------------------------------------------
 
 // 连接一台 Linux 服务器（密码 或 私钥 认证），成功后把连接信息保存到服务器
-app.MapPost("/api/connect", (ConnectRequest req, ConnectionManager mgr, ConnectionsStore store, OperationLogger log) =>
+app.MapPost("/api/connect", (ConnectRequest req, ConnectionManager mgr, ConnectionsStore store, SettingsStore settings, OperationLogger log) =>
 {
     if (string.IsNullOrWhiteSpace(req.Host) || string.IsNullOrWhiteSpace(req.Username))
         return Results.BadRequest(new { error = "Host 与 Username 为必填" });
 
     var port = req.Port is int pp && pp > 0 ? pp : 22;
-    var (ok, id, home, err) = ConnectInternal(req, mgr);
+    var (ok, id, home, err) = ConnectInternal(req, mgr, settings);
     if (!ok)
     {
         log.Log("error", $"{req.Username}@{req.Host}:{port}", "连接", "认证/握手失败", err);
@@ -281,6 +281,8 @@ app.MapGet("/api/connections", (ConnectionsStore store) =>
         authType = p.AuthType,
         hasPassword = !string.IsNullOrEmpty(p.Password),
         hasKey = !string.IsNullOrEmpty(p.PrivateKey),
+        proxyMode = p.ProxyMode,
+        proxy = p.Proxy,
         createdAt = p.CreatedAt,
         lastConnectedAt = p.LastConnectedAt
     }).OrderByDescending(p => p.lastConnectedAt).ToList();
@@ -334,13 +336,13 @@ app.MapPost("/api/connections/import", (List<ConnectionProfile> profiles, string
 });
 
 // 用已保存的凭据重新连接
-app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr, ConnectionsStore store, OperationLogger log) =>
+app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr, ConnectionsStore store, SettingsStore settings, OperationLogger log) =>
 {
     var prof = store.Get(req.ConnectionId);
     if (prof is null) return Results.NotFound(new { error = "未找到保存的连接" });
 
-    var creq = new ConnectRequest(prof.Host, prof.Port, prof.Username, prof.Password, prof.PrivateKey, prof.Passphrase);
-    var (ok, id, home, err) = ConnectInternal(creq, mgr);
+    var creq = new ConnectRequest(prof.Host, prof.Port, prof.Username, prof.Password, prof.PrivateKey, prof.Passphrase, prof.Name, prof.ProxyMode, prof.Proxy);
+    var (ok, id, home, err) = ConnectInternal(creq, mgr, settings);
     if (!ok)
     {
         log.Log("error", $"{prof.Username}@{prof.Host}:{prof.Port}", "重连", "失败", err);
@@ -386,6 +388,11 @@ app.MapPut("/api/connections/{id}", (string id, ConnectRequest req, ConnectionsS
         AuthType = string.IsNullOrWhiteSpace(req.PrivateKey)
             ? (string.IsNullOrWhiteSpace(req.Password) ? prof.AuthType : "password")
             : "key",
+        // 代理：未传 mode（旧客户端）保持原样；custom 且没带新配置时保留原自定义配置
+        ProxyMode = string.IsNullOrWhiteSpace(req.ProxyMode) ? prof.ProxyMode : req.ProxyMode,
+        Proxy = string.IsNullOrWhiteSpace(req.ProxyMode)
+            ? prof.Proxy
+            : req.ProxyMode == "custom" ? (req.Proxy ?? prof.Proxy) : null,
     };
     store.Update(updated);
     return Results.Ok(new { message = "已更新", id = updated.Id, name = updated.Name });
@@ -1069,6 +1076,18 @@ app.MapPut("/api/settings/macros", (List<TerminalMacro> macros, SettingsStore st
     return Results.Ok(new { macros = store.ListMacros() });
 });
 
+// ---- 全局代理：代理模式为「跟随全局」的连接建立 SSH 时使用（连接默认直连，需显式选择跟随全局）----
+// GET 返回完整配置（含代理密码）供编辑回填；与 /api/connections/export 同级别敏感，同受认证保护
+app.MapGet("/api/settings/proxy", (SettingsStore store) =>
+    Results.Ok(new { proxy = store.GetProxy() }));
+
+// 整份替换；host 清空即停用（连接全部回落直连）
+app.MapPut("/api/settings/proxy", (ProxyConfig? proxy, SettingsStore store) =>
+{
+    store.SetProxy(proxy);
+    return Results.Ok(new { proxy = store.GetProxy() });
+});
+
 // ---- 命令历史：Terminal 执行过的命令，双击可再次执行 ----
 app.MapGet("/api/settings/history", (SettingsStore store) =>
     Results.Ok(new { history = store.ListHistory() }));
@@ -1538,7 +1557,7 @@ public static partial class WebHost
     }
 
     // 真正执行连接（纯逻辑，不含持久化/日志，便于 connect 与 reconnect 复用）
-    internal static (bool ok, string? connectionId, string? home, string? error) ConnectInternal(ConnectRequest req, ConnectionManager mgr)
+    internal static (bool ok, string? connectionId, string? home, string? error) ConnectInternal(ConnectRequest req, ConnectionManager mgr, SettingsStore settings)
     {
         try
         {
@@ -1565,7 +1584,24 @@ public static partial class WebHost
             if (authMethods.Count == 0)
                 return (false, null, null, "必须提供密码或私钥");
 
-            var connInfo = new Renci.SshNet.ConnectionInfo(req.Host, port, req.Username, authMethods.ToArray());
+            // 代理：follow/direct/custom；follow 与「custom 但没填主机」都回落全局，最终没配主机则直连。
+            // 此版本 SSH.NET 的代理属性只读，走带代理参数的 ConnectionInfo 构造函数
+            var proxy = ResolveProxy(req, settings);
+            Renci.SshNet.ConnectionInfo connInfo;
+            if (proxy is not null)
+            {
+                var proxyType = proxy.Type == "socks5" ? ProxyTypes.Socks5
+                    : proxy.Type == "socks4" ? ProxyTypes.Socks4
+                    : ProxyTypes.Http;
+                connInfo = new Renci.SshNet.ConnectionInfo(
+                    req.Host, port, req.Username,
+                    proxyType, proxy.Host!, proxy.Port!.Value, proxy.Username ?? "", proxy.Password ?? "",
+                    authMethods.ToArray());
+            }
+            else
+            {
+                connInfo = new Renci.SshNet.ConnectionInfo(req.Host, port, req.Username, authMethods.ToArray());
+            }
             var ssh = new SshClient(connInfo);
             var sftp = new SftpClient(connInfo);
             // 心跳：拔网线/服务端假死这类「没有 FIN 的断开」靠 TCP 自身要等很久才暴露，
@@ -1602,6 +1638,17 @@ public static partial class WebHost
         }
     }
 
+    // 解析本次连接实际使用的代理：custom 用连接自带配置（未填主机回落全局），follow 用全局，
+    // direct/缺省 直连（默认直连：旧数据与升级前行为一致）。返回 null = 直连。
+    internal static ProxyConfig? ResolveProxy(ConnectRequest req, SettingsStore settings)
+    {
+        var mode = req.ProxyMode ?? "direct";
+        if (mode == "direct") return null;
+        var p = mode == "custom" && !string.IsNullOrWhiteSpace(req.Proxy?.Host) ? req.Proxy : settings.GetProxy();
+        if (p is null || string.IsNullOrWhiteSpace(p.Host) || p.Port is not int port || port <= 0) return null;
+        return p;
+    }
+
     internal static ConnectionProfile ToProfile(ConnectRequest req, int port) => new(
         Id: Guid.NewGuid().ToString("N"),
         Name: req.Name ?? req.Host,
@@ -1613,7 +1660,9 @@ public static partial class WebHost
         PrivateKey: req.PrivateKey,
         Passphrase: req.Passphrase,
         CreatedAt: DateTime.Now,
-        LastConnectedAt: DateTime.Now);
+        LastConnectedAt: DateTime.Now,
+        ProxyMode: req.ProxyMode ?? "direct",
+        Proxy: req.Proxy);
 
     internal static async Task WriteLogEvent(HttpContext ctx, LogEntry e, CancellationToken ct)
     {
@@ -1649,6 +1698,10 @@ public static class FileHelpers
     }
 }
 
+// 代理配置：全局（settings.json）与连接级自定义共用同一形状。
+// Type：http / socks5 / socks4（对应 SSH.NET ProxyTypes）；Host 为空视为未配置（直连）。
+public record ProxyConfig(string? Type, string? Host, int? Port, string? Username, string? Password);
+
 public record ConnectRequest(
     string Host,
     int? Port,
@@ -1656,7 +1709,10 @@ public record ConnectRequest(
     string? Password,
     string? PrivateKey,
     string? Passphrase,
-    string? Name = null);
+    string? Name = null,
+    // 代理模式：direct = 直连（默认，缺省/null 同义）；follow = 跟随全局代理；custom = 用 Proxy 单独配置
+    string? ProxyMode = null,
+    ProxyConfig? Proxy = null);
 
 public record IdRequest(string ConnectionId);
 public record PathRequest(string ConnectionId, string Path, string Name);
@@ -1684,7 +1740,7 @@ public record TerminalMacro(string Id, string ConnKey, string Name, string Comma
 // Cwd = 命令执行时所在目录（快捷命令模式有值；交互终端未知时为 null/空）。
 public record CommandHistoryItem(string ConnKey, string Command, string Cwd, int ExitStatus, DateTime CreatedAt);
 public record AddHistoryRequest(string? ConnKey, string? Command, string? Cwd, int ExitStatus);
-public record UserSettings(List<FavoriteDir> Favorites, List<TerminalMacro> Macros, List<CommandHistoryItem> History);
+public record UserSettings(List<FavoriteDir> Favorites, List<TerminalMacro> Macros, List<CommandHistoryItem> History, ProxyConfig? Proxy = null);
 
 /// <summary>
 /// 一个到 Linux 服务器的 SSH/SFTP 会话。
@@ -2358,7 +2414,11 @@ public record ConnectionProfile(
     string? PrivateKey,
     string? Passphrase,
     DateTime CreatedAt,
-    DateTime LastConnectedAt);
+    DateTime LastConnectedAt,
+    // 代理：direct（默认）/follow/custom；custom 时 Proxy 为该连接单独的代理配置。
+    // 旧 connections.json 无这两个字段 → null → 视为 direct，行为与升级前一致。
+    string? ProxyMode = null,
+    ProxyConfig? Proxy = null);
 
 // 用户偏好设置存储：Data/settings.json（常用目录收藏 + 终端宏），
 // 与 ConnectionsStore 同款 JSON 持久化；写时先写临时文件再原子替换，避免中途崩溃损坏 JSON。
@@ -2420,6 +2480,21 @@ public sealed class SettingsStore
         lock (_gate)
         {
             _settings = _settings with { Macros = macros ?? new List<TerminalMacro>() };
+            Save();
+        }
+    }
+
+    // 全局代理（连接级「跟随全局」时使用）；null = 未配置，连接直连
+    public ProxyConfig? GetProxy()
+    {
+        lock (_gate) return _settings.Proxy;
+    }
+
+    public void SetProxy(ProxyConfig? proxy)
+    {
+        lock (_gate)
+        {
+            _settings = _settings with { Proxy = proxy };
             Save();
         }
     }

@@ -1,6 +1,7 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { ref, reactive, computed, watch } from 'vue'
 import { api } from '../api.js'
+import { useSettings } from '../useSettings.js'
 
 // mode='connect'：连接并保存；mode='edit'：更新已保存的连接（initial 传入该连接）
 const props = defineProps({
@@ -20,6 +21,19 @@ const passphrase = ref('')
 const error = ref('')
 const busy = ref(false)
 
+// ---- 代理：direct=直连（默认）follow=跟随全局 custom=单独配置 ----
+// 「跟随全局」单选上要展示全局代理当前配置，挂载时拉一次偏好
+const { proxy: globalProxy, ensureLoaded } = useSettings()
+ensureLoaded()
+const globalProxyDesc = computed(() => {
+  const p = globalProxy.value
+  if (!p || !p.host) return '（未配置，将直连）'
+  const t = (p.type || 'http').toUpperCase()
+  return `（${t} ${p.host}:${p.port || ''}）`
+})
+const proxyMode = ref('direct')
+const proxy = reactive({ type: 'http', host: '', port: null, username: '', password: '' })
+
 // 编辑模式：用已保存的连接预填表单（密码/私钥不返回，留空表示不修改）
 watch(
   () => props.initial,
@@ -33,6 +47,12 @@ watch(
     password.value = ''
     keyText.value = ''
     passphrase.value = ''
+    proxyMode.value = v.proxyMode === 'follow' || v.proxyMode === 'custom' ? v.proxyMode : 'direct'
+    proxy.type = v.proxy?.type || 'http'
+    proxy.host = v.proxy?.host || ''
+    proxy.port = v.proxy?.port || null
+    proxy.username = v.proxy?.username || ''
+    proxy.password = v.proxy?.password || ''
   },
   { immediate: true }
 )
@@ -46,6 +66,16 @@ function buildReq() {
     password: authType.value === 'password' ? password.value : '',
     privateKey: authType.value === 'key' ? keyText.value : '',
     passphrase: authType.value === 'key' ? passphrase.value : '',
+    proxyMode: proxyMode.value,
+    proxy: proxyMode.value === 'custom'
+      ? {
+          type: proxy.type,
+          host: proxy.host.trim(),
+          port: Number(proxy.port) || null,
+          username: proxy.username.trim() || null,
+          password: proxy.password || null,
+        }
+      : null,
   }
 }
 
@@ -154,6 +184,54 @@ async function submit() {
             :placeholder="mode === 'edit' ? '留空表示不修改' : ''"
             show-password
           />
+        </el-form-item>
+      </template>
+
+      <el-form-item label="代理">
+        <el-radio-group v-model="proxyMode">
+          <el-radio value="direct">直连</el-radio>
+          <el-radio value="follow">跟随全局{{ globalProxyDesc }}</el-radio>
+          <el-radio value="custom">自定义</el-radio>
+        </el-radio-group>
+      </el-form-item>
+
+      <template v-if="proxyMode === 'custom'">
+        <el-row :gutter="10">
+          <el-col :xs="24" :sm="10">
+            <el-form-item label="代理类型">
+              <el-select v-model="proxy.type">
+                <el-option label="HTTP" value="http" />
+                <el-option label="SOCKS5" value="socks5" />
+                <el-option label="SOCKS4" value="socks4" />
+              </el-select>
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="14">
+            <el-form-item label="代理主机" required>
+              <el-input v-model.trim="proxy.host" placeholder="例如 127.0.0.1" clearable />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-row :gutter="10">
+          <el-col :xs="24" :sm="10">
+            <el-form-item label="代理端口" required>
+              <el-input-number
+                v-model="proxy.port"
+                :min="1"
+                :max="65535"
+                controls-position="right"
+                style="width: 100%"
+              />
+            </el-form-item>
+          </el-col>
+          <el-col :xs="24" :sm="14">
+            <el-form-item label="代理用户名">
+              <el-input v-model.trim="proxy.username" placeholder="可选" clearable />
+            </el-form-item>
+          </el-col>
+        </el-row>
+        <el-form-item label="代理密码">
+          <el-input v-model="proxy.password" type="password" placeholder="可选" show-password />
         </el-form-item>
       </template>
 

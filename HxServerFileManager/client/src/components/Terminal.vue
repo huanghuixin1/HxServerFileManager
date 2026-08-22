@@ -338,6 +338,22 @@ async function openInteractive() {
       })
       xterm.loadAddon(fitAddon)
       xterm.open(termHost.value)
+      // Ctrl+W 双保险：
+      //   收得到 Ctrl/Cmd+W 的环境（Safari/桌面壳 WebView）→ preventDefault 掐掉「关标签页」，^W 照常进终端；
+      //   Chrome/Edge/Firefox 普通窗口收不到 Ctrl+W 事件 → 提供 Ctrl+Alt+W 代发（该组合不在浏览器
+      //   保留清单里，能送达页面），直接向 pty 注入 \x17（^W 控制码），nano 搜索可用。
+      xterm.attachCustomKeyEventHandler((ev) => {
+        if (ev.type !== 'keydown') return true
+        if (ev.code === 'KeyW' || ev.key === 'w' || ev.key === 'W') {
+          if (ev.ctrlKey && ev.altKey && !ev.metaKey) {
+            ev.preventDefault()
+            sendInput('\x17') // 代发 Ctrl+W
+            return false // 已手动发送，不再交给 xterm 处理，避免重复
+          }
+          if ((ev.ctrlKey || ev.metaKey) && !ev.altKey) ev.preventDefault()
+        }
+        return true
+      })
       xterm.onData((data) => {
         sendInput(data)
       })
@@ -349,6 +365,12 @@ async function openInteractive() {
       // 右键粘贴：接管 contextmenu，从剪贴板读取内容后发送
       termHost.value.addEventListener('contextmenu', onTermContextMenu)
       xterm.writeln('--- 交互终端已连接（可直接输入；Ctrl+C 中断，exit 退出） ---')
+      if (inBrowser) {
+        // 浏览器环境会截走 Ctrl+W（nano 搜索）等保留快捷键，给出路提示
+        xterm.writeln(kbdLockAvailable
+          ? '\x1b[2m--- 提示：浏览器截走了 Ctrl+W（nano 搜索），可用 Ctrl+Alt+W 代替；点标题栏「沉浸模式」全屏后 Ctrl+W 本尊可用 ---\x1b[0m'
+          : '\x1b[2m--- 提示：浏览器截走了 Ctrl+W（nano 搜索），可用 Ctrl+Alt+W 代替（沉浸模式需 Chrome/Edge）---\x1b[0m')
+      }
     }
     applyFit() // 容器无尺寸时保持默认 80x24
     await api.terminalOpen(props.connId, xterm.cols, xterm.rows)
@@ -391,6 +413,9 @@ async function openInteractive() {
     }
     xterm.focus()
     startSizeObserver()
+    // 误关兜底：交互会话开着期间，关标签页/刷新前先弹浏览器确认（同类监听 addEventListener 去重）。
+    // 只在浏览器环境挂——桌面壳（Photino）里 beforeunload 可能拦住窗口关闭
+    if (inBrowser) window.addEventListener('beforeunload', onBeforeUnload)
   } catch (e) {
     if (xterm) xterm.writeln('\r\n[交互终端打开失败] ' + e.message)
   }
@@ -470,6 +495,58 @@ function doPastePlain() {
   xterm?.focus()
 }
 
+// ---- 浏览器保留快捷键（Ctrl+W）：nano 的搜索是 Ctrl+W，但 Chrome/Edge/Firefox 把它当
+// 「关闭标签页」保留快捷键，keydown 根本不发给页面，preventDefault 拦不住。三层处理：
+//   1) 收得到事件的环境（Safari/桌面壳 WebView）→ attachCustomKeyEventHandler 里拦默认行为；
+//   2) 拦不住时兜底：交互终端开着挂 beforeunload，误按 Ctrl+W/刷新/关窗先弹浏览器确认；
+//   3) Chrome/Edge 的 Keyboard Lock API：全屏 + keyboard.lock() 后 Ctrl+W 真正进终端（沉浸模式）。
+const inBrowser = typeof window !== 'undefined' && !window.external?.sendMessage
+const kbdLockAvailable = inBrowser && typeof navigator !== 'undefined' && typeof navigator.keyboard?.lock === 'function'
+const kbdLocked = ref(false)
+
+function onBeforeUnload(e) {
+  e.preventDefault()
+  e.returnValue = '' // Chrome/Edge 要求给 returnValue 赋值才会弹「离开网站？」确认
+}
+
+// 沉浸模式：终端全屏 + 独占键盘。lock() 不传参 = 锁全部按键（含 Esc/Ctrl+W/Ctrl+T），
+// 全部交给终端，nano/vim 的快捷键完整可用；退出按住 Esc 一会儿（Chrome 会出提示）
+async function toggleImmersive() {
+  if (kbdLocked.value) {
+    exitImmersive()
+    return
+  }
+  if (!termHost.value) return
+  try {
+    await termHost.value.requestFullscreen()
+    await navigator.keyboard.lock()
+    kbdLocked.value = true
+    if (xterm) {
+      xterm.writeln('\r\n\x1b[1;36m[沉浸模式] 键盘已独占，Ctrl+W 等浏览器快捷键将直接进入终端；按住 Esc 一会儿退出全屏\x1b[0m')
+      xterm.focus()
+    }
+  } catch (e) {
+    exitImmersive()
+    ElMessage.error('进入沉浸模式失败：' + (e.message || e))
+  }
+}
+
+function exitImmersive() {
+  try { navigator.keyboard?.unlock?.() } catch (_) { /* ignore */ }
+  kbdLocked.value = false
+  if (document.fullscreenElement) {
+    try { document.exitFullscreen() } catch (_) { /* ignore */ }
+  }
+}
+
+// 用户按住 Esc / 系统退出全屏后同步解锁状态，避免按钮图标停在「已沉浸」
+function onFullscreenChange() {
+  if (!document.fullscreenElement && kbdLocked.value) {
+    try { navigator.keyboard?.unlock?.() } catch (_) { /* ignore */ }
+    kbdLocked.value = false
+  }
+}
+
 // 在终端里写一条醒目的断开提示（带 ANSI 配色 + 闪烁，尽量显眼）
 function writeDisconnectedBanner() {
   if (!xterm) return
@@ -491,10 +568,12 @@ function reconnect() {
 
 function closeInteractive() {
   stopSizeObserver()
+  exitImmersive() // 退出沉浸模式（可能还全屏着）
   manualClose = true // 主动关闭（切 exec 模式 / 卸载），不触发断开提示
   if (ws) { try { ws.close() } catch (_) {} ws = null }
   if (xterm) { try { xterm.dispose() } catch (_) {} xterm = null }
   if (termHost.value) termHost.value.removeEventListener('contextmenu', onTermContextMenu)
+  window.removeEventListener('beforeunload', onBeforeUnload)
   fitAddon = null
 }
 
@@ -514,11 +593,13 @@ watch(mode, (m) => {
 onMounted(() => {
   // 默认交互终端：挂载后立即打开
   if (mode.value === 'interactive') nextTick(openInteractive)
+  document.addEventListener('fullscreenchange', onFullscreenChange)
   ensureLoaded()
 })
 
 onUnmounted(() => {
   stopSizeObserver()
+  document.removeEventListener('fullscreenchange', onFullscreenChange)
   closeInteractive()
   // 通知后端回收 shell（尽量，失败也无妨）
   api.terminalClose(props.connId).catch(() => {})
@@ -540,6 +621,17 @@ onUnmounted(() => {
         :disabled="lines.length === 0"
         @click="lines = []"
       >清空</el-button>
+      <el-button
+        v-if="mode === 'interactive' && kbdLockAvailable"
+        size="small"
+        text
+        :title="kbdLocked ? '退出沉浸模式' : '沉浸模式：全屏并独占键盘，Ctrl+W 等浏览器快捷键直接进终端（nano/vim 可正常使用），按住 Esc 退出'"
+        @click="toggleImmersive"
+      >
+        <el-icon :size="16">
+          <Monitor v-if="!kbdLocked" /><Close v-else />
+        </el-icon>
+      </el-button>
       <el-button
         size="small"
         text
@@ -886,6 +978,10 @@ onUnmounted(() => {
   border-radius: 10px;
   padding: 8px 8px 16px; /* 底部多留白，终端滚动到底时最后一行不贴边 */
   overflow: hidden;
+}
+.xterm-wrap:fullscreen {
+  border-radius: 0; /* 沉浸模式：整屏都是终端 */
+  padding: 4px;
 }
 .xterm-wrap :deep(.xterm) {
   height: 100%;

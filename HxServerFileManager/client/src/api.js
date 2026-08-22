@@ -305,6 +305,11 @@ export const api = {
   putMacros: (macros) =>
     request('/api/settings/macros', { method: 'PUT', body: JSON.stringify(macros) }),
 
+  // ---- 全局代理：连接级「跟随全局」的 SSH 连接使用（{type, host, port, username, password} | null）----
+  getProxy: () => request('/api/settings/proxy'),
+  putProxy: (proxy) =>
+    request('/api/settings/proxy', { method: 'PUT', body: JSON.stringify(proxy ?? null) }),
+
   // ---- 命令历史：Terminal 执行过的命令（双击再次执行）----
   getHistory: () => request('/api/settings/history'),
   addHistory: (item) =>

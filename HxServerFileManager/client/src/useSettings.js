@@ -7,6 +7,8 @@ const favorites = ref([]) // FavoriteDir[]：{id, connectionId, name, path, crea
 const macros = ref([]) // TerminalMacro[]：{id, name, command, createdAt, updatedAt}
 // CommandHistoryItem[]：{connKey, command, cwd, exitStatus, createdAt}，按 connKey 隔离
 const history = ref([])
+// 全局代理：{type, host, port, username, password} | null（连接级「跟随全局」时使用）
+const proxy = ref(null)
 
 // 每个连接最多保留的命令历史条数（与后端 SettingsStore.AppendHistory 的 200 一致）
 const HISTORY_LIMIT = 200
@@ -15,14 +17,16 @@ let loadedOnce = false
 
 async function ensureLoaded() {
   if (loadedOnce) return
-  const [fav, mac, hist] = await Promise.all([
+  const [fav, mac, hist, px] = await Promise.all([
     api.getFavorites().catch(() => ({ favorites: [] })),
     api.getMacros().catch(() => ({ macros: [] })),
     api.getHistory().catch(() => ({ history: [] })),
+    api.getProxy().catch(() => ({ proxy: null })),
   ])
   favorites.value = fav.favorites || []
   macros.value = mac.macros || []
   history.value = hist.history || []
+  proxy.value = px.proxy || null
   loadedOnce = true
 }
 
@@ -66,6 +70,7 @@ export function useSettings() {
     favorites,
     macros,
     history,
+    proxy,
     ensureLoaded,
     newId,
     addHistory,
@@ -75,6 +80,10 @@ export function useSettings() {
     },
     saveMacros: async () => {
       await api.putMacros(macros.value)
+    },
+    // 保存全局代理（先改 proxy.value 再调用；host 清空即整体置 null 停用）
+    saveProxy: async () => {
+      await api.putProxy(proxy.value)
     },
   }
 }
