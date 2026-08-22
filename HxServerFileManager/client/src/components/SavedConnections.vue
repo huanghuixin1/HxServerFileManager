@@ -2,6 +2,11 @@
 import { ref, onMounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { api, isDesktop, desktopSaveTextFile } from '../api.js'
+import { useSettings } from '../useSettings.js'
+
+// 代理标签（follow/custom 时展示，title 悬停可见具体配置）
+const { proxyTagInfo, ensureLoaded } = useSettings()
+ensureLoaded()
 
 const props = defineProps({
   reloadToken: { type: Number, default: 0 },
@@ -182,6 +187,16 @@ async function doDelete(item) {
               style="margin-left: 6px"
             >
               {{ it.authType === 'key' ? '私钥' : '密码' }}
+            </el-tag>
+            <el-tag
+              v-if="proxyTagInfo(it)"
+              size="small"
+              type="primary"
+              effect="plain"
+              style="margin-left: 6px"
+              :title="proxyTagInfo(it).title"
+            >
+              {{ proxyTagInfo(it).text }}
             </el-tag>
           </div>
         </div>

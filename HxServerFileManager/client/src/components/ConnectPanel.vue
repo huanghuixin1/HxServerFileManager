@@ -120,6 +120,8 @@ async function submit() {
         authType: authType.value,
         name: res.name || alias.value,
         homeDirectory: res.homeDirectory || '/',
+        proxyMode: proxyMode.value,
+        proxy: req.proxy,
       })
     }
   } catch (e) {

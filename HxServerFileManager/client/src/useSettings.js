@@ -65,6 +65,25 @@ function clearHistory(connKey) {
   api.clearHistory(connKey).catch(() => {})
 }
 
+// 已保存连接的代理展示信息：follow → 跟随全局（title 带全局当前配置），custom → 自定义。
+// 返回 null = 直连/未配置代理，调用方不展示标签。
+function proxyTagInfo(c) {
+  if (!c) return null
+  if (c.proxyMode === 'custom') {
+    const p = c.proxy || {}
+    const t = String(p.type || 'http').toUpperCase()
+    return { text: '自定义代理', title: `自定义代理：${t} ${p.host || '?'}:${p.port || '?'}` }
+  }
+  if (c.proxyMode === 'follow') {
+    const g = proxy.value
+    const t = String(g?.type || 'http').toUpperCase()
+    return g?.host
+      ? { text: '全局代理', title: `跟随全局代理：${t} ${g.host}:${g.port || ''}` }
+      : { text: '全局代理', title: '跟随全局代理（全局未配置，实际直连）' }
+  }
+  return null
+}
+
 export function useSettings() {
   return {
     favorites,
@@ -75,6 +94,7 @@ export function useSettings() {
     newId,
     addHistory,
     clearHistory,
+    proxyTagInfo,
     saveFavorites: async () => {
       await api.putFavorites(favorites.value)
     },

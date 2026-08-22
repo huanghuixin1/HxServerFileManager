@@ -45,7 +45,7 @@ const editing = ref(null)
 const editVisible = ref(false)
 
 // ---- 全局代理（头部「代理设置」弹窗）：连接默认直连，需在连接里选「跟随全局」才使用 ----
-const { proxy: globalProxy, ensureLoaded: ensureSettingsLoaded, saveProxy } = useSettings()
+const { proxy: globalProxy, ensureLoaded: ensureSettingsLoaded, saveProxy, proxyTagInfo } = useSettings()
 const proxyDlgVisible = ref(false)
 // 弹窗编辑的是本地副本，保存成功才写回全局，避免半编辑状态影响别处
 const proxyForm = reactive({ type: 'http', host: '', port: 7890, username: '', password: '' })
@@ -402,6 +402,9 @@ function toConn(payload) {
     authType: payload.authType,
     name: payload.name || '',
     homeDirectory: payload.homeDirectory || '/',
+    // 代理信息（tab 上显示迷你徽标用）：连接响应/已保存条目带回，缺省为 null（直连）
+    proxyMode: payload.proxyMode || null,
+    proxy: payload.proxy || null,
   }
 }
 
@@ -518,6 +521,8 @@ async function openSaved(p) {
       port: p.port,
       authType: p.authType,
       name: p.name || '',
+      proxyMode: p.proxyMode,
+      proxy: p.proxy,
     }),
     uid,
     pending: true,
@@ -534,6 +539,8 @@ async function openSaved(p) {
       port: p.port,
       authType: p.authType,
       name: res.name || p.name || '',
+      proxyMode: res.proxyMode ?? p.proxyMode,
+      proxy: res.proxy ?? p.proxy,
     })
     conn.uid = uid // 保留 uid：工作区（Terminal/FileManager）不重挂载
     const oldId = placeholder.connectionId
@@ -728,6 +735,16 @@ async function pollServerCopy() {
               >
                 <span class="dd-name">{{ c.name }}</span>
                 <span class="dd-sub">{{ c.username }}@{{ c.host }}:{{ c.port }}</span>
+                <el-tag
+                  v-if="proxyTagInfo(c)"
+                  size="small"
+                  type="primary"
+                  effect="plain"
+                  class="dd-proxy"
+                  :title="proxyTagInfo(c).title"
+                >
+                  {{ proxyTagInfo(c).text }}
+                </el-tag>
               </el-dropdown-item>
               <el-dropdown-item v-if="savedList.length" divided command="manage">
                 <el-icon><Setting /></el-icon> 管理已保存的连接…
@@ -772,6 +789,12 @@ async function pollServerCopy() {
         <span class="t-label" :title="`${c.username}@${c.host}:${c.port}`">
           {{ c.name || `${c.username}@${c.host}:${c.port}` }}
         </span>
+        <span
+          v-if="proxyTagInfo(c)"
+          class="t-proxy"
+          :class="c.proxyMode === 'custom' ? 't-custom' : 't-global'"
+          :title="proxyTagInfo(c).title"
+        >{{ c.proxyMode === 'custom' ? '自' : '全' }}</span>
         <el-icon
           class="t-close"
           title="断开该连接"
@@ -1097,6 +1120,10 @@ async function pollServerCopy() {
   color: #8a97a5;
   font-size: 12px;
 }
+.dd-proxy {
+  margin-left: auto;
+  flex-shrink: 0;
+}
 .tabsbar {
   background: #fff;
   border-bottom: 1px solid var(--border);
@@ -1153,6 +1180,23 @@ async function pollServerCopy() {
 }
 .sess-tab.broken .t-dot {
   background: #e5484d;
+}
+/* 代理迷你徽标：单字（全=跟随全局 / 自=自定义），悬停 title 看完整配置 */
+.t-proxy {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2.5px 5px;
+  border-radius: 999px;
+  cursor: default;
+}
+.t-proxy.t-global {
+  color: #2d6cdf;
+  background: #e8f1ff;
+}
+.t-proxy.t-custom {
+  color: #c2620d;
+  background: #fdf0e3;
 }
 .t-close {
   font-size: 13px;

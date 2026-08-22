@@ -254,6 +254,8 @@ app.MapPost("/api/connect", (ConnectRequest req, ConnectionManager mgr, Connecti
         username = req.Username,
         name = req.Name,
         homeDirectory = home,
+        proxyMode = prof.ProxyMode,
+        proxy = prof.Proxy,
         message = "连接成功"
     });
 });
@@ -389,6 +391,8 @@ app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr,
         username = prof.Username,
         name = prof.Name,
         homeDirectory = home,
+        proxyMode = prof.ProxyMode,
+        proxy = prof.Proxy,
         message = "连接成功"
     });
 });
