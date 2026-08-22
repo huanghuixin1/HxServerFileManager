@@ -70,6 +70,9 @@ static void ShowWindow(WebApplication app, string url, string? logoPath)
         .SetSize(1280, 800)
         .Center()
         .SetDevToolsEnabled(true)
+        // 关掉 WebView 原生右键菜单（含「刷新」）：误点刷新会把整个 SPA 重载、断掉所有 SSH 会话。
+        // 只禁原生菜单——DOM 的 contextmenu 事件照常触发，前端自己的右键行为（终端右键粘贴）不受影响
+        .SetContextMenuEnabled(false)
         .RegisterWindowClosingHandler((sender, e) =>
         {
             AppState.BeginShutdown(); // 标记窗口开始关闭：取消在途下载、禁止再回传消息（防关闭瞬间 SendWebMessage 原生崩溃闪退）
