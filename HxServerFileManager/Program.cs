@@ -335,6 +335,37 @@ app.MapPost("/api/connections/import", (List<ConnectionProfile> profiles, string
     return Results.Ok(new { added, updated, skipped });
 });
 
+// 仅保存连接（不发起 SSH 连接）：服务器暂时连不上/凭据未定时先存起来，稍后可编辑或直接连接。
+// 与 PUT 编辑同款「留空字段保持不变」：对已存在的同 host|port|username 连接，密码/私钥/口令留空则保留原值，
+// 避免「仅保存」把已有凭据抹掉（Upsert 是整体替换，不做留空合并）。
+app.MapPost("/api/connections", (ConnectRequest req, ConnectionsStore store, OperationLogger log) =>
+{
+    if (string.IsNullOrWhiteSpace(req.Host) || string.IsNullOrWhiteSpace(req.Username))
+        return Results.BadRequest(new { error = "Host 与 Username 为必填" });
+
+    var port = req.Port is int pp && pp > 0 ? pp : 22;
+    var prof = ToProfile(req, port);
+    var key = $"{prof.Host}|{prof.Port}|{prof.Username}";
+    var existing = store.List().FirstOrDefault(x => $"{x.Host}|{x.Port}|{x.Username}" == key);
+    if (existing is not null)
+    {
+        prof = prof with
+        {
+            Name = string.IsNullOrWhiteSpace(req.Name) ? existing.Name : prof.Name,
+            Password = string.IsNullOrEmpty(req.Password) ? existing.Password : req.Password,
+            PrivateKey = string.IsNullOrEmpty(req.PrivateKey) ? existing.PrivateKey : req.PrivateKey,
+            Passphrase = string.IsNullOrEmpty(req.Passphrase) ? existing.Passphrase : req.Passphrase,
+            // 代理与凭据同款「未传保留」：proxyMode 为 null（旧客户端/仅改别处）不动原代理配置
+            ProxyMode = req.ProxyMode ?? existing.ProxyMode,
+            Proxy = req.ProxyMode is null ? existing.Proxy : req.Proxy,
+        };
+    }
+
+    var saved = store.Upsert(prof);
+    log.Log("info", $"{saved.Username}@{saved.Host}:{saved.Port}", "保存连接", "仅保存（未连接）");
+    return Results.Ok(new { id = saved.Id, name = saved.Name, message = "已保存（未连接）" });
+});
+
 // 用已保存的凭据重新连接
 app.MapPost("/api/connections/reconnect", (IdRequest req, ConnectionManager mgr, ConnectionsStore store, SettingsStore settings, OperationLogger log) =>
 {

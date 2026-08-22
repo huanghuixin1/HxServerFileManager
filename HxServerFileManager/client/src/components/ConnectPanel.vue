@@ -8,7 +8,7 @@ const props = defineProps({
   initial: { type: Object, default: null },
   mode: { type: String, default: 'connect' },
 })
-const emit = defineEmits(['connected', 'updated'])
+const emit = defineEmits(['connected', 'updated', 'saved'])
 
 const alias = ref('')
 const host = ref('')
@@ -76,6 +76,25 @@ function buildReq() {
           password: proxy.password || null,
         }
       : null,
+  }
+}
+
+// 仅保存：不发起连接，直接存为已保存连接（服务器连不上/凭据未定时先存起来）。
+// 对已存在的同主机连接，密码/私钥留空则保留原值（后端合并）
+async function saveOnly() {
+  error.value = ''
+  if (!host.value || !username.value) {
+    error.value = 'Host 与 Username 为必填'
+    return
+  }
+  busy.value = true
+  try {
+    const res = await api.saveConnection(buildReq())
+    emit('saved', { id: res.id, name: res.name || alias.value })
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    busy.value = false
   }
 }
 
@@ -243,13 +262,27 @@ async function submit() {
         show-icon
       />
 
+      <div v-if="mode === 'connect'" class="btn-row">
+        <el-button type="primary" native-type="submit" :loading="busy" class="btn-grow">
+          {{ busy ? '连接中…' : '连接并保存' }}
+        </el-button>
+        <el-button
+          class="btn-grow"
+          :disabled="busy"
+          title="不发起连接，直接保存；已存在的同主机连接会更新，密码/私钥留空则保留原值"
+          @click="saveOnly"
+        >
+          仅保存
+        </el-button>
+      </div>
       <el-button
+        v-else
         type="primary"
         native-type="submit"
         :loading="busy"
         style="width: 100%"
       >
-        {{ busy ? (mode === 'edit' ? '保存中…' : '连接中…') : (mode === 'edit' ? '保存修改' : '连接') }}
+        {{ busy ? '保存中…' : '保存修改' }}
       </el-button>
     </el-form>
   </div>
@@ -267,5 +300,12 @@ async function submit() {
 .key-textarea :deep(textarea) {
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   font-size: 12.5px;
+}
+.btn-row {
+  display: flex;
+  gap: 10px;
+}
+.btn-grow {
+  flex: 1;
 }
 </style>

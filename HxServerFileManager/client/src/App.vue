@@ -583,6 +583,14 @@ function onUpdated() {
   ElMessage.success('已保存修改')
 }
 
+// 仅保存（未连接）：刷新已保存列表；从「新建连接」弹窗保存的顺手关掉弹窗
+function onSavedOnly(res) {
+  connectVisible.value = false
+  savedReload.value++
+  loadSaved()
+  ElMessage.success(`已保存${res?.name ? `「${res.name}」` : ''}（未连接），可稍后在已保存连接中打开`)
+}
+
 function openEditor(connId, path) {
   editor.value = { open: true, connId, path }
 }
@@ -775,7 +783,7 @@ async function pollServerCopy() {
     <main class="content">
       <!-- 无任何连接：内联连接表单 + 已保存连接 -->
       <section v-if="connections.length === 0" class="connect-area">
-        <ConnectPanel @connected="handleConnected" />
+        <ConnectPanel @connected="handleConnected" @saved="onSavedOnly" />
         <!-- 连接列表：点「连接」立即开占位 tab（与顶栏「已保存连接」下拉同一套 openSaved 流程） -->
         <SavedConnections
           :reload-token="savedReload"
@@ -849,7 +857,7 @@ async function pollServerCopy() {
       width="min(480px, 92vw)"
       :close-on-click-modal="false"
     >
-      <ConnectPanel @connected="handleConnected" />
+      <ConnectPanel @connected="handleConnected" @saved="onSavedOnly" />
     </el-dialog>
 
     <!-- 管理已保存的连接（连接中也可进入） -->

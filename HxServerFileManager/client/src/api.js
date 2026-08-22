@@ -93,6 +93,10 @@ export const api = {
   connect: (req) =>
     request('/api/connect', { method: 'POST', body: JSON.stringify(req) }),
 
+  // 仅保存连接（不发起 SSH 连接）：对同 host|port|username 的已有连接，凭据留空则保留原值
+  saveConnection: (req) =>
+    request('/api/connections', { method: 'POST', body: JSON.stringify(req) }),
+
   disconnect: (connId) =>
     request('/api/disconnect', { method: 'POST', body: JSON.stringify({ connectionId: connId }) }),
 
